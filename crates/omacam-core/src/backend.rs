@@ -16,6 +16,17 @@ pub struct Size {
     pub height: u32,
 }
 
+impl FrameData {
+    /// The pixels, when they're in memory.
+    pub fn bytes(&self) -> Option<&[u8]> {
+        match self {
+            FrameData::Memory(v) => Some(v),
+            FrameData::Shared(s) => Some(s.as_ref()),
+            FrameData::Dmabuf { .. } => None,
+        }
+    }
+}
+
 impl Size {
     pub const fn new(width: u32, height: u32) -> Self {
         Size { width, height }
@@ -200,11 +211,24 @@ impl fmt::Debug for ReleaseToken {
     }
 }
 
+/// Pixels shared between the viewfinder, the video encoder and a photo,
+/// without copies.
+#[derive(Debug, Clone)]
+pub struct SharedPixels(pub std::sync::Arc<Vec<u8>>);
+
+impl AsRef<[u8]> for SharedPixels {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
 /// The pixels of a frame.
 #[derive(Debug)]
 pub enum FrameData {
     /// A copy the frame owns. The camera's buffer is already back in use.
     Memory(Vec<u8>),
+    /// The same copy, shared (the app shares it with its encoder).
+    Shared(SharedPixels),
     /// The camera's own dmabuf, lent until the token is dropped. The fd is
     /// valid for as long as the token lives and must not be closed.
     Dmabuf {

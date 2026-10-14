@@ -5,6 +5,7 @@ mod exif;
 mod photo;
 mod prefs;
 mod script;
+mod sensors;
 mod settings;
 mod theme;
 mod viewfinder;

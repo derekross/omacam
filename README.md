@@ -31,8 +31,9 @@ finds.
 - The last photo as a thumbnail; tap it to open it.
 - Video: 1080p or 720p at 30 fps, H.264 with Opus sound in MP4, saved in
   `~/Videos/Camera`, with zoom while recording (within the lens in use).
-- Photos with EXIF data (time, exposure, ISO, aperture, focal length, zoom;
-  no serial numbers, no location) and the shutter sound.
+- Photos with EXIF data (time to the millisecond, exposure, ISO, aperture,
+  focal length, which camera, zoom; no serial numbers, no location) and
+  the shutter sound. Photos and videos follow how the phone is held.
 - Settings from the gear: aspect ratio (full, 4:3, 16:9, 1:1), resolution,
   JPEG quality, a 3 or 10 s timer, a 3x3 or 4x4 grid, mirrored selfies,
   the shutter sound, where photos are saved, volume keys as the shutter,

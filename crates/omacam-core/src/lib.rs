@@ -17,6 +17,7 @@ pub mod controller;
 pub mod exposure;
 pub mod focus;
 pub mod lens;
+pub mod orientation;
 pub mod switch;
 pub mod zoom;
 

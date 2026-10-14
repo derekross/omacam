@@ -9,6 +9,9 @@
 # preview/still: the processed stream sizes asked of libcamera's software
 #   ISP. libcamera may adjust them; the app uses what it gets.
 # rotation: leave out to use libcamera's Rotation property.
+# focal_length_mm: the real focal length, for EXIF, from the sensor
+#   diagonal (Google's pixel size x the full pixel array) and the field of
+#   view: f = diagonal / (2 tan(FOV/2)). Derived, not measured.
 
 device = "cheetah"
 max_zoom = 15.0
@@ -20,6 +23,7 @@ id = "/base/soc@0/usi@109000c0/i2c@10900000/camera-sensor@3d" # Samsung S5KGN1
 zoom = 1.0
 f_number = 1.85
 focal_length_35mm = 25
+focal_length_mm = 7.05
 preview = [2016, 1136]
 still = [4080, 3072]
 autofocus = true
@@ -31,6 +35,7 @@ id = "/base/soc@0/usi@109200c0/i2c@10920000/camera-sensor@1a" # Sony IMX386
 zoom = 0.45
 f_number = 2.2
 focal_length_35mm = 11
+focal_length_mm = 1.61
 preview = [2016, 1508]
 # The full mode, since kernel 00545 keeps its lines under the CSIS write
 # DMA's limit (330 MB/s; CAMERA-PLAN CAM-M.5l).
@@ -44,6 +49,7 @@ id = "/base/soc@0/usi@109300c0/i2c@10930000/camera-sensor@2d" # Samsung S5KGM5
 zoom = 4.78
 f_number = 3.5
 focal_length_35mm = 119
+focal_length_mm = 19.26
 preview = [2016, 1512]
 still = [4032, 3024]
 # The SEM1215SA lens doesn't answer yet (CAMERA-PLAN CAM-T T.3).
@@ -56,6 +62,7 @@ id = "/base/soc@0/usi@109100c0/i2c@10910000/camera-sensor@10" # Samsung S5K3J1
 zoom = 1.0
 f_number = 2.2
 focal_length_35mm = 21
+focal_length_mm = 2.74
 preview = [1912, 1368]
 still = [3840, 2736]
 autofocus = false

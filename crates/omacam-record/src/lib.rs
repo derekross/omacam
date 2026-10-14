@@ -171,6 +171,9 @@ pub struct Config {
     /// Clockwise degrees that turn the picture upright; written as the
     /// file's orientation tag.
     pub rotation: u32,
+    /// When recording started, ISO 8601 with the UTC offset: the file's
+    /// creation time.
+    pub created: Option<String>,
     pub audio: Audio,
 }
 
@@ -230,13 +233,39 @@ fn orientation_tag(rotation: u32) -> &'static str {
     }
 }
 
-/// A recording in progress.
-pub struct Recorder {
+/// Timing shared by the frame pushers, the audio probe and stop.
+#[derive(Debug, Default)]
+struct Timing {
+    /// Running time of the first frame: the file's zero.
+    first: Option<gst::ClockTime>,
+    /// Running time of the last frame, once stopping: audio after it goes.
+    end: Option<gst::ClockTime>,
+    last: Option<gst::ClockTime>,
+    frames: u64,
+}
+
+struct Inner {
     pipeline: gst::Pipeline,
     src: gst_app::AppSrc,
     crop: gst::Element,
+    /// The queues straight before the muxer: their pads carry the offset
+    /// that puts the first frame at zero.
+    video_out: gst::Pad,
+    audio_out: Option<gst::Pad>,
     config: Config,
-    frames: u64,
+    timing: std::sync::Mutex<Timing>,
+}
+
+/// A recording in progress.
+pub struct Recorder {
+    inner: std::sync::Arc<Inner>,
+}
+
+/// A handle that feeds frames from any thread (the camera's), so the
+/// encoder gets every frame whatever the UI is doing. Cheap to clone.
+#[derive(Clone)]
+pub struct Tap {
+    inner: std::sync::Arc<Inner>,
 }
 
 impl Recorder {
@@ -268,25 +297,37 @@ impl Recorder {
         }
         let c = &config;
         let location = c.path.display().to_string().replace('"', "");
+        // Generous queues before the muxer: it interleaves by time, and a
+        // short audio queue that filled while it waited for video blocked
+        // the microphone and lost sound.
+        let big = "max-size-buffers=0 max-size-bytes=0 max-size-time=5000000000";
         let audio = match c.audio {
             Audio::None => String::new(),
-            Audio::PipeWire => {
-                "pipewiresrc do-timestamp=true ! queue ! audioconvert ! audioresample \
-                 ! audio/x-raw,rate=48000,channels=2 ! opusenc bitrate=128000 ! queue ! mux."
-                    .into()
-            }
-            Audio::Test => "audiotestsrc is-live=true wave=sine ! audioconvert ! audioresample \
-                 ! audio/x-raw,rate=48000,channels=2 ! opusenc bitrate=64000 ! queue ! mux."
-                .into(),
+            Audio::PipeWire => format!(
+                "pipewiresrc ! queue {big} ! audioconvert ! audioresample \
+                 ! audio/x-raw,rate=48000,channels=2 ! opusenc bitrate=128000 \
+                 ! queue name=aq {big} ! mux."
+            ),
+            Audio::Test => format!(
+                "audiotestsrc is-live=true wave=sine ! audioconvert ! audioresample \
+                 ! audio/x-raw,rate=48000,channels=2 ! opusenc bitrate=64000 \
+                 ! queue name=aq {big} ! mux."
+            ),
         };
+        // The camera's frames carry their own timestamps (set in push), so
+        // appsrc doesn't stamp them. Conversion and scaling run on four
+        // threads in one pass, and the encoder in its own thread behind a
+        // short queue that drops rather than blocks the camera.
         let desc = format!(
-            "appsrc name=src is-live=true format=time do-timestamp=true block=false \
+            "appsrc name=src is-live=true format=time do-timestamp=false block=false \
                caps=video/x-raw,format={fmt},width={iw},height={ih},framerate=0/1 \
-             ! queue max-size-buffers=4 max-size-bytes=0 max-size-time=0 leaky=downstream \
-             ! videocrop name=crop ! videoscale add-borders=false ! videoconvert \
+             ! queue max-size-buffers=3 max-size-bytes=0 max-size-time=0 leaky=downstream \
+             ! videocrop name=crop \
+             ! videoconvertscale add-borders=false n-threads=4 \
              ! video/x-raw,format=I420,width={ow},height={oh},pixel-aspect-ratio=1/1 \
-             ! {chain} ! taginject tags=\"image-orientation={orient}\" \
-             ! queue ! {muxer} name=mux ! filesink location=\"{location}\" \
+             ! queue max-size-buffers=3 max-size-bytes=0 max-size-time=0 leaky=downstream \
+             ! {chain} ! taginject tags=\"{tags}\" \
+             ! queue name=vq {big} ! {muxer} name=mux ! filesink async=false location=\"{location}\" \
              {audio}",
             fmt = c.input.caps_name(),
             iw = c.padded_width(),
@@ -294,49 +335,95 @@ impl Recorder {
             ow = c.out_width,
             oh = c.out_height,
             chain = c.codec.chain(c.bitrate_kbps(), c.fps),
-            orient = orientation_tag(c.rotation),
+            tags = {
+                let mut t = format!("image-orientation={}", orientation_tag(c.rotation));
+                if let Some(d) = &c.created {
+                    let safe: String = d
+                        .chars()
+                        .filter(|ch| ch.is_ascii_alphanumeric() || "-:+.".contains(*ch))
+                        .collect();
+                    t.push_str(&format!(",datetime=(datetime){safe}"));
+                }
+                t
+            },
             muxer = c.codec.muxer(),
         );
         tracing::debug!(pipeline = desc, "recording pipeline");
         let pipeline = gst::parse::launch(&desc)?
             .downcast::<gst::Pipeline>()
             .map_err(|_| Error::Pipeline("not a pipeline".into()))?;
-        let src = pipeline
-            .by_name("src")
-            .and_then(|e| e.downcast::<gst_app::AppSrc>().ok())
-            .ok_or_else(|| Error::Pipeline("no appsrc".into()))?;
-        let crop = pipeline
-            .by_name("crop")
-            .ok_or_else(|| Error::Pipeline("no videocrop".into()))?;
-        let rec = Recorder {
+        let by = |name: &str| {
+            pipeline
+                .by_name(name)
+                .ok_or_else(|| Error::Pipeline(format!("no {name}")))
+        };
+        let src = by("src")?
+            .downcast::<gst_app::AppSrc>()
+            .map_err(|_| Error::Pipeline("src isn't an appsrc".into()))?;
+        let crop = by("crop")?;
+        let video_out = by("vq")?
+            .static_pad("src")
+            .ok_or_else(|| Error::Pipeline("no vq pad".into()))?;
+        let aq = pipeline.by_name("aq");
+        let audio_out = aq.as_ref().and_then(|q| q.static_pad("src"));
+        let inner = std::sync::Arc::new(Inner {
             pipeline,
             src,
             crop,
-            frames: 0,
+            video_out,
+            audio_out,
             config,
-        };
+            timing: std::sync::Mutex::new(Timing::default()),
+        });
+        // Sound before the first frame or after the last one is dropped,
+        // so both tracks cover the same span.
+        if let Some(sink) = aq.as_ref().and_then(|q| q.static_pad("sink")) {
+            let weak = std::sync::Arc::downgrade(&inner);
+            sink.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+                let Some(inner) = weak.upgrade() else {
+                    return gst::PadProbeReturn::Ok;
+                };
+                let Some(buffer) = info.buffer() else {
+                    return gst::PadProbeReturn::Ok;
+                };
+                let t = inner.timing.lock().unwrap();
+                let keep = match (t.first, buffer.pts()) {
+                    (Some(first), Some(pts)) => pts >= first && t.end.is_none_or(|end| pts <= end),
+                    _ => false,
+                };
+                if keep {
+                    gst::PadProbeReturn::Ok
+                } else {
+                    gst::PadProbeReturn::Drop
+                }
+            });
+        }
+        let rec = Recorder { inner };
         rec.set_zoom(1.0);
-        rec.pipeline.set_state(gst::State::Playing)?;
-        // A source that can't start (no microphone) fails here.
-        let (res, _, _) = rec.pipeline.state(gst::ClockTime::from_seconds(3));
+        rec.inner.pipeline.set_state(gst::State::Playing)?;
+        // A source that can't open (no microphone) fails at once; wait a
+        // moment for that, not for the whole start (frames before PLAYING
+        // are dropped, and the file starts at the first one after).
+        let _ = rec.inner.pipeline.state(gst::ClockTime::from_mseconds(500));
         if let Some(err) = rec.bus_error() {
-            let _ = rec.pipeline.set_state(gst::State::Null);
+            let _ = rec.inner.pipeline.set_state(gst::State::Null);
             return Err(Error::Pipeline(err));
         }
-        res?;
+        let c = &rec.inner.config;
         tracing::info!(
-            path = %rec.config.path.display(),
-            codec = ?rec.config.codec,
-            size = %format!("{}x{}", rec.config.out_width, rec.config.out_height),
-            kbps = rec.config.bitrate_kbps(),
-            audio = ?rec.config.audio,
+            path = %c.path.display(),
+            codec = ?c.codec,
+            size = %format!("{}x{}", c.out_width, c.out_height),
+            kbps = c.bitrate_kbps(),
+            audio = ?c.audio,
+            rotation = c.rotation,
             "recording"
         );
         Ok(rec)
     }
 
     fn bus_error(&self) -> Option<String> {
-        let bus = self.pipeline.bus()?;
+        let bus = self.inner.pipeline.bus()?;
         while let Some(msg) = bus.pop() {
             if let gst::MessageView::Error(e) = msg.view() {
                 return Some(format!("{} ({:?})", e.error(), e.debug()));
@@ -346,48 +433,41 @@ impl Recorder {
     }
 
     pub fn config(&self) -> &Config {
-        &self.config
+        &self.inner.config
     }
 
     pub fn frames(&self) -> u64 {
-        self.frames
+        self.inner.timing.lock().unwrap().frames
+    }
+
+    /// A handle for pushing frames from another thread.
+    pub fn tap(&self) -> Tap {
+        Tap {
+            inner: self.inner.clone(),
+        }
     }
 
     /// Zoom within the frame: `scale` 1 is the whole 16:9 view.
     pub fn set_zoom(&self, scale: f64) {
-        let c = &self.config;
-        let (l, r, t, b) = crop_for(c.in_width, c.in_height, c.out_width, c.out_height, scale);
-        let padding = c.padded_width() - c.in_width;
-        self.crop.set_property("left", l as i32);
-        self.crop.set_property("right", (r + padding) as i32);
-        self.crop.set_property("top", t as i32);
-        self.crop.set_property("bottom", b as i32);
+        self.tap().set_zoom(scale);
     }
 
-    /// Hand a frame to the encoder. `data` is shared, not copied (a
-    /// `glib::Bytes` the viewfinder also shows works). A frame the encoder
-    /// can't keep up with is dropped by the queue.
-    pub fn push<T: AsRef<[u8]> + Send + 'static>(&mut self, data: T) -> Result<()> {
-        let c = &self.config;
-        let need = c.stride as usize * (c.in_height as usize - 1)
-            + c.in_width as usize * bytes_per_pixel(c.input);
-        if data.as_ref().len() < need {
-            return Err(Error::Pipeline("frame shorter than its size".into()));
-        }
-        let buffer = gst::Buffer::from_slice(data);
-        self.src
-            .push_buffer(buffer)
-            .map_err(|e| Error::Pipeline(format!("push: {e:?}")))?;
-        self.frames += 1;
-        Ok(())
+    /// Hand a frame to the encoder (see [`Tap::push`]).
+    pub fn push<T: AsRef<[u8]> + Send + 'static>(&self, data: T) -> Result<()> {
+        self.tap().push(data)
     }
 
     /// Finish the file: end of stream, wait for the muxer to write it.
     pub fn stop(self) -> Result<PathBuf> {
-        let _ = self.src.end_of_stream();
+        let inner = &self.inner;
+        {
+            let mut t = inner.timing.lock().unwrap();
+            t.end = t.last;
+        }
+        let _ = inner.src.end_of_stream();
         // The audio source needs its own end of stream.
-        self.pipeline.send_event(gst::event::Eos::new());
-        let bus = self
+        inner.pipeline.send_event(gst::event::Eos::new());
+        let bus = inner
             .pipeline
             .bus()
             .ok_or_else(|| Error::Pipeline("no bus".into()))?;
@@ -401,15 +481,93 @@ impl Recorder {
             }
             None => result = Err(Error::Pipeline("the file wasn't finished in 10 s".into())),
         }
-        self.pipeline.set_state(gst::State::Null)?;
+        inner.pipeline.set_state(gst::State::Null)?;
+        let t = inner.timing.lock().unwrap();
+        let span = match (t.first, t.last) {
+            (Some(a), Some(b)) => b.saturating_sub(a).mseconds(),
+            _ => 0,
+        };
+        let fps = if span > 0 {
+            (t.frames.saturating_sub(1)) as f64 * 1000.0 / span as f64
+        } else {
+            0.0
+        };
         result.map(|()| {
-            tracing::info!(path = %self.config.path.display(), frames = self.frames, "recording saved");
-            self.config.path.clone()
+            tracing::info!(
+                path = %inner.config.path.display(),
+                frames = t.frames,
+                ms = span,
+                fps = format!("{fps:.1}"),
+                "recording saved"
+            );
+            inner.config.path.clone()
         })
     }
 }
 
-impl Drop for Recorder {
+impl Tap {
+    pub fn set_zoom(&self, scale: f64) {
+        let c = &self.inner.config;
+        let (l, r, t, b) = crop_for(c.in_width, c.in_height, c.out_width, c.out_height, scale);
+        let padding = c.padded_width() - c.in_width;
+        let crop = &self.inner.crop;
+        crop.set_property("left", l as i32);
+        crop.set_property("right", (r + padding) as i32);
+        crop.set_property("top", t as i32);
+        crop.set_property("bottom", b as i32);
+    }
+
+    /// Hand a frame to the encoder, shared, not copied. Its timestamp is
+    /// the pipeline clock's running time now, the clock the microphone's
+    /// sound is stamped with; the first frame becomes the file's zero.
+    /// Frames before the pipeline runs, or after stop, are dropped, and
+    /// so is a frame the encoder can't keep up with.
+    pub fn push<T: AsRef<[u8]> + Send + 'static>(&self, data: T) -> Result<()> {
+        let inner = &self.inner;
+        let c = &inner.config;
+        let need = c.stride as usize * (c.in_height as usize - 1)
+            + c.in_width as usize * bytes_per_pixel(c.input);
+        if data.as_ref().len() < need {
+            return Err(Error::Pipeline("frame shorter than its size".into()));
+        }
+        let (Some(clock), Some(base)) = (inner.pipeline.clock(), inner.pipeline.base_time()) else {
+            return Ok(()); // not running yet
+        };
+        let now = clock.time().saturating_sub(base);
+        {
+            let mut t = inner.timing.lock().unwrap();
+            if t.end.is_some() {
+                return Ok(());
+            }
+            if t.first.is_none() {
+                t.first = Some(now);
+                let offset = -(now.nseconds() as i64);
+                inner.video_out.set_offset(offset);
+                if let Some(a) = &inner.audio_out {
+                    a.set_offset(offset);
+                }
+            }
+            if t.last.is_some_and(|l| now <= l) {
+                return Ok(()); // never two frames at one time
+            }
+            t.last = Some(now);
+            t.frames += 1;
+        }
+        let mut buffer = gst::Buffer::from_slice(data);
+        {
+            let b = buffer.get_mut().expect("a new buffer");
+            b.set_pts(now);
+            b.set_dts(now);
+        }
+        inner
+            .src
+            .push_buffer(buffer)
+            .map_err(|e| Error::Pipeline(format!("push: {e:?}")))?;
+        Ok(())
+    }
+}
+
+impl Drop for Inner {
     fn drop(&mut self) {
         let _ = self.pipeline.set_state(gst::State::Null);
     }
@@ -493,6 +651,7 @@ mod tests {
             out_height: h,
             fps: 30,
             rotation: 270,
+            created: None,
             audio: Audio::None,
         };
         assert!((11_000..13_000).contains(&cfg(1920, 1080).bitrate_kbps()));
@@ -511,6 +670,56 @@ mod tests {
         assert_eq!(orientation_tag(270), "rotate-270");
         assert_eq!(orientation_tag(90), "rotate-90");
         assert_eq!(orientation_tag(0), "rotate-0");
+    }
+
+    /// The video frames' and the sound's timestamps in an MP4, in seconds:
+    /// every video pts, and the sound's first and last pts with the count
+    /// of gaps over 30 ms between packets.
+    fn read_back(path: &Path, with_sound: bool) -> (Vec<f64>, Option<(f64, f64, usize)>) {
+        let desc = format!(
+            "filesrc location=\"{}\" ! qtdemux name=d d.video_0 ! queue ! appsink name=v sync=false {}",
+            path.display(),
+            if with_sound { "d.audio_0 ! queue ! appsink name=a sync=false" } else { "" }
+        );
+        let p = gst::parse::launch(&desc)
+            .unwrap()
+            .downcast::<gst::Pipeline>()
+            .unwrap();
+        let sink = |n: &str| {
+            p.by_name(n)
+                .map(|e| e.downcast::<gst_app::AppSink>().unwrap())
+        };
+        let (v, a) = (sink("v").unwrap(), sink("a"));
+        p.set_state(gst::State::Playing).unwrap();
+        let pts = |s: &gst_app::AppSink| {
+            let mut out = Vec::new();
+            while let Ok(sample) = s.pull_sample() {
+                let b = sample.buffer().unwrap();
+                out.push((
+                    b.pts().unwrap().nseconds() as f64 / 1e9,
+                    b.duration()
+                        .map(|d| d.nseconds() as f64 / 1e9)
+                        .unwrap_or(0.0),
+                ));
+            }
+            out
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        if let Some(a) = a {
+            std::thread::spawn(move || {
+                let _ = tx.send(pts(&a));
+            });
+        }
+        let video: Vec<f64> = pts(&v).into_iter().map(|(t, _)| t).collect();
+        let sound = rx.recv().ok().map(|s| {
+            let gaps = s
+                .windows(2)
+                .filter(|w| w[1].0 - (w[0].0 + w[0].1) > 0.03)
+                .count();
+            (s[0].0, s[s.len() - 1].0 + s[s.len() - 1].1, gaps)
+        });
+        p.set_state(gst::State::Null).unwrap();
+        (video, sound)
     }
 
     /// Encode a second of synthetic frames (with a test tone when the
@@ -534,7 +743,7 @@ mod tests {
         let path = next_path(&dir, "test", codec.extension());
         // Padded rows, as the main camera's are.
         let (w, h, stride) = (320u32, 240u32, 336 * 4);
-        let mut rec = Recorder::start(Config {
+        let rec = Recorder::start(Config {
             path: path.clone(),
             codec,
             input: InputFormat::Bgrx,
@@ -545,10 +754,11 @@ mod tests {
             out_height: 180,
             fps: 30,
             rotation: 270,
+            created: Some("2026-10-14T15:24:10.123-04:00".into()),
             audio,
         })
         .unwrap();
-        for i in 0..30u32 {
+        for i in 0..45u32 {
             let frame: Vec<u8> = (0..stride / 4 * h)
                 .flat_map(|p| [(p % w) as u8, (i * 8) as u8, (p / w) as u8, 255])
                 .collect();
@@ -573,6 +783,19 @@ mod tests {
                 assert!(bytes.windows(4).any(|w| w == b"avc1"), "H.264 track");
                 if audio == Audio::Test {
                     assert!(bytes.windows(4).any(|w| w == b"Opus"), "Opus track");
+                }
+                let (video, sound) = read_back(&saved, audio == Audio::Test);
+                // 45 frames pushed every 33 ms: all kept, from zero, at 30.
+                assert!(video.len() >= 40, "{} video frames", video.len());
+                assert!(video[0] < 0.02, "video starts at {}", video[0]);
+                let span = video[video.len() - 1] - video[0];
+                let fps = (video.len() - 1) as f64 / span;
+                assert!((25.0..35.0).contains(&fps), "{fps:.1} fps");
+                if let Some((first, last, gaps)) = sound {
+                    assert!((-0.001..0.1).contains(&first), "sound starts at {first}");
+                    assert!(last <= span + 0.15, "sound ends at {last}, video at {span}");
+                    assert!(last > span - 0.3, "sound ends early at {last}");
+                    assert_eq!(gaps, 0, "gaps in the sound");
                 }
             }
             _ => assert_eq!(

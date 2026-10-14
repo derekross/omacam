@@ -39,6 +39,8 @@ pub struct Lens {
     pub zoom: f64,
     pub f_number: Option<f64>,
     pub focal_length_35mm: Option<u32>,
+    /// The real focal length, millimetres.
+    pub focal_length_mm: Option<f64>,
     pub preview: Option<Size>,
     pub still: Option<Size>,
     /// Table says it focuses, and the camera has autofocus.
@@ -88,6 +90,7 @@ struct LensEntry {
     zoom: f64,
     f_number: Option<f64>,
     focal_length_35mm: Option<u32>,
+    focal_length_mm: Option<f64>,
     preview: Option<[u32; 2]>,
     still: Option<[u32; 2]>,
     #[serde(default)]
@@ -183,6 +186,7 @@ impl TableSpec {
                     zoom: e.zoom,
                     f_number: e.f_number,
                     focal_length_35mm: e.focal_length_35mm,
+                    focal_length_mm: e.focal_length_mm,
                     preview: e.preview.map(|[w, h]| Size::new(w, h)),
                     still: e.still.map(|[w, h]| Size::new(w, h)),
                     autofocus: e.autofocus && cam.autofocus,
@@ -212,6 +216,7 @@ impl TableSpec {
                 zoom: 1.0,
                 f_number: None,
                 focal_length_35mm: None,
+                focal_length_mm: None,
                 preview: None,
                 still: None,
                 autofocus: cam.autofocus,

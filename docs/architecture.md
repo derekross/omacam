@@ -135,9 +135,11 @@ Two paths, `--display`:
   there is and plays everywhere; VP8/VP9 cost more CPU per frame at the
   same quality, so VP8 in WebM is only the fallback when no H.264 encoder
   is installed (`omacam_record::best_codec`). OpenH264 sits between them.
-  The CPU load and dropped frames at 1080p30 and 720p30 on the phone are
-  still to be measured (the recorder counts pushed frames; the leaky queue
-  before the encoder drops what it can't keep up with).
+  Measured on the Pixel 7 Pro (2026-10-14, libcamera 0.7.2-4.8), the main
+  camera through `libcamerasrc` into the encoder chain with no UI: camera
+  alone 30.2 fps; with crop, `videoconvertscale` (4 threads) and x264 at
+  1080p 30.1 fps, at 720p 30.2 fps. Synthetic 2008x1136 frames through the
+  same chain: 36 fps at 1080p, 41 at 720p. So the encoder keeps up at 30.
 - **The container.** MP4 carries Opus (the ISO BMFF Opus mapping):
   mpv (the phone's video player), Firefox, Chromium, VLC and GStreamer play
   it; QuickTime doesn't. Matroska would carry it as well but plays in fewer
@@ -157,8 +159,29 @@ Two paths, `--display`:
 
 One stream feeds both: the preview's processed frames (2008x1136 on the
 main camera, 2008x1508 on the ultrawide) go to the viewfinder and, while
-recording, to the encoder as the same shared buffer (`glib::Bytes`, no
-copy). `videocrop` takes the 16:9 middle of the frame and the zoom crop
+recording, to the encoder as the same shared buffer (no copy). The
+encoder is fed on the camera's own thread, as each frame arrives, not
+from the viewfinder: 0.1.7 encoded only the frames the UI thread got to
+show, and with that thread saturated the owner's first clips came out at
+9-17 fps.
+
+Timestamps: every frame is stamped with the pipeline clock's running time
+as it arrives, the clock the microphone's sound is stamped with; the
+first frame becomes the file's zero (an offset on both tracks), and sound
+before the first frame or after the last is dropped, so both tracks
+cover the same span. (0.1.7 let appsrc stamp frames once the pipeline
+ran, which could put the video seconds after or before the sound.) The
+muxer's input queues hold seconds, not the default 200 ms: a short audio
+queue that filled while the muxer waited for video had blocked the
+microphone and lost sound.
+
+Orientation: the file's rotation is the camera's upright turn plus how
+the phone is held when recording starts (`orientation.rs`, from
+iio-sensor-proxy's accelerometer; the front camera turns the other way),
+so a video recorded in landscape plays in landscape. Photos turn their
+pixels the same way at the shutter (EXIF Orientation stays 1), and a 4:3
+or 16:9 aspect becomes a landscape one when held sideways. The file's
+creation time is when recording started. `videocrop` takes the 16:9 middle of the frame and the zoom crop
 (padded rows are cropped off the same way), `videoscale` makes it 1920x1080
 or 1280x720 with square pixels (a fixed pixel aspect ratio: a zoom that
 changed it renegotiated the encoder, which mp4mux refused), and x264
@@ -193,8 +216,10 @@ active zoom button and the busy shutter take the theme's accent.
 - Tap to focus and exposure compensation (need the libcamera patches L1,
   L2 in Omarchy Mobile's `packages/libcamera`).
 - Location tags, the in-app viewer of recent shots.
-- Video: other frame rates, stabilisation, lens switching while recording,
-  the measured CPU load on the phone.
+- Video: other frame rates, stabilisation, lens switching while recording.
+- The on-screen controls don't turn with the phone yet.
+- Location tags: the EXIF GPS writer is done and tested (`exif::Gps`);
+  the setting stays off until omacam gets fixes from GeoClue.
 - Exposure carried across a lens switch: computed (`exposure.rs`), passed to
   libcamera only with `--exposure-hints` until it's checked whether the
   simple IPA takes `ExposureTime` as a starting point or as manual exposure.

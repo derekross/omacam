@@ -15,6 +15,7 @@ use omacam_core::backend::{Backend, Command, Event, Frame, FrameData, PixelLayou
 use omacam_core::controller::{Options, Output, Picture};
 use omacam_core::focus::Status as FocusStatus;
 use omacam_core::lens::Role;
+use omacam_core::orientation::{self, DeviceOrientation};
 use omacam_core::zoom::ZoomSource;
 use omacam_core::{capture, Controller};
 
@@ -164,6 +165,11 @@ struct App {
     gear: gtk::Button,
     rec_label: gtk::Label,
     recording: RefCell<Option<Recording>>,
+    /// The recording's camera and its frame tap, for the camera thread.
+    rec_tap: Arc<Mutex<Option<(String, omacam_record::Tap)>>>,
+    /// How the phone is held (the accelerometer).
+    held: Rc<Cell<DeviceOrientation>>,
+    _sensor: Option<crate::sensors::Accelerometer>,
 }
 
 /// A recording in progress.
@@ -356,6 +362,8 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
     window.set_content(Some(&toasts));
 
     let (tx, rx) = async_channel::unbounded::<Msg>();
+    let held = Rc::new(Cell::new(DeviceOrientation::Normal));
+    let sensor = crate::sensors::Accelerometer::claim(held.clone());
     let app = Rc::new(App {
         cli,
         window: window.clone(),
@@ -409,6 +417,9 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
         gear: gear.clone(),
         rec_label,
         recording: RefCell::new(None),
+        rec_tap: Arc::new(Mutex::new(None)),
+        held: held.clone(),
+        _sensor: sensor,
     });
     {
         let a = Rc::downgrade(&app);
@@ -524,8 +535,12 @@ fn memory_format(layout: PixelLayout) -> gdk::MemoryFormat {
 fn texture(display: &gdk::Display, frame: Frame) -> Option<(gdk::Texture, Option<glib::Bytes>)> {
     let (w, h) = (frame.size.width as i32, frame.size.height as i32);
     match frame.data {
-        FrameData::Memory(v) => {
-            let bytes = glib::Bytes::from_owned(v);
+        FrameData::Memory(_) | FrameData::Shared(_) => {
+            let bytes = match frame.data {
+                FrameData::Memory(v) => glib::Bytes::from_owned(v),
+                FrameData::Shared(s) => glib::Bytes::from_owned(s),
+                FrameData::Dmabuf { .. } => unreachable!(),
+            };
             let tex = gdk::MemoryTexture::new(
                 w,
                 h,
@@ -570,9 +585,7 @@ fn texture(display: &gdk::Display, frame: Frame) -> Option<(gdk::Texture, Option
 
 /// Mean brightness (0-255) of a memory frame, from a sparse sample.
 fn mean_luma(frame: &Frame) -> Option<f64> {
-    let FrameData::Memory(data) = &frame.data else {
-        return None;
-    };
+    let data = frame.data.bytes()?;
     let bpp = frame.layout.bytes_per_pixel() as usize;
     let (w, h) = (frame.size.width as usize, frame.size.height as usize);
     let (mut sum, mut n) = (0.0, 0u32);
@@ -616,8 +629,25 @@ impl App {
     fn start_backend(self: &Rc<Self>) {
         let tx = self.tx.clone();
         let slot = self.frame_slot.clone();
+        let rec_tap = self.rec_tap.clone();
         let sink = Box::new(move |e: Event| match e {
-            Event::Frame(f) => {
+            Event::Frame(mut f) => {
+                // While recording, every frame of the recorded camera goes
+                // to the encoder here, on the camera's thread, whatever
+                // the viewfinder keeps up with; the same pixels, shared.
+                if let FrameData::Memory(v) =
+                    std::mem::replace(&mut f.data, FrameData::Memory(Vec::new()))
+                {
+                    let shared = omacam_core::backend::SharedPixels(Arc::new(v));
+                    if let Some((camera, tap)) = rec_tap.lock().unwrap().as_ref() {
+                        if *camera == f.camera {
+                            if let Err(e) = tap.push(shared.clone()) {
+                                tracing::warn!(error = %e, "frame not recorded");
+                            }
+                        }
+                    }
+                    f.data = FrameData::Shared(shared);
+                }
                 let was_empty = {
                     let mut s = slot.lock().unwrap();
                     let empty = s.is_none();
@@ -781,11 +811,8 @@ impl App {
             frame.stride,
             frame.layout,
         );
-        if let Some((tex, bytes)) = texture(&WidgetExt::display(&self.window), frame) {
+        if let Some((tex, _)) = texture(&WidgetExt::display(&self.window), frame) {
             self.shown_format.set(Some(format));
-            if let Some(bytes) = bytes {
-                self.record_frame(&camera, bytes);
-            }
             self.viewfinder.set_frame(tex, placement);
             self.status_box.set_visible(false);
             *self.shown_camera.borrow_mut() = Some(camera);
@@ -850,9 +877,40 @@ impl App {
         };
         let stamp = fmt("%Y%m%d_%H%M%S").unwrap_or_else(|| "photo".into());
         let (make, model) = exif::device();
+        let lens_make = make.clone();
+        let held = self.held.get();
+        let front = p.lens.role == Role::Front;
+        // Held sideways: the picture turns with the phone, and the aspect
+        // ratio is a landscape one.
+        let turn = orientation::turn(p.rotation, held, front);
+        let aspect =
+            settings
+                .aspect
+                .portrait_ratio()
+                .map(|a| if held.is_landscape() { 1.0 / a } else { a });
+        let subsec = now
+            .as_ref()
+            .map(|d| format!("{:03}", d.microsecond() / 1000));
+        let lens_model = Some(format!(
+            "{}{} camera{}{}",
+            model
+                .as_deref()
+                .map(|m| format!("{m} "))
+                .unwrap_or_default(),
+            p.lens.name,
+            p.lens
+                .focal_length_mm
+                .map(|f| format!(" {f:.2}mm"))
+                .unwrap_or_default(),
+            p.lens
+                .f_number
+                .map(|n| format!(" f/{n}"))
+                .unwrap_or_default(),
+        ));
         let opts = PhotoOptions {
+            turn,
             quality: settings.jpeg_quality as i32,
-            aspect: settings.aspect.portrait_ratio(),
+            aspect,
             medium: settings.resolution == crate::settings::Resolution::Medium,
             mirror: settings.mirror_front && p.lens.role == Role::Front,
             exif: exif::Info {
@@ -861,6 +919,12 @@ impl App {
                 software: format!("omacam {}", env!("CARGO_PKG_VERSION")),
                 datetime: fmt("%Y:%m:%d %H:%M:%S").unwrap_or_default(),
                 offset: fmt("%:z"),
+                lens_make,
+                lens_model,
+                subsec,
+                // Location tags: off by default (Q5) and not wired to
+                // GeoClue yet, so no fix is passed; exif::Gps is ready.
+                gps: None,
                 ..exif::Info::default()
             },
         };
@@ -1393,18 +1457,6 @@ impl App {
         *self.countdown.borrow_mut() = Some(id);
     }
 
-    /// Hand a frame on screen to the recording, when it's from the
-    /// camera being recorded.
-    fn record_frame(&self, camera: &str, bytes: glib::Bytes) {
-        let mut rec = self.recording.borrow_mut();
-        let Some(r) = rec.as_mut().filter(|r| r.camera == camera) else {
-            return;
-        };
-        if let Err(e) = r.recorder.push(bytes) {
-            tracing::warn!(error = %e, "frame not recorded");
-        }
-    }
-
     fn toggle_recording(self: &Rc<Self>) {
         if self.recording.borrow().is_some() {
             self.stop_recording();
@@ -1443,10 +1495,23 @@ impl App {
             self.error(&format!("Can't make {}: {e}", dir.display()));
             return;
         }
-        let stamp = glib::DateTime::now_local()
-            .and_then(|d| d.format("%Y%m%d_%H%M%S"))
+        let now = glib::DateTime::now_local().ok();
+        let stamp = now
+            .as_ref()
+            .and_then(|d| d.format("%Y%m%d_%H%M%S").ok())
             .map(|s| s.to_string())
-            .unwrap_or_else(|_| "video".into());
+            .unwrap_or_else(|| "video".into());
+        let created = now
+            .as_ref()
+            .and_then(|d| d.format_iso8601().ok())
+            .map(|s| s.to_string());
+        let front = self
+            .controller
+            .borrow()
+            .as_ref()
+            .and_then(|c| c.table().index_of(&camera).map(|i| c.table().get(i).role))
+            == Some(Role::Front);
+        let held = self.held.get();
         let t = self
             .controller
             .borrow()
@@ -1468,13 +1533,22 @@ impl App {
             out_width: out_w,
             out_height: out_h,
             fps: 30,
-            rotation: t.map(|t| t.rotation).unwrap_or(0),
+            // Turned for how the phone is held when recording starts.
+            rotation: orientation::turn(t.map(|t| t.rotation).unwrap_or(0), held, front),
+            created,
             audio: omacam_record::Audio::PipeWire,
         };
         match omacam_record::Recorder::start(config) {
             Ok(recorder) => {
                 let zoom = t.map(|t| t.scale).unwrap_or(1.0);
                 recorder.set_zoom(zoom);
+                *self.rec_tap.lock().unwrap() = Some((camera.clone(), recorder.tap()));
+                // Focus once as recording starts (continuous AF holds once
+                // it has found focus; a fresh scan catches a new subject).
+                let now = Instant::now();
+                if let Some(out) = self.with_controller(|c| c.tap(0.5, 0.5, now)) {
+                    self.apply(out);
+                }
                 *self.recording.borrow_mut() = Some(Recording {
                     recorder,
                     camera,
@@ -1497,6 +1571,7 @@ impl App {
         let Some(rec) = self.recording.borrow_mut().take() else {
             return;
         };
+        self.rec_tap.lock().unwrap().take();
         self.with_controller(|c| c.set_recording(false));
         self.rec_label.set_visible(false);
         // The last frame becomes the gallery button's picture.
@@ -1704,6 +1779,9 @@ impl App {
 
 /// How to turn a captured frame into the saved photo.
 struct PhotoOptions {
+    /// Clockwise degrees from the frame to the upright photo, the way the
+    /// phone was held included.
+    turn: u32,
     quality: i32,
     /// Width over height, upright; None keeps the frame's shape.
     aspect: Option<f64>,
@@ -1721,7 +1799,7 @@ fn encode_and_write(
     stamp: &str,
     opts: PhotoOptions,
 ) -> anyhow::Result<(PathBuf, photo::Bgrx)> {
-    let FrameData::Memory(data) = &p.frame.data else {
+    let Some(data) = p.frame.data.bytes() else {
         anyhow::bail!("the still frame wasn't copied to memory");
     };
     let started = Instant::now();
@@ -1732,7 +1810,7 @@ fn encode_and_write(
         stride: p.frame.stride,
         layout: p.frame.layout,
     };
-    let img = photo::crop_and_rotate(&raw, p.crop, p.rotation)?;
+    let img = photo::crop_and_rotate(&raw, p.crop, opts.turn)?;
     let mut img = photo::crop_to_aspect(img, opts.aspect);
     if opts.mirror {
         photo::mirror(&mut img);
@@ -1753,6 +1831,7 @@ fn encode_and_write(
             .focal_length_35mm
             .map(|f| (f as f64 * p.crop).round() as u32),
         digital_zoom: Some(p.crop),
+        focal_length_mm: p.lens.focal_length_mm,
         ..opts.exif
     };
     let jpeg = exif::insert(&jpeg, &info);

@@ -24,8 +24,32 @@ pub struct Info {
     pub focal_length_35mm: Option<u32>,
     /// The digital zoom (crop) applied, 1 for none.
     pub digital_zoom: Option<f64>,
+    /// The real focal length, mm.
+    pub focal_length_mm: Option<f64>,
+    pub lens_make: Option<String>,
+    /// Which camera: "Pixel 7 Pro Main camera 7.05mm f/1.85".
+    pub lens_model: Option<String>,
+    /// Milliseconds of the second, three digits ("042").
+    pub subsec: Option<String>,
+    /// Only when location tags are on (off by default, Q5).
+    pub gps: Option<Gps>,
 }
 
+/// A position for the GPS IFD.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Gps {
+    pub latitude: f64,
+    pub longitude: f64,
+    /// Metres above sea level.
+    pub altitude: Option<f64>,
+    /// Horizontal accuracy, metres.
+    pub accuracy: Option<f64>,
+    /// UTC date "YYYY:MM:DD" and time (h, m, s) of the fix.
+    pub date: String,
+    pub time: (u32, u32, f64),
+}
+
+const BYTE: u16 = 1;
 const ASCII: u16 = 2;
 const SHORT: u16 = 3;
 const LONG: u16 = 4;
@@ -78,6 +102,70 @@ fn rational(tag: u16, num: u32, den: u32) -> Entry {
         count: 1,
         data,
     }
+}
+
+fn rationals(tag: u16, values: &[(u32, u32)]) -> Entry {
+    let mut data = Vec::new();
+    for (n, d) in values {
+        data.extend_from_slice(&n.to_le_bytes());
+        data.extend_from_slice(&d.to_le_bytes());
+    }
+    Entry {
+        tag,
+        kind: RATIONAL,
+        count: values.len() as u32,
+        data,
+    }
+}
+
+fn bytes(tag: u16, values: &[u8]) -> Entry {
+    Entry {
+        tag,
+        kind: BYTE,
+        count: values.len() as u32,
+        data: values.to_vec(),
+    }
+}
+
+/// Degrees as degrees, minutes and seconds (to 1/1000 s).
+fn dms(v: f64) -> [(u32, u32); 3] {
+    let v = v.abs();
+    let d = v.floor();
+    let m = ((v - d) * 60.0).floor();
+    let s = ((v - d) * 60.0 - m) * 60.0;
+    [
+        (d as u32, 1),
+        (m as u32, 1),
+        ((s * 1000.0).round() as u32, 1000),
+    ]
+}
+
+fn gps_entries(g: &Gps) -> Vec<Entry> {
+    let mut e = vec![
+        bytes(0x0000, &[2, 3, 0, 0]),
+        ascii(0x0001, if g.latitude >= 0.0 { "N" } else { "S" }),
+        rationals(0x0002, &dms(g.latitude)),
+        ascii(0x0003, if g.longitude >= 0.0 { "E" } else { "W" }),
+        rationals(0x0004, &dms(g.longitude)),
+        rationals(
+            0x0007,
+            &[
+                (g.time.0, 1),
+                (g.time.1, 1),
+                ((g.time.2 * 1000.0).round() as u32, 1000),
+            ],
+        ),
+        ascii(0x0012, "WGS-84"),
+        ascii(0x001d, &g.date),
+    ];
+    if let Some(a) = g.altitude {
+        e.push(bytes(0x0005, &[u8::from(a < 0.0)]));
+        e.push(ratio(0x0006, a.abs(), 100));
+    }
+    if let Some(acc) = g.accuracy {
+        e.push(ratio(0x001f, acc, 100));
+    }
+    e
 }
 
 /// A value as a rational with the given denominator.
@@ -176,15 +264,40 @@ pub fn tiff(info: &Info) -> Vec<u8> {
     if let Some(f) = info.focal_length_35mm {
         exif.push(short(0xa405, f.min(u16::MAX as u32) as u16));
     }
-    // Header (8), then IFD0 with a pointer to the Exif IFD after it.
-    let ifd0_len = ifd_len(&ifd0) + 12; // + the pointer entry
+    if let Some(f) = info.focal_length_mm {
+        exif.push(ratio(0x920a, f, 100));
+    }
+    if let Some(m) = &info.lens_make {
+        exif.push(ascii(0xa433, m));
+    }
+    if let Some(m) = &info.lens_model {
+        exif.push(ascii(0xa434, m));
+    }
+    if let Some(s) = &info.subsec {
+        exif.push(ascii(0x9290, s));
+        exif.push(ascii(0x9291, s));
+        exif.push(ascii(0x9292, s));
+    }
+    let gps = info.gps.as_ref().map(gps_entries);
+    // Header (8), IFD0 with pointers to the Exif IFD and the GPS IFD,
+    // then those two.
+    let pointers = if gps.is_some() { 2 } else { 1 };
+    let ifd0_len = ifd_len(&ifd0) + 12 * pointers;
     let exif_at = 8 + ifd0_len;
+    let gps_at = exif_at + ifd_len(&exif);
     ifd0.push(long(0x8769, exif_at));
+    if gps.is_some() {
+        ifd0.push(long(0x8825, gps_at));
+    }
     let mut out = b"II*\0".to_vec();
     out.extend_from_slice(&8u32.to_le_bytes());
     write_ifd(&mut out, ifd0, 0);
     debug_assert_eq!(out.len() as u32, exif_at);
     write_ifd(&mut out, exif, 0);
+    if let Some(g) = gps {
+        debug_assert_eq!(out.len() as u32, gps_at);
+        write_ifd(&mut out, g, 0);
+    }
     out
 }
 
@@ -250,6 +363,11 @@ mod tests {
             f_number: Some(1.85),
             focal_length_35mm: Some(25),
             digital_zoom: Some(2.0),
+            focal_length_mm: Some(7.05),
+            lens_make: Some("Google".into()),
+            lens_model: Some("Pixel 7 Pro Main camera 7.05mm f/1.85".into()),
+            subsec: Some("042".into()),
+            gps: None,
         }
     }
 
@@ -287,9 +405,57 @@ mod tests {
         assert_eq!(get(Tag::DigitalZoomRatio), "2");
         assert_eq!(get(Tag::PixelXDimension), "3072");
         assert_eq!(get(Tag::PixelYDimension), "4072");
-        assert!(exif
-            .get_field(Tag::GPSLatitude, ::exif::In::PRIMARY)
-            .is_none());
+        assert_eq!(get(Tag::FocalLength), "7.05");
+        assert_eq!(
+            get(Tag::LensModel),
+            "\"Pixel 7 Pro Main camera 7.05mm f/1.85\""
+        );
+        assert_eq!(get(Tag::LensMake), "\"Google\"");
+        assert_eq!(get(Tag::SubSecTimeOriginal), "\"042\"");
+        assert!(
+            exif.get_field(Tag::GPSLatitude, ::exif::In::PRIMARY)
+                .is_none(),
+            "no GPS when off"
+        );
+    }
+
+    #[test]
+    fn location_tags_when_given_a_fix() {
+        let with_gps = Info {
+            gps: Some(Gps {
+                latitude: 51.4779,
+                longitude: -0.0015,
+                altitude: Some(45.5),
+                accuracy: Some(12.0),
+                date: "2026:10:14".into(),
+                time: (19, 24, 10.5),
+            }),
+            ..info()
+        };
+        let out = insert(&jpeg(), &with_gps);
+        let exif = ::exif::Reader::new()
+            .read_from_container(&mut std::io::Cursor::new(&out))
+            .expect("EXIF parses");
+        use ::exif::{In, Tag, Value};
+        let field = |t| {
+            exif.get_field(t, In::PRIMARY)
+                .unwrap_or_else(|| panic!("{t} missing"))
+        };
+        let deg = |t| match &field(t).value {
+            Value::Rational(v) => v[0].to_f64() + v[1].to_f64() / 60.0 + v[2].to_f64() / 3600.0,
+            other => panic!("{other:?}"),
+        };
+        assert!((deg(Tag::GPSLatitude) - 51.4779).abs() < 1e-6);
+        assert!((deg(Tag::GPSLongitude) - 0.0015).abs() < 1e-6);
+        assert_eq!(field(Tag::GPSLatitudeRef).display_value().to_string(), "N");
+        assert_eq!(field(Tag::GPSLongitudeRef).display_value().to_string(), "W");
+        assert_eq!(field(Tag::GPSAltitude).display_value().to_string(), "45.5");
+        assert_eq!(
+            field(Tag::GPSDateStamp).display_value().to_string(),
+            "2026-10-14"
+        );
+        assert_eq!(field(Tag::Make).display_value().to_string(), "\"Google\"");
+        assert_eq!(field(Tag::FocalLength).display_value().to_string(), "7.05");
     }
 
     #[test]

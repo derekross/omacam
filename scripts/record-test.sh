@@ -17,4 +17,4 @@ fi
 mkdir -p "$HOME/.cargo/registry"
 docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/src" -v "$HOME/.cargo/registry:/cargo/registry" \
   -e CARGO_HOME=/cargo -e HOME=/tmp -e CARGO_TARGET_DIR=/src/target/record-test -w /src "$tag" \
-  cargo test --locked -p omacam-record -- --nocapture
+  env RUST_LOG=${RUST_LOG:-} GST_DEBUG=${GST_DEBUG:-1} cargo test --locked -p omacam-record -- --nocapture
