@@ -809,7 +809,7 @@ dependencies = [
 
 [[package]]
 name = "omacam"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -826,7 +826,7 @@ dependencies = [
 
 [[package]]
 name = "omacam-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde",
  "thiserror 2.0.21",
@@ -836,7 +836,7 @@ dependencies = [
 
 [[package]]
 name = "omacam-fake"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "omacam-core",
  "tracing",
@@ -844,7 +844,7 @@ dependencies = [
 
 [[package]]
 name = "omacam-libcamera"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "libcamera",
  "omacam-core",

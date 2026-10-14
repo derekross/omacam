@@ -51,6 +51,16 @@ pub fn fit(frame: (f32, f32), widget: (f32, f32), inset: f32) -> graphene::Rect 
     graphene::Rect::new(x, y, dw, dh)
 }
 
+/// The part of an upright frame of `frame` size that shows at `scale`:
+/// a centred rectangle (x, y, w, h) in frame pixels. Drawing clips the
+/// scaled frame to its fitted rectangle, so this is what fills it.
+#[cfg(test)]
+fn visible_source(frame: (f32, f32), scale: f64) -> (f32, f32, f32, f32) {
+    let s = scale.max(1.0) as f32;
+    let (w, h) = (frame.0 / s, frame.1 / s);
+    ((frame.0 - w) / 2.0, (frame.1 - h) / 2.0, w, h)
+}
+
 mod imp {
     use super::*;
 
@@ -209,6 +219,52 @@ mod tests {
         let r = fit((1136.0, 2016.0), (1920.0, 1080.0), 0.0);
         assert!((r.height() - 1080.0).abs() < 0.01);
         assert!(r.x() > 0.0);
+    }
+
+    /// Every zoom from 0.45x to 10x on the Pixel 7 Pro, in the window the
+    /// phone gives the app (456 wide, about 730 above the control bar):
+    /// the picture fills the viewfinder's width or height, and what shows
+    /// is a rectangle inside the frame.
+    #[test]
+    fn every_zoom_fills_the_viewfinder_with_a_crop_inside_the_frame() {
+        use omacam_core::controller::Options;
+        use omacam_core::zoom::ZoomSource;
+        use omacam_core::{Controller, LensTable};
+        let cams = omacam_fake::cheetah_cameras();
+        let spec = omacam_core::lens::TableSpec::cheetah();
+        let table: LensTable = spec.resolve(&cams);
+        let mut c = Controller::new(&spec, &cams, Options::default());
+        let now = std::time::Instant::now();
+        let widget = (456.0f32, 730.0f32);
+        let mut z = 0.45;
+        while z <= 10.0 {
+            c.set_zoom(z, ZoomSource::Preset, now);
+            for lens in table.lenses().iter().filter(|l| !l.mirror) {
+                let t = c.transform(&lens.id).unwrap();
+                let (pw, ph) = (
+                    lens.preview.unwrap().width as f32,
+                    lens.preview.unwrap().height as f32,
+                );
+                let upright = if t.rotation % 180 == 90 {
+                    (ph, pw)
+                } else {
+                    (pw, ph)
+                };
+                let r = fit(upright, widget, 0.0);
+                let fills =
+                    (r.width() - widget.0).abs() < 0.01 || (r.height() - widget.1).abs() < 0.01;
+                assert!(fills, "{} at {z}: {:?}", lens.name, r);
+                let (x, y, w, h) = visible_source(upright, t.scale);
+                assert!(
+                    x >= 0.0 && y >= 0.0 && x + w <= upright.0 + 0.01 && y + h <= upright.1 + 0.01
+                );
+                assert!(w <= upright.0 && h <= upright.1 && w > 0.0 && h > 0.0);
+                // The visible part keeps the frame's aspect, so it fills
+                // the fitted rectangle exactly.
+                assert!((w / h - upright.0 / upright.1).abs() < 1e-3);
+            }
+            z += 0.05;
+        }
     }
 
     #[test]

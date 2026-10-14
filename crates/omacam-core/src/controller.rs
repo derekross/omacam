@@ -64,8 +64,8 @@ pub enum Output {
 /// How to draw a frame of one lens.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Transform {
-    /// Magnification of the frame (crop), may be below 1 for a frozen frame
-    /// of a narrower lens.
+    /// Magnification of the frame about its centre (the zoom crop), never
+    /// below 1.
     pub scale: f64,
     /// Clockwise degrees that turn the frame upright.
     pub rotation: u32,
@@ -232,9 +232,12 @@ impl Controller {
         let i = self.table.index_of(camera)?;
         let lens = self.table.get(i);
         let zoom = self.side().map(|s| s.planner.zoom()).unwrap_or(1.0);
-        // A frame from the other side (frozen across a flip) keeps 1x.
+        // A frame from the other side (frozen across a flip) keeps 1x. A
+        // frame is never drawn below 1x: a lens can't show more than its
+        // own field of view, so a frozen frame from a narrower lens holds
+        // at its full view until the wider lens's first frame.
         let scale = if lens.role.faces_front() == (self.facing == Facing::Front) {
-            zoom / lens.zoom
+            (zoom / lens.zoom).max(1.0)
         } else {
             1.0
         };
@@ -723,6 +726,31 @@ mirror = true
         assert_eq!(c.transform("tele").unwrap().rotation, 270);
         let front = c.transform("front").unwrap();
         assert_eq!((front.rotation, front.mirror), (270, true));
+    }
+
+    #[test]
+    fn frames_are_never_drawn_below_their_own_field_of_view() {
+        let now = Instant::now();
+        let mut c = Controller::new(&spec(), &cameras(), Options::default());
+        open(&mut c, now);
+        let mut z = 0.45;
+        while z <= 10.0 {
+            c.set_zoom(z, ZoomSource::Gesture, now);
+            for cam in ["main", "uw", "tele"] {
+                let t = c.transform(cam).unwrap();
+                assert!(t.scale >= 1.0, "{cam} at {z}: scale {}", t.scale);
+            }
+            // The lens that should be streaming crops exactly zoom/factor.
+            let lens = c.table().get(c.side().unwrap().lens());
+            let t = c.transform(&lens.id).unwrap();
+            assert!((t.scale - (z / lens.zoom).max(1.0)).abs() < 1e-9);
+            z += 0.01;
+        }
+        // The frozen main frame while the ultrawide starts for 0.6x: full
+        // view, not shrunk.
+        c.set_zoom(0.6, ZoomSource::Preset, now);
+        assert_eq!(c.transform("main").unwrap().scale, 1.0);
+        assert!((c.transform("uw").unwrap().scale - 0.6 / 0.45).abs() < 1e-9);
     }
 
     #[test]

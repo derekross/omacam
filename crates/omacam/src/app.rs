@@ -115,6 +115,10 @@ struct App {
 
     shown_camera: RefCell<Option<String>>,
     shown_size: Cell<(u32, u32)>,
+    /// Mean brightness (0-255) and the AE values of the last shown frame,
+    /// for the state log.
+    shown_luma: Cell<Option<f64>>,
+    shown_ae: Cell<(Option<i32>, Option<f32>)>,
     fps: RefCell<Fps>,
     pinch_base: Cell<f64>,
     drag_base: Cell<f64>,
@@ -295,6 +299,8 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
         tx,
         shown_camera: RefCell::new(None),
         shown_size: Cell::new((0, 0)),
+        shown_luma: Cell::new(None),
+        shown_ae: Cell::new((None, None)),
         fps: RefCell::new(Fps {
             window_start: Instant::now(),
             frames: 0,
@@ -429,6 +435,28 @@ fn texture(display: &gdk::Display, frame: Frame) -> Option<gdk::Texture> {
             }
         }
     }
+}
+
+/// Mean brightness (0-255) of a memory frame, from a sparse sample.
+fn mean_luma(frame: &Frame) -> Option<f64> {
+    let FrameData::Memory(data) = &frame.data else {
+        return None;
+    };
+    let bpp = frame.layout.bytes_per_pixel() as usize;
+    let (w, h) = (frame.size.width as usize, frame.size.height as usize);
+    let (mut sum, mut n) = (0.0, 0u32);
+    for y in (0..h).step_by(16) {
+        for x in (0..w).step_by(16) {
+            let i = y * frame.stride as usize + x * bpp;
+            let Some(p) = data.get(i..i + 3) else {
+                continue;
+            };
+            // B, G, R for the XRGB/RGB layouts; close enough for the others.
+            sum += 0.114 * p[0] as f64 + 0.587 * p[1] as f64 + 0.299 * p[2] as f64;
+            n += 1;
+        }
+    }
+    (n > 0).then(|| sum / n as f64)
 }
 
 fn format_zoom(z: f64) -> String {
@@ -567,6 +595,11 @@ impl App {
         let placement = self.placement_for(&frame.camera);
         let camera = frame.camera.clone();
         let size = (frame.size.width, frame.size.height);
+        if self.cli.debug || self.cli.script.is_some() {
+            self.shown_luma.set(mean_luma(&frame));
+            self.shown_ae
+                .set((frame.meta.exposure_us, frame.meta.analogue_gain));
+        }
         if let Some(tex) = texture(&WidgetExt::display(&self.window), frame) {
             self.viewfinder.set_frame(tex, placement);
             self.status.set_visible(false);
@@ -1066,6 +1099,9 @@ impl App {
             switch_ms = view.last_switch.map(|d| d.as_millis() as u64),
             switching = view.switching,
             capturing = view.capturing,
+            luma = self.shown_luma.get().map(|l| format!("{l:.0}")),
+            exposure_us = self.shown_ae.get().0,
+            gain = self.shown_ae.get().1,
             "state"
         );
     }
