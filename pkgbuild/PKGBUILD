@@ -12,6 +12,11 @@ depends=(
   'gcc-libs'
   'glib2'
   'glibc'
+  gst-plugin-pipewire
+  gst-plugins-base
+  gst-plugins-good
+  gst-plugins-ugly
+  gstreamer
   'gtk4>=4.14'
   'hicolor-icon-theme'
   'libadwaita>=1.5'

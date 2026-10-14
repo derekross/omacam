@@ -44,6 +44,18 @@ window.omacam, window.omacam viewfinder { background: black; }
   box-shadow: 0 0 0 5px rgba(255,255,255,0.35);
 }
 .shutter:active { background: #d8d8d8; }
+.shutter.record { background: #e5383b; }
+.shutter.recording { background: #e5383b; border-radius: 18px; }
+.mode-switch button {
+  min-height: 32px; padding: 0 16px; border-radius: 999px;
+  background: transparent; color: rgba(255,255,255,0.8); font-weight: bold;
+  box-shadow: none;
+}
+.mode-switch button:checked { background: rgba(255,255,255,0.18); color: var(--accent-bg-color); }
+.rec-timer {
+  background: #e5383b; color: white; font-weight: bold;
+  border-radius: 999px; padding: 4px 12px; font-feature-settings: "tnum";
+}
 .shutter.busy { background: var(--accent-bg-color); }
 .round-button {
   min-width: 56px; min-height: 56px; padding: 0; margin: 0; border-radius: 999px;
@@ -76,6 +88,7 @@ enum Msg {
     Saved(Result<(PathBuf, photo::Bgrx), String>),
     /// A command on the control socket (`omacam --remote shutter`).
     Remote(String),
+    VideoSaved(Result<PathBuf, String>),
 }
 
 struct Fps {
@@ -143,6 +156,22 @@ struct App {
     countdown: RefCell<Option<glib::SourceId>>,
     countdown_left: Cell<u32>,
     settings_dialog: RefCell<Option<adw::PreferencesDialog>>,
+    /// The size, stride and layout of the frames on screen.
+    shown_format: Cell<Option<(u32, u32, u32, PixelLayout)>>,
+    mode_photo: gtk::ToggleButton,
+    mode_video: gtk::ToggleButton,
+    mode_box: gtk::Box,
+    gear: gtk::Button,
+    rec_label: gtk::Label,
+    recording: RefCell<Option<Recording>>,
+}
+
+/// A recording in progress.
+struct Recording {
+    recorder: omacam_record::Recorder,
+    camera: String,
+    since: Instant,
+    zoom: f64,
 }
 
 pub fn run(cli: Cli) -> glib::ExitCode {
@@ -213,6 +242,14 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
     gear.set_margin_end(10);
     gear.set_size_request(44, 44);
     overlay.add_overlay(&gear);
+    let rec_label = gtk::Label::new(None);
+    rec_label.add_css_class("rec-timer");
+    rec_label.set_halign(gtk::Align::Center);
+    rec_label.set_valign(gtk::Align::Start);
+    rec_label.set_margin_top(14);
+    rec_label.set_visible(false);
+    rec_label.set_can_target(false);
+    overlay.add_overlay(&rec_label);
 
     // Centre: zoom readout while zooming, and status text.
     let zoom_indicator = gtk::Label::new(None);
@@ -291,7 +328,22 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
     let controls = gtk::Box::new(gtk::Orientation::Vertical, 12);
     controls.add_css_class("omacam-controls");
     controls.set_vexpand(false);
+    // Photo / Video.
+    let mode_photo = gtk::ToggleButton::with_label("Photo");
+    let mode_video = gtk::ToggleButton::with_label("Video");
+    mode_video.set_group(Some(&mode_photo));
+    mode_photo.set_active(true);
+    let mode_box = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    mode_box.add_css_class("mode-switch");
+    mode_box.set_halign(gtk::Align::Center);
+    mode_box.append(&mode_photo);
+    mode_box.append(&mode_video);
+    if omacam_record::init().is_err() {
+        mode_video.set_sensitive(false);
+        mode_video.set_tooltip_text(Some("GStreamer didn't start"));
+    }
     controls.append(&pills);
+    controls.append(&mode_box);
     controls.append(&row);
 
     let page = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -350,6 +402,13 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
         countdown: RefCell::new(None),
         countdown_left: Cell::new(0),
         settings_dialog: RefCell::new(None),
+        shown_format: Cell::new(None),
+        mode_photo,
+        mode_video,
+        mode_box,
+        gear: gear.clone(),
+        rec_label,
+        recording: RefCell::new(None),
     });
     {
         let a = Rc::downgrade(&app);
@@ -422,6 +481,13 @@ async fn run_script(app: Rc<App>, steps: Vec<crate::script::Step>) {
                     d.close();
                 }
             }
+            Step::Mode(m) => {
+                if m == "video" {
+                    app.mode_video.set_active(true);
+                } else {
+                    app.mode_photo.set_active(true);
+                }
+            }
             Step::Tap(u, v) => {
                 if let Some(out) = app.with_controller(|c| c.tap(u, v, Instant::now())) {
                     app.apply(out);
@@ -453,19 +519,23 @@ fn memory_format(layout: PixelLayout) -> gdk::MemoryFormat {
     }
 }
 
-fn texture(display: &gdk::Display, frame: Frame) -> Option<gdk::Texture> {
+/// A texture for the viewfinder, and for a memory frame its pixels as
+/// shared bytes (the recorder takes the same bytes, no copy).
+fn texture(display: &gdk::Display, frame: Frame) -> Option<(gdk::Texture, Option<glib::Bytes>)> {
     let (w, h) = (frame.size.width as i32, frame.size.height as i32);
     match frame.data {
-        FrameData::Memory(v) => Some(
-            gdk::MemoryTexture::new(
+        FrameData::Memory(v) => {
+            let bytes = glib::Bytes::from_owned(v);
+            let tex = gdk::MemoryTexture::new(
                 w,
                 h,
                 memory_format(frame.layout),
-                &glib::Bytes::from_owned(v),
+                &bytes,
                 frame.stride as usize,
             )
-            .upcast(),
-        ),
+            .upcast();
+            Some((tex, Some(bytes)))
+        }
         FrameData::Dmabuf {
             fd,
             offset,
@@ -488,7 +558,7 @@ fn texture(display: &gdk::Display, frame: Frame) -> Option<gdk::Texture> {
                     .build_with_release_func(move || drop(release))
             };
             match built {
-                Ok(t) => Some(t),
+                Ok(t) => Some((t, None)),
                 Err(e) => {
                     tracing::warn!(error = %e, "dmabuf import failed");
                     None
@@ -684,6 +754,11 @@ impl App {
                 *self.last_photo.borrow_mut() = Some(path);
             }
             Msg::Saved(Err(e)) => self.error(&format!("Photo not saved: {e}")),
+            Msg::VideoSaved(Ok(path)) => {
+                self.thumb.set_sensitive(true);
+                *self.last_photo.borrow_mut() = Some(path);
+            }
+            Msg::VideoSaved(Err(e)) => self.error(&format!("Video not saved: {e}")),
             Msg::Remote(cmd) => match cmd.as_str() {
                 "shutter" => self.press_shutter(),
                 other => tracing::warn!(command = other, "unknown remote command"),
@@ -700,7 +775,17 @@ impl App {
             self.shown_ae
                 .set((frame.meta.exposure_us, frame.meta.analogue_gain));
         }
-        if let Some(tex) = texture(&WidgetExt::display(&self.window), frame) {
+        let format = (
+            frame.size.width,
+            frame.size.height,
+            frame.stride,
+            frame.layout,
+        );
+        if let Some((tex, bytes)) = texture(&WidgetExt::display(&self.window), frame) {
+            self.shown_format.set(Some(format));
+            if let Some(bytes) = bytes {
+                self.record_frame(&camera, bytes);
+            }
             self.viewfinder.set_frame(tex, placement);
             self.status_box.set_visible(false);
             *self.shown_camera.borrow_mut() = Some(camera);
@@ -836,7 +921,57 @@ impl App {
             self.shutter.remove_css_class("busy");
         }
         self.shutter
-            .set_sensitive(!view.capturing && !view.switching);
+            .set_sensitive(!view.capturing && (!view.switching || view.recording));
+        let video = view.mode == omacam_core::controller::Mode::Video;
+        if video {
+            self.shutter.add_css_class("record");
+            self.shutter.set_tooltip_text(Some(if view.recording {
+                "Stop recording"
+            } else {
+                "Record"
+            }));
+        } else {
+            self.shutter.remove_css_class("record");
+            self.shutter.set_tooltip_text(Some("Take a photo"));
+        }
+        if view.recording {
+            self.shutter.add_css_class("recording");
+        } else {
+            self.shutter.remove_css_class("recording");
+        }
+        self.mode_box
+            .set_sensitive(!view.recording && !view.capturing);
+        if self.mode_video.is_active() != video {
+            if video {
+                self.mode_video.set_active(true);
+            } else {
+                self.mode_photo.set_active(true);
+            }
+        }
+        self.gear.set_sensitive(!view.recording);
+        if view.recording {
+            self.flip.set_sensitive(false);
+        }
+        let mut rec = self.recording.borrow_mut();
+        if let Some(r) = rec.as_mut() {
+            let scale = self
+                .controller
+                .borrow()
+                .as_ref()
+                .and_then(|c| c.transform(&r.camera))
+                .map(|t| t.scale)
+                .unwrap_or(1.0);
+            if (scale - r.zoom).abs() > 1e-6 {
+                r.recorder.set_zoom(scale);
+                r.zoom = scale;
+            }
+            self.rec_label.set_label(&format!(
+                "● {}",
+                omacam_record::format_elapsed(r.since.elapsed())
+            ));
+            self.rec_label.set_visible(true);
+        }
+        drop(rec);
         if !self.setting_slider.get() {
             let pos = self
                 .controller
@@ -865,8 +1000,14 @@ impl App {
                 }
             },
         });
+        // Video records 16:9, upright 9:16: show what goes in the file.
+        let aspect = if view.mode == omacam_core::controller::Mode::Video {
+            Some(9.0 / 16.0)
+        } else {
+            settings.aspect.portrait_ratio()
+        };
         self.viewfinder.set_decor(Decor {
-            aspect: settings.aspect.portrait_ratio(),
+            aspect,
             grid: settings.grid.lines(),
             ring,
         });
@@ -1070,6 +1211,17 @@ impl App {
                 a.press_shutter();
             }
         });
+        let a = Rc::downgrade(self);
+        self.mode_video.connect_toggled(move |b| {
+            let Some(a) = a.upgrade() else { return };
+            let mode = if b.is_active() {
+                omacam_core::controller::Mode::Video
+            } else {
+                omacam_core::controller::Mode::Photo
+            };
+            a.with_controller(|c| c.set_mode(mode));
+            a.refresh();
+        });
 
         // Tap the picture to focus there.
         let tap = gtk::GestureClick::new();
@@ -1161,6 +1313,9 @@ impl App {
     }
 
     fn set_suspended(self: &Rc<Self>, suspended: bool) {
+        if suspended {
+            self.stop_recording();
+        }
         if self.suspended.replace(suspended) == suspended {
             return;
         }
@@ -1184,7 +1339,7 @@ impl App {
             });
             if !out.is_empty() {
                 self.apply(out);
-            } else if self.debug_enabled() || focus {
+            } else if self.debug_enabled() || focus || self.recording.borrow().is_some() {
                 self.refresh();
             }
         }
@@ -1197,6 +1352,15 @@ impl App {
     /// The shutter button, a volume key or the control socket: start the
     /// self-timer if one is set, or cancel a running one.
     fn press_shutter(self: &Rc<Self>) {
+        let video = self
+            .controller
+            .borrow()
+            .as_ref()
+            .is_some_and(|c| c.view().mode == omacam_core::controller::Mode::Video);
+        if video {
+            self.toggle_recording();
+            return;
+        }
         if let Some(id) = self.countdown.borrow_mut().take() {
             id.remove();
             self.zoom_indicator.set_visible(false);
@@ -1227,6 +1391,164 @@ impl App {
             glib::ControlFlow::Continue
         });
         *self.countdown.borrow_mut() = Some(id);
+    }
+
+    /// Hand a frame on screen to the recording, when it's from the
+    /// camera being recorded.
+    fn record_frame(&self, camera: &str, bytes: glib::Bytes) {
+        let mut rec = self.recording.borrow_mut();
+        let Some(r) = rec.as_mut().filter(|r| r.camera == camera) else {
+            return;
+        };
+        if let Err(e) = r.recorder.push(bytes) {
+            tracing::warn!(error = %e, "frame not recorded");
+        }
+    }
+
+    fn toggle_recording(self: &Rc<Self>) {
+        if self.recording.borrow().is_some() {
+            self.stop_recording();
+        } else {
+            self.start_recording();
+        }
+    }
+
+    fn start_recording(self: &Rc<Self>) {
+        let Some(camera) = self
+            .controller
+            .borrow()
+            .as_ref()
+            .and_then(|c| c.recording_source())
+        else {
+            return;
+        };
+        if self.cli.display != crate::Display::Memory {
+            self.error("Video recording needs the memory display for now (--display memory)");
+            return;
+        }
+        let Some((w, h, stride, layout)) = self.shown_format.get() else {
+            return;
+        };
+        let Some(codec) = omacam_record::best_codec() else {
+            self.error("No video encoder: install gst-plugins-ugly (x264)");
+            return;
+        };
+        let settings = self.settings.borrow().clone();
+        let dir = self
+            .cli
+            .output_dir
+            .clone()
+            .unwrap_or_else(crate::settings::default_video_dir);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            self.error(&format!("Can't make {}: {e}", dir.display()));
+            return;
+        }
+        let stamp = glib::DateTime::now_local()
+            .and_then(|d| d.format("%Y%m%d_%H%M%S"))
+            .map(|s| s.to_string())
+            .unwrap_or_else(|_| "video".into());
+        let t = self
+            .controller
+            .borrow()
+            .as_ref()
+            .and_then(|c| c.transform(&camera));
+        let (out_w, out_h) = settings.video_resolution.size();
+        let config = omacam_record::Config {
+            path: omacam_record::next_path(&dir, &stamp, codec.extension()),
+            codec,
+            input: match layout {
+                PixelLayout::Xrgb8888 => omacam_record::InputFormat::Bgrx,
+                PixelLayout::Xbgr8888 => omacam_record::InputFormat::Rgbx,
+                PixelLayout::Rgb888 => omacam_record::InputFormat::Bgr,
+                PixelLayout::Bgr888 => omacam_record::InputFormat::Rgb,
+            },
+            in_width: w,
+            in_height: h,
+            stride,
+            out_width: out_w,
+            out_height: out_h,
+            fps: 30,
+            rotation: t.map(|t| t.rotation).unwrap_or(0),
+            audio: omacam_record::Audio::PipeWire,
+        };
+        match omacam_record::Recorder::start(config) {
+            Ok(recorder) => {
+                let zoom = t.map(|t| t.scale).unwrap_or(1.0);
+                recorder.set_zoom(zoom);
+                *self.recording.borrow_mut() = Some(Recording {
+                    recorder,
+                    camera,
+                    since: Instant::now(),
+                    zoom,
+                });
+                self.with_controller(|c| c.set_recording(true));
+                if self.settings.borrow().shutter_sound {
+                    play_shutter_sound();
+                }
+            }
+            Err(e) => self.error(&format!("Recording didn't start: {e}")),
+        }
+        self.refresh();
+    }
+
+    /// Stop and finish the file off the UI thread. `wait` finishes it here
+    /// (at shutdown).
+    fn finish_recording(self: &Rc<Self>, wait: bool) {
+        let Some(rec) = self.recording.borrow_mut().take() else {
+            return;
+        };
+        self.with_controller(|c| c.set_recording(false));
+        self.rec_label.set_visible(false);
+        // The last frame becomes the gallery button's picture.
+        if let Some(tex) = self.viewfinder.texture() {
+            let mut d = gdk::TextureDownloader::new(&tex);
+            d.set_format(gdk::MemoryFormat::B8g8r8a8);
+            let (bytes, stride) = d.download_bytes();
+            let (w, h) = (tex.width() as u32, tex.height() as u32);
+            let mut data = Vec::with_capacity((w * h * 4) as usize);
+            for row in bytes.chunks(stride).take(h as usize) {
+                data.extend_from_slice(&row[..(w * 4) as usize]);
+            }
+            let img = photo::Bgrx {
+                width: w,
+                height: h,
+                data,
+            };
+            let rotation = self.placement_for(&rec.camera).rotation;
+            let raw = photo::Raw {
+                data: &img.data,
+                width: w,
+                height: h,
+                stride: w * 4,
+                layout: PixelLayout::Xrgb8888,
+            };
+            if let Ok(upright) = photo::crop_and_rotate(&raw, 1.0, rotation) {
+                let t = photo::thumbnail(&upright);
+                let tex = gdk::MemoryTexture::new(
+                    t.width as i32,
+                    t.height as i32,
+                    gdk::MemoryFormat::B8g8r8x8,
+                    &glib::Bytes::from_owned(t.data),
+                    t.width as usize * 4,
+                );
+                self.thumb_picture.set_paintable(Some(&tex));
+                self.thumb_picture.set_pixel_size(56);
+            }
+        }
+        if wait {
+            let _ = rec.recorder.stop();
+            return;
+        }
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let result = rec.recorder.stop().map_err(|e| e.to_string());
+            let _ = tx.send_blocking(Msg::VideoSaved(result));
+        });
+        self.refresh();
+    }
+
+    fn stop_recording(self: &Rc<Self>) {
+        self.finish_recording(false);
     }
 
     fn take_photo(self: &Rc<Self>) {
@@ -1362,6 +1684,7 @@ impl App {
     }
 
     fn shutdown(self: &Rc<Self>) {
+        self.finish_recording(true);
         self.suspended.set(true);
         self.freeze_in_memory();
         self.frame_slot.lock().unwrap().take();

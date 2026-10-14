@@ -4,6 +4,7 @@ members = [
     "crates/omacam-core",
     "crates/omacam-fake",
     "crates/omacam-libcamera",
+    "crates/omacam-record",
     "crates/omacam",
 ]
 # The libcamera backend needs libcamera's headers and library at build time.
@@ -12,11 +13,12 @@ members = [
 default-members = [
     "crates/omacam-core",
     "crates/omacam-fake",
+    "crates/omacam-record",
     "crates/omacam",
 ]
 
 [workspace.package]
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 license = "GPL-3.0-or-later"
 rust-version = "1.87"
@@ -32,6 +34,7 @@ undocumented_unsafe_blocks = "warn"
 omacam-core = { path = "crates/omacam-core" }
 omacam-fake = { path = "crates/omacam-fake" }
 omacam-libcamera = { path = "crates/omacam-libcamera" }
+omacam-record = { path = "crates/omacam-record" }
 
 anyhow = "1"
 thiserror = "2"

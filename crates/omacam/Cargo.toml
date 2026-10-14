@@ -17,6 +17,7 @@ libcamera = ["dep:omacam-libcamera"]
 [dependencies]
 omacam-core.workspace = true
 omacam-fake.workspace = true
+omacam-record.workspace = true
 omacam-libcamera = { workspace = true, optional = true }
 anyhow.workspace = true
 clap.workspace = true

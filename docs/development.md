@@ -68,6 +68,10 @@ ssh phone 'cat > /usr/local/bin/omacam && chmod 755 /usr/local/bin/omacam' \
   the fake backend in real time: zooming across all lenses, a full still,
   flipping, and a busy camera that frees up.
 
+- **`scripts/record-test.sh`** runs the recorder's tests in a container
+  that has GStreamer's encoders, so the encode-to-a-file test runs (it
+  skips where they're missing); `CODEC_PLUGINS=gst-plugins-good` tests the
+  VP8/WebM fallback.
 - **`scripts/ui-shots.sh`** takes screenshots of the UI on synthetic
   frames at 480x1040 in a headless Weston inside a container (never on
   your own desktop), into `target/ui-shots/`.

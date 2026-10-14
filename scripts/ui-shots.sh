@@ -8,11 +8,11 @@
 # Writes target/ui-shots/*.png. Needs Docker; builds the app (no libcamera).
 set -euo pipefail
 cd "$(dirname "$0")/.."
-IMAGE=omacam-uitest:1
+IMAGE=omacam-uitest:2
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
   docker build -t "$IMAGE" - <<'DOCKERFILE'
 FROM archlinux:latest
-RUN pacman -Syu --noconfirm --needed weston gtk4 libadwaita adwaita-icon-theme libjpeg-turbo ttf-dejavu mesa && pacman -Scc --noconfirm
+RUN pacman -Syu --noconfirm --needed weston gtk4 libadwaita adwaita-icon-theme libjpeg-turbo ttf-dejavu mesa gstreamer gst-plugins-base gst-plugins-good gst-plugins-ugly && pacman -Scc --noconfirm
 DOCKERFILE
 fi
 cargo build --release --locked -p omacam
@@ -33,6 +33,15 @@ docker run --rm --user "$(id -u):$(id -g)" -e W="$w" -e H="$h" -e SCALE="$scale"
     shot /out/focus.png; settings photo; wait 1; shot /out/settings-photo.png;
     settings video; wait 0.5; shot /out/settings-video.png; settings advanced; wait 0.5;
     shot /out/settings-advanced.png; close-settings; wait 0.5; flip; wait 1.5;
-    shot /out/front.png; quit"
+    shot /out/front.png; flip; wait 1.5; mode video; wait 0.5; shot /out/video-mode.png;
+    shutter; wait 2; zoom 2; wait 1; shot /out/recording.png; shutter; wait 3;
+    shot /out/after-video.png; quit"
 ' 2>&1 | grep -E "WARN|ERROR|window saved" || true
 ls "$out"
+video=$(ls "$out"/photos/VID_*.mp4 2>/dev/null | head -1 || true)
+if [[ -n $video ]]; then
+  echo "recorded: $video ($(stat -c %s "$video") bytes)"
+else
+  echo "no video recorded" >&2
+  exit 1
+fi

@@ -54,7 +54,7 @@ sysroot() {
     -e HUID="$(id -u)" -e HGID="$(id -g)" "$image" bash -euo pipefail -c '
       grep -q "^DisableSandbox" /etc/pacman.conf || sed -i "s/^\[options\]/[options]\nDisableSandbox/" /etc/pacman.conf
       pacman-key --init >/dev/null 2>&1; pacman-key --populate archlinuxarm >/dev/null 2>&1 || true
-      pacman -Syu --noconfirm --needed gtk4 libadwaita libcamera libcamera-ipa libjpeg-turbo gcc pkgconf >/dev/null
+      pacman -Syu --noconfirm --needed gtk4 libadwaita libcamera libcamera-ipa libjpeg-turbo gstreamer gst-plugins-base-libs gcc pkgconf >/dev/null
       if [[ -d /extra ]]; then
         shopt -s nullglob
         pkgs=(/extra/*.pkg.tar.zst /extra/*.pkg.tar.xz)

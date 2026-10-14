@@ -66,6 +66,17 @@ pub enum Output {
     Error(String),
 }
 
+/// Photos or videos.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Mode {
+    #[default]
+    Photo,
+    Video,
+}
+
+/// The hint shown when a zoom would need another lens while recording.
+pub const RECORDING_LENS_HINT: &str = "The lens stays the same while recording";
+
 /// How to draw a frame of one lens.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Transform {
@@ -95,6 +106,8 @@ pub struct ViewState {
     pub last_switch: Option<Duration>,
     /// The focus ring, after a tap.
     pub focus: Option<focus::Indicator>,
+    pub mode: Mode,
+    pub recording: bool,
 }
 
 struct Side {
@@ -135,6 +148,8 @@ pub struct Controller {
     last_meta: Option<(usize, FrameMeta)>,
     suspended: bool,
     retry_at: Option<Instant>,
+    mode: Mode,
+    recording: bool,
 }
 
 impl Controller {
@@ -160,6 +175,8 @@ impl Controller {
             last_meta: None,
             suspended: true,
             retry_at: None,
+            mode: Mode::Photo,
+            recording: false,
         }
     }
 
@@ -271,6 +288,8 @@ impl Controller {
             can_flip: self.back.is_some() && self.front.is_some(),
             last_switch: self.switch.last_switch_time(),
             focus: self.focus.indicator(),
+            mode: self.mode,
+            recording: self.recording,
         }
     }
 
@@ -430,6 +449,7 @@ impl Controller {
     pub fn suspend(&mut self, now: Instant) -> Vec<Output> {
         let mut out = Vec::new();
         self.suspended = true;
+        self.recording = false;
         self.retry_at = None;
         self.capture.abort();
         self.request(None, now, &mut out);
@@ -440,6 +460,13 @@ impl Controller {
     pub fn set_zoom(&mut self, zoom: f64, source: ZoomSource, now: Instant) -> Vec<Output> {
         let mut out = Vec::new();
         if self.capture.is_busy() {
+            return out;
+        }
+        if self.recording {
+            let held = self.side_mut().is_some_and(|s| s.planner.set_locked(zoom));
+            if held {
+                out.push(Output::Error(RECORDING_LENS_HINT.into()));
+            }
             return out;
         }
         let changed = self
@@ -454,6 +481,9 @@ impl Controller {
     /// A pinch or slider drag ended.
     pub fn zoom_released(&mut self, now: Instant) -> Vec<Output> {
         let mut out = Vec::new();
+        if self.recording {
+            return out;
+        }
         let changed = self.side_mut().and_then(|s| s.planner.release(now));
         if changed.is_some() {
             self.request_preview(now, &mut out);
@@ -469,6 +499,30 @@ impl Controller {
     /// Change the photo mode (a setting).
     pub fn set_capture_mode(&mut self, mode: capture::Mode) {
         self.opts.capture_mode = mode;
+    }
+
+    /// Photo or video. Ignored while recording or taking a photo.
+    pub fn set_mode(&mut self, mode: Mode) {
+        if !self.recording && !self.capture.is_busy() {
+            self.mode = mode;
+        }
+    }
+
+    /// The camera that a recording would take its frames from: the
+    /// streaming preview's, once its frames show.
+    pub fn recording_source(&self) -> Option<String> {
+        let (_, target) = self.switch.streaming()?;
+        if target.purpose != Purpose::Preview || self.switch.is_switching() {
+            return None;
+        }
+        Some(target.camera.clone())
+    }
+
+    /// Recording started or stopped (the app runs the encoder). While
+    /// recording the lens doesn't change: zoom stays within it, and flip
+    /// and photos wait.
+    pub fn set_recording(&mut self, on: bool) {
+        self.recording = on && self.mode == Mode::Video;
     }
 
     /// A tap on the drawn picture at (u, v), 0..1 from its top left.
@@ -526,7 +580,7 @@ impl Controller {
 
     pub fn flip(&mut self, now: Instant) -> Vec<Output> {
         let mut out = Vec::new();
-        if self.capture.is_busy() || self.back.is_none() || self.front.is_none() {
+        if self.recording || self.capture.is_busy() || self.back.is_none() || self.front.is_none() {
             return out;
         }
         self.facing = match self.facing {
@@ -541,7 +595,7 @@ impl Controller {
 
     pub fn shutter(&mut self, now: Instant) -> Vec<Output> {
         let mut out = Vec::new();
-        if self.switch.streaming().is_none() || self.switch.is_switching() {
+        if self.recording || self.switch.streaming().is_none() || self.switch.is_switching() {
             return out;
         }
         let Some(lens) = self.side().map(|s| s.lens()) else {
@@ -1064,6 +1118,37 @@ mirror = true
         assert!(commands(&c.set_cameras(&spec(), &cameras(), now)).is_empty());
         let (_, cam, _) = start_of(&c.resume(now));
         assert_eq!(cam, "main");
+    }
+
+    #[test]
+    fn while_recording_the_lens_holds_and_flip_and_photos_wait() {
+        let now = Instant::now();
+        let mut c = Controller::new(&spec(), &cameras(), Options::default());
+        open(&mut c, now);
+        assert_eq!(c.recording_source().as_deref(), Some("main"));
+        c.set_recording(true);
+        assert!(!c.view().recording, "only in video mode");
+        c.set_mode(Mode::Video);
+        c.set_recording(true);
+        assert!(c.view().recording);
+        c.set_mode(Mode::Photo);
+        assert_eq!(c.view().mode, Mode::Video, "no mode change mid-recording");
+        // Past the tele's threshold: the main crops instead.
+        assert!(commands(&c.set_zoom(6.0, ZoomSource::Preset, now)).is_empty());
+        assert_eq!(c.transform("main").unwrap().scale, 6.0);
+        // Below the main's view: held, with the hint.
+        let out = c.set_zoom(0.5, ZoomSource::Gesture, now);
+        assert!(matches!(out.as_slice(), [Output::Error(m)] if m == RECORDING_LENS_HINT));
+        assert_eq!(c.view().zoom, 1.0);
+        assert!(
+            c.tick(now + Duration::from_secs(1)).is_empty(),
+            "no switch later either"
+        );
+        assert!(c.flip(now).is_empty());
+        assert!(c.shutter(now).is_empty());
+        c.set_recording(false);
+        let (_, cam, _) = start_of(&c.set_zoom(0.5, ZoomSource::Preset, now));
+        assert_eq!(cam, "uw", "switching again after");
     }
 
     #[test]

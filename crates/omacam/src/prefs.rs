@@ -13,7 +13,10 @@ use adw::prelude::*;
 use gtk4 as gtk;
 use libadwaita as adw;
 
-use crate::settings::{default_photo_dir, Aspect, Grid, Resolution, Settings, Timer};
+use crate::settings::{
+    default_photo_dir, default_video_dir, Aspect, Grid, Resolution, Settings, Timer,
+    VideoResolution,
+};
 
 type OnChange = Rc<dyn Fn(&Settings)>;
 
@@ -207,10 +210,23 @@ pub fn dialog(
         .build();
     let vgroup = adw::PreferencesGroup::builder()
         .title("Video")
-        .description("Video recording is coming soon.")
+        .description(format!(
+            "Videos are saved in {} as MP4: H.264 video, Opus sound.",
+            default_video_dir().display()
+        ))
         .build();
-    vgroup.add(&later("Resolution and frame rate", "Coming soon"));
-    vgroup.add(&later("Stabilisation", "Coming soon"));
+    vgroup.add(&combo(
+        "Resolution",
+        Some("Landscape frames, turned upright by the player"),
+        &VideoResolution::ALL,
+        VideoResolution::label,
+        s.video_resolution,
+        &state,
+        &on_change,
+        |s, v| s.video_resolution = v,
+    ));
+    vgroup.add(&later("Frame rate", "30 fps; other rates later"));
+    vgroup.add(&later("Stabilisation", "Coming later"));
     video.add(&vgroup);
 
     // Advanced and about.

@@ -133,6 +133,34 @@ impl Grid {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum VideoResolution {
+    #[default]
+    #[serde(rename = "1080p")]
+    FullHd,
+    #[serde(rename = "720p")]
+    Hd,
+}
+
+impl VideoResolution {
+    pub const ALL: [VideoResolution; 2] = [VideoResolution::FullHd, VideoResolution::Hd];
+
+    /// Landscape width and height of the encoded frames.
+    pub fn size(self) -> (u32, u32) {
+        match self {
+            VideoResolution::FullHd => (1920, 1080),
+            VideoResolution::Hd => (1280, 720),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            VideoResolution::FullHd => "1080p",
+            VideoResolution::Hd => "720p (lighter on the battery)",
+        }
+    }
+}
+
 pub const DEFAULT_QUALITY: u8 = 92;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -156,6 +184,7 @@ pub struct Settings {
     pub volume_shutter: bool,
     pub tap_to_focus: bool,
     pub debug_overlay: bool,
+    pub video_resolution: VideoResolution,
 }
 
 impl Default for Settings {
@@ -173,6 +202,7 @@ impl Default for Settings {
             volume_shutter: true,
             tap_to_focus: true,
             debug_overlay: false,
+            video_resolution: VideoResolution::FullHd,
         }
     }
 }
@@ -228,6 +258,14 @@ impl Settings {
     pub fn photo_dir(&self) -> PathBuf {
         self.save_dir.clone().unwrap_or_else(default_photo_dir)
     }
+}
+
+/// Where videos go: `$XDG_VIDEOS_DIR/Camera`, beside the photos' folder
+/// in Pictures, as desktop Linux keeps them apart.
+pub fn default_video_dir() -> PathBuf {
+    gtk4::glib::user_special_dir(gtk4::glib::UserDirectory::Videos)
+        .unwrap_or_else(|| gtk4::glib::home_dir().join("Videos"))
+        .join("Camera")
 }
 
 pub fn default_photo_dir() -> PathBuf {
@@ -286,12 +324,14 @@ mod tests {
             volume_shutter: false,
             tap_to_focus: false,
             debug_overlay: true,
+            video_resolution: VideoResolution::Hd,
         };
         s.save(&p).unwrap();
         let text = std::fs::read_to_string(&p).unwrap();
         assert!(text.contains("aspect = \"1:1\""), "{text}");
         assert!(text.contains("timer = \"10s\""), "{text}");
         assert!(text.contains("grid = \"3x3\""), "{text}");
+        assert!(text.contains("video_resolution = \"720p\""), "{text}");
         assert_eq!(Settings::load(&p), s);
     }
 

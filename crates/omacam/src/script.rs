@@ -23,6 +23,8 @@ pub enum Step {
     CloseSettings,
     /// A tap on the picture at (u, v), 0..1.
     Tap(f64, f64),
+    /// Switch to photo or video (`shutter` then records and stops).
+    Mode(String),
     Quit,
 }
 
@@ -57,6 +59,8 @@ pub fn parse(text: &str) -> Result<Vec<Step>, String> {
                 arg.into()
             }),
             "close-settings" => Step::CloseSettings,
+            "mode" if arg == "photo" || arg == "video" => Step::Mode(arg.into()),
+            "mode" => return Err(format!("mode: photo or video, got {arg:?}")),
             "tap" => {
                 let mut it = arg.split_whitespace().map(|v| v.parse::<f64>());
                 match (it.next(), it.next()) {
@@ -103,6 +107,11 @@ mod tests {
         assert!(parse("shot").is_err());
         assert!(parse("dance").is_err());
         assert!(parse("tap 2 0.5").is_err());
+        assert_eq!(
+            parse("mode video").unwrap(),
+            vec![Step::Mode("video".into())]
+        );
+        assert!(parse("mode film").is_err());
         assert_eq!(parse("tap 0.25 0.75").unwrap(), vec![Step::Tap(0.25, 0.75)]);
         assert_eq!(
             parse("settings video; close-settings").unwrap(),

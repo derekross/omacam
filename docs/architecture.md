@@ -116,6 +116,62 @@ Two paths, `--display`:
   26.2.4-1.2; it becomes the default once the panthor export fix is in the
   released Mesa package.
 
+## Video (§3.9)
+
+### What the hardware and the system offer (2026-10-14)
+
+- **No hardware encoder.** The gs201's video codec block (MFC) has no
+  mainline driver in our kernel: no `/dev/video*` encoder node (the four
+  video nodes are the CSIS capture DMAs), no `v4l2h264enc`. Encoding is on
+  the CPU: two Cortex-X1, two A78 and four A55 cores.
+- **Encoders on the phone:** the x264, OpenH264 and libvpx libraries are
+  installed; GStreamer has `vp8enc`/`vp9enc` (gst-plugins-good) but not
+  `x264enc` (gst-plugins-ugly) or `openh264enc` (gst-plugins-bad). The
+  omacam package depends on gst-plugins-ugly, which Arch Linux ARM ships
+  (1.28.8, on x264).
+- **Choice:** H.264 by x264 at `speed-preset=ultrafast tune=zerolatency`,
+  baseline profile, about 12 Mb/s at 1080p30 and 5.5 Mb/s at 720p30, with
+  Opus sound (Q11), in MP4. x264's ultrafast is the cheapest software H.264
+  there is and plays everywhere; VP8/VP9 cost more CPU per frame at the
+  same quality, so VP8 in WebM is only the fallback when no H.264 encoder
+  is installed (`omacam_record::best_codec`). OpenH264 sits between them.
+  The CPU load and dropped frames at 1080p30 and 720p30 on the phone are
+  still to be measured (the recorder counts pushed frames; the leaky queue
+  before the encoder drops what it can't keep up with).
+- **The container.** MP4 carries Opus (the ISO BMFF Opus mapping):
+  mpv (the phone's video player), Firefox, Chromium, VLC and GStreamer play
+  it; QuickTime doesn't. Matroska would carry it as well but plays in fewer
+  galleries and editors; MP4 it is.
+- **Sound** comes from PipeWire's default source (the AoC's microphones),
+  `pipewiresrc` into `opusenc` at 48 kHz stereo. When no microphone opens,
+  the video is recorded without sound and the log says so.
+- **Sync.** Frames and sound are both timestamped on the pipeline clock as
+  they arrive (`appsrc do-timestamp`, a live `pipewiresrc`), so they stay
+  together to within a frame plus the camera's own latency (about one
+  frame). The sensor timestamps would tighten that later.
+- **Orientation.** The encoded frames are landscape; the camera's upright
+  rotation goes into the file as its `image-orientation` tag, which mp4mux
+  writes as the track's display matrix, so players show it upright.
+
+### How it records
+
+One stream feeds both: the preview's processed frames (2008x1136 on the
+main camera, 2008x1508 on the ultrawide) go to the viewfinder and, while
+recording, to the encoder as the same shared buffer (`glib::Bytes`, no
+copy). `videocrop` takes the 16:9 middle of the frame and the zoom crop
+(padded rows are cropped off the same way), `videoscale` makes it 1920x1080
+or 1280x720 with square pixels (a fixed pixel aspect ratio: a zoom that
+changed it renegotiated the encoder, which mp4mux refused), and x264
+encodes it. The viewfinder shows the 9:16 frame the video records.
+
+While recording the lens doesn't change: the zoom crops the current lens
+(and stops at its own view, with a hint), and flip and photos wait.
+Switching lenses needs a stop and a start of the camera, about 300-600 ms
+of no frames, which a video can't hide. Videos go to
+`$XDG_VIDEOS_DIR/Camera` (`~/Videos/Camera`): desktop Linux keeps photos
+and videos in their own folders, and the file manager and players look
+there; Pixel's single DCIM folder is an Android convention.
+
 ## Sharing the cameras
 
 libcamera locks a camera per process. omacam releases every camera and its
@@ -136,8 +192,9 @@ active zoom button and the busy shutter take the theme's accent.
 
 - Tap to focus and exposure compensation (need the libcamera patches L1,
   L2 in Omarchy Mobile's `packages/libcamera`).
-- EXIF data, the shutter sound, location tags, the in-app viewer of recent
-  shots, video (P6).
+- Location tags, the in-app viewer of recent shots.
+- Video: other frame rates, stabilisation, lens switching while recording,
+  the measured CPU load on the phone.
 - Exposure carried across a lens switch: computed (`exposure.rs`), passed to
   libcamera only with `--exposure-hints` until it's checked whether the
   simple IPA takes `ExposureTime` as a starting point or as manual exposure.

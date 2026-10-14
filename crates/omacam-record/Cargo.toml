@@ -1,0 +1,16 @@
+[package]
+name = "omacam-record"
+description = "omacam's video recorder: camera frames and the microphone into an MP4 through GStreamer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+gstreamer = "0.25"
+gstreamer-app = "0.25"
+thiserror.workspace = true
+tracing.workspace = true

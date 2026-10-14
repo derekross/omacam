@@ -29,6 +29,8 @@ finds.
   window; otherwise the camera focuses on the centre, and a fixed-focus
   camera says so).
 - The last photo as a thumbnail; tap it to open it.
+- Video: 1080p or 720p at 30 fps, H.264 with Opus sound in MP4, saved in
+  `~/Videos/Camera`, with zoom while recording (within the lens in use).
 - Photos with EXIF data (time, exposure, ISO, aperture, focal length, zoom;
   no serial numbers, no location) and the shutter sound.
 - Settings from the gear: aspect ratio (full, 4:3, 16:9, 1:1), resolution,
@@ -39,8 +41,8 @@ finds.
 - The cameras are let go while the window is hidden, so other apps (a
   browser, a video call) can use them.
 
-Not yet: exposure compensation, video, location tags, RAW, a level, HDR
-and night modes. See
+Not yet: exposure compensation, lens switching while recording, other
+video frame rates, location tags, RAW, a level, HDR and night modes. See
 [docs/architecture.md](docs/architecture.md) for the plan.
 
 ## Install
