@@ -3,9 +3,11 @@
 
 use std::time::{Duration, Instant};
 
+use crate::backend::{Awb, Caps, ExposureSettings, Setting};
 use crate::backend::{CameraInfo, Command, Event, Frame, FrameMeta, Purpose, StreamRequest};
 use crate::capture::{self, CaptureController, Step};
 use crate::exposure;
+use crate::exposure_control::{self, Exposure};
 use crate::focus::{self, FocusController};
 use crate::lens::{Facing, Lens, LensTable, Role, TableSpec};
 use crate::switch::{Action, FrameKind, SwitchController, Target};
@@ -53,6 +55,8 @@ pub struct Picture {
     pub rotation: u32,
     pub lens: Lens,
     pub zoom: f64,
+    /// The exposure settings in force (EXIF records them).
+    pub settings: ExposureSettings,
 }
 
 /// What the UI should do.
@@ -61,7 +65,7 @@ pub enum Output {
     Backend(Command),
     /// A new frame for the viewfinder.
     Show(Frame),
-    Picture(Picture),
+    Picture(Box<Picture>),
     /// Something to tell the user.
     Error(String),
 }
@@ -76,6 +80,25 @@ pub enum Mode {
 
 /// The hint shown when a zoom would need another lens while recording.
 pub const RECORDING_LENS_HINT: &str = "The lens stays the same while recording";
+
+/// The exposure state the Pro panel and the EV slider show.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ExposureView {
+    pub caps: Caps,
+    /// What's sent to the camera now.
+    pub settings: ExposureSettings,
+    /// The Pro panel's own values (manual ones stay set across lenses).
+    pub pro: ExposureSettings,
+    /// The EV slider's offset.
+    pub ev_user: f32,
+    pub locked: bool,
+    /// ISO at gain 1 for this lens.
+    pub base_iso: f64,
+    /// What the camera reported for the last frame (auto's choice).
+    pub shutter_us: Option<i32>,
+    pub iso: Option<u32>,
+    pub lens_position: Option<f32>,
+}
 
 /// How to draw a frame of one lens.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -104,6 +127,9 @@ pub struct ViewState {
     pub capturing: bool,
     pub can_flip: bool,
     pub last_switch: Option<Duration>,
+    /// Exposure, white balance and focus: what the camera offers, what's
+    /// set, and what auto chose.
+    pub exposure: ExposureView,
     /// The focus ring, after a tap.
     pub focus: Option<focus::Indicator>,
     pub mode: Mode,
@@ -145,6 +171,7 @@ pub struct Controller {
     switch: SwitchController,
     capture: CaptureController,
     focus: FocusController,
+    exposure: Exposure,
     last_meta: Option<(usize, FrameMeta)>,
     suspended: bool,
     retry_at: Option<Instant>,
@@ -172,6 +199,7 @@ impl Controller {
             switch: SwitchController::new(),
             capture: CaptureController::new(),
             focus: FocusController::new(),
+            exposure: Exposure::new(),
             last_meta: None,
             suspended: true,
             retry_at: None,
@@ -287,6 +315,7 @@ impl Controller {
             capturing: self.capture.is_busy(),
             can_flip: self.back.is_some() && self.front.is_some(),
             last_switch: self.switch.last_switch_time(),
+            exposure: self.exposure_view(),
             focus: self.focus.indicator(),
             mode: self.mode,
             recording: self.recording,
@@ -353,7 +382,9 @@ impl Controller {
         let lens = self.table.get(lens_idx);
         let mut target = Target::new(lens_idx, purpose);
         target.camera = lens.id.clone();
-        target.controls.af_continuous = lens.autofocus;
+        let settings = self.exposure.effective(&lens.caps);
+        target.controls.af_continuous = lens.autofocus && settings.lens.is_auto();
+        target.controls.settings = Some(settings);
         if self.opts.transfer_exposure {
             if let Some((from, meta)) = &self.last_meta {
                 let from_lens = self.table.get(*from);
@@ -431,6 +462,13 @@ impl Controller {
     fn request_preview(&mut self, now: Instant, out: &mut Vec<Output>) {
         if self.suspended {
             return;
+        }
+        // Another camera: metering, the EV slider and a lock start over.
+        let next = self.side().map(|s| self.table.get(s.lens()).id.clone());
+        if let (Some(wanted), Some(next)) = (self.switch.wanted(), next) {
+            if wanted.camera != next {
+                self.exposure.lens_switched();
+            }
         }
         let target = self.target(Purpose::Preview);
         self.request(target, now, out);
@@ -525,44 +563,205 @@ impl Controller {
         self.recording = on && self.mode == Mode::Video;
     }
 
-    /// A tap on the drawn picture at (u, v), 0..1 from its top left.
-    pub fn tap(&mut self, u: f64, v: f64, now: Instant) -> Vec<Output> {
-        let mut out = Vec::new();
-        if !self.opts.tap_to_focus || self.capture.is_busy() || self.switch.is_switching() {
-            return out;
+    /// The lens streaming the preview, with its stream generation.
+    fn preview_lens(&self) -> Option<(u64, crate::lens::Lens)> {
+        let (generation, target) = self.switch.streaming()?;
+        if target.purpose != Purpose::Preview || self.switch.is_switching() {
+            return None;
         }
-        let Some((generation, target)) = self.switch.streaming() else {
-            return out;
+        let lens = self.table.lenses().get(target.lens).cloned()?;
+        Some((generation, lens))
+    }
+
+    /// Send the current exposure settings to the streaming preview.
+    fn push_settings(&self, out: &mut Vec<Output>) {
+        let Some((generation, lens)) = self.preview_lens() else {
+            return;
         };
-        if target.purpose != Purpose::Preview {
+        let settings = self.exposure.effective(&lens.caps);
+        out.push(Output::Backend(Command::SetControls {
+            generation,
+            controls: crate::backend::Controls {
+                af_continuous: lens.autofocus && settings.lens.is_auto() && !self.focus.is_active(),
+                settings: Some(settings),
+                ..Default::default()
+            },
+        }));
+    }
+
+    fn exposure_view(&self) -> ExposureView {
+        let lens = self.side().map(|s| self.table.get(s.lens()));
+        let caps = lens.map(|l| l.caps.clone()).unwrap_or_default();
+        let base_iso = lens
+            .map(|l| l.base_iso)
+            .unwrap_or(crate::lens::DEFAULT_BASE_ISO);
+        let meta = self.last_meta.as_ref().map(|(_, m)| m);
+        ExposureView {
+            settings: self.exposure.effective(&caps),
+            pro: *self.exposure.pro(),
+            ev_user: self.exposure.ev_user(),
+            locked: self.exposure.is_locked(),
+            base_iso,
+            shutter_us: meta.and_then(|m| m.exposure_us),
+            iso: meta.and_then(|m| {
+                m.analogue_gain.map(|g| {
+                    exposure_control::iso(g as f64 * m.digital_gain.unwrap_or(1.0) as f64, base_iso)
+                })
+            }),
+            lens_position: meta.and_then(|m| m.lens_position),
+            caps,
+        }
+    }
+
+    /// A tap on the drawn picture at (u, v), 0..1 from its top left, with
+    /// the mean luma (0-255) of the tapped area when the app could measure
+    /// it: focus there (unless focus is manual) and meter it; releases an
+    /// AE/AF lock and resets the EV slider.
+    pub fn tap(&mut self, u: f64, v: f64, luma: Option<f64>, now: Instant) -> Vec<Output> {
+        let mut out = Vec::new();
+        if !self.opts.tap_to_focus || self.capture.is_busy() {
             return out;
         }
-        let Some(lens) = self.table.lenses().get(target.lens).cloned() else {
+        let Some((generation, lens)) = self.preview_lens() else {
             return out;
         };
         let Some(t) = self.transform(&lens.id) else {
             return out;
         };
-        let request = self.focus.tap(
-            u,
-            v,
-            &t,
-            focus::Capability {
-                autofocus: lens.autofocus,
-                af_windows: lens.af_windows,
-                area: lens.crop_maximum,
+        self.exposure.tap(luma, &lens.caps);
+        let settings = self.exposure.effective(&lens.caps);
+        let request = if settings.lens.is_auto() {
+            self.focus.tap(
+                u,
+                v,
+                &t,
+                focus::Capability {
+                    autofocus: lens.autofocus,
+                    af_windows: lens.af_windows,
+                    area: lens.crop_maximum,
+                },
+                now,
+            )
+        } else {
+            None
+        };
+        out.push(Output::Backend(Command::SetControls {
+            generation,
+            controls: crate::backend::Controls {
+                focus: request,
+                settings: Some(settings),
+                ..Default::default()
             },
-            now,
-        );
-        if let Some(focus) = request {
+        }));
+        out
+    }
+
+    /// One autofocus scan where the AF looks, keeping the exposure as it
+    /// is (as recording starts).
+    pub fn refocus(&mut self, now: Instant) -> Vec<Output> {
+        let mut out = Vec::new();
+        let Some((generation, lens)) = self.preview_lens() else {
+            return out;
+        };
+        if !self.exposure.effective(&lens.caps).lens.is_auto() {
+            return out;
+        }
+        let Some(t) = self.transform(&lens.id) else {
+            return out;
+        };
+        let cap = focus::Capability {
+            autofocus: lens.autofocus,
+            af_windows: false,
+            area: None,
+        };
+        if let Some(request) = self.focus.tap(0.5, 0.5, &t, cap, now) {
             out.push(Output::Backend(Command::SetControls {
                 generation,
                 controls: crate::backend::Controls {
-                    focus: Some(focus),
+                    focus: Some(request),
                     ..Default::default()
                 },
             }));
         }
+        out
+    }
+
+    /// A long press: AE/AF lock at what the camera reports now.
+    pub fn lock(&mut self, now: Instant) -> Vec<Output> {
+        let _ = now;
+        let mut out = Vec::new();
+        let Some((_, lens)) = self.preview_lens() else {
+            return out;
+        };
+        let meta = self.last_meta.as_ref().map(|(_, m)| m.clone());
+        if self.exposure.lock(meta.as_ref(), &lens.caps) {
+            self.focus.reset();
+            self.push_settings(&mut out);
+        } else {
+            out.push(Output::Error(
+                "This camera doesn't offer manual exposure yet, so it can't lock".into(),
+            ));
+        }
+        out
+    }
+
+    pub fn unlock(&mut self) -> Vec<Output> {
+        let mut out = Vec::new();
+        if self.exposure.is_locked() {
+            self.exposure.unlock();
+            self.push_settings(&mut out);
+        }
+        out
+    }
+
+    /// The EV slider.
+    pub fn set_ev(&mut self, ev: f32) -> Vec<Output> {
+        let mut out = Vec::new();
+        let caps = self.exposure_view().caps;
+        self.exposure.set_ev(ev, &caps);
+        self.push_settings(&mut out);
+        out
+    }
+
+    pub fn set_shutter(&mut self, s: Setting<i32>) -> Vec<Output> {
+        self.exposure.set_shutter(s);
+        let mut out = Vec::new();
+        self.push_settings(&mut out);
+        out
+    }
+
+    /// ISO, as the Pro panel shows it; sent as analogue gain.
+    pub fn set_iso(&mut self, iso: Setting<u32>) -> Vec<Output> {
+        let base = self.exposure_view().base_iso;
+        self.exposure.set_gain(match iso {
+            Setting::Auto => Setting::Auto,
+            Setting::Manual(i) => Setting::Manual(exposure_control::gain_for_iso(i, base)),
+        });
+        let mut out = Vec::new();
+        self.push_settings(&mut out);
+        out
+    }
+
+    pub fn set_white_balance(&mut self, s: Setting<Awb>) -> Vec<Output> {
+        self.exposure.set_white_balance(s);
+        let mut out = Vec::new();
+        self.push_settings(&mut out);
+        out
+    }
+
+    pub fn set_lens_position(&mut self, s: Setting<f32>) -> Vec<Output> {
+        self.exposure.set_lens(s);
+        self.focus.reset();
+        let mut out = Vec::new();
+        self.push_settings(&mut out);
+        out
+    }
+
+    /// Everything back to automatic.
+    pub fn reset_exposure(&mut self) -> Vec<Output> {
+        self.exposure.reset();
+        let mut out = Vec::new();
+        self.push_settings(&mut out);
         out
     }
 
@@ -621,7 +820,12 @@ impl Controller {
         match step {
             Step::StartStill(controls) => {
                 if let Some(mut target) = self.target(Purpose::Still) {
-                    target.controls = controls;
+                    // The still keeps the exposure settings; the locked
+                    // values are start hints.
+                    target.controls.exposure_us = controls.exposure_us;
+                    target.controls.analogue_gain = controls.analogue_gain;
+                    target.controls.colour_gains = controls.colour_gains;
+                    target.controls.lens_position = controls.lens_position;
                     target.controls.af_continuous = false;
                     self.request(Some(target), now, out);
                 }
@@ -659,7 +863,12 @@ impl Controller {
                     .lenses()
                     .get(target.lens)
                     .is_some_and(|l| l.autofocus);
-                if af && target.purpose == Purpose::Preview {
+                let auto = self
+                    .table
+                    .lenses()
+                    .get(target.lens)
+                    .is_some_and(|l| self.exposure.effective(&l.caps).lens.is_auto());
+                if af && auto && target.purpose == Purpose::Preview {
                     out.push(Output::Backend(Command::SetControls {
                         generation,
                         controls: crate::backend::Controls {
@@ -680,13 +889,14 @@ impl Controller {
     fn picture(&self, frame: Frame, lens_idx: usize) -> Output {
         let lens = self.table.get(lens_idx).clone();
         let zoom = self.side().map(|s| s.planner.zoom()).unwrap_or(1.0);
-        Output::Picture(Picture {
+        Output::Picture(Box::new(Picture {
             crop: (zoom / lens.zoom).max(1.0),
             rotation: lens.upright_clockwise(),
             zoom,
+            settings: self.exposure.effective(&lens.caps),
             lens,
             frame,
-        })
+        }))
     }
 
     pub fn on_event(&mut self, event: Event, now: Instant) -> Vec<Output> {
@@ -1022,7 +1232,7 @@ mirror = true
         }
         let mut c = Controller::new(&spec(), &cams, Options::default());
         let g = open(&mut c, now);
-        match commands(&c.tap(0.25, 0.25, now)).as_slice() {
+        match commands(&c.tap(0.25, 0.25, None, now)).as_slice() {
             [Command::SetControls {
                 generation,
                 controls,
@@ -1043,7 +1253,7 @@ mirror = true
     }
 
     #[test]
-    fn taps_on_a_fixed_focus_lens_or_when_off_send_nothing() {
+    fn taps_on_a_fixed_focus_lens_meter_only_and_off_send_nothing() {
         let now = Instant::now();
         let mut c = Controller::new(&spec(), &cameras(), Options::default());
         open(&mut c, now);
@@ -1051,11 +1261,14 @@ mirror = true
         let (g, _, _) = (2, "tele", Purpose::Preview);
         c.on_event(started(g, "tele"), now);
         c.on_event(frame(g, "tele", 10_000), now);
-        assert!(commands(&c.tap(0.5, 0.5, now)).is_empty());
+        match commands(&c.tap(0.5, 0.5, None, now)).as_slice() {
+            [Command::SetControls { controls, .. }] => assert!(controls.focus.is_none()),
+            other => panic!("{other:?}"),
+        }
         assert_eq!(c.view().focus.unwrap().status, focus::Status::FixedFocus);
         c.set_tap_to_focus(false);
         c.set_zoom(1.0, ZoomSource::Preset, now);
-        assert!(c.tap(0.5, 0.5, now).is_empty());
+        assert!(c.tap(0.5, 0.5, None, now).is_empty());
     }
 
     #[test]
@@ -1149,6 +1362,131 @@ mirror = true
         c.set_recording(false);
         let (_, cam, _) = start_of(&c.set_zoom(0.5, ZoomSource::Preset, now));
         assert_eq!(cam, "uw", "switching again after");
+    }
+
+    fn caps_all() -> crate::backend::Caps {
+        crate::backend::Caps {
+            ev: Some((-8.0, 8.0)),
+            exposure_time: Some((100, 66_000)),
+            gain: Some((1.0, 16.0)),
+            manual_exposure: true,
+            awb_modes: true,
+            colour_temperature: Some((2500, 7500)),
+            lens_position: Some((0.0, 1.0)),
+        }
+    }
+
+    fn settings_of(out: &[Output]) -> crate::backend::ExposureSettings {
+        match commands(out).as_slice() {
+            [Command::SetControls { controls, .. }] => controls.settings.expect("settings"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_tap_meters_and_the_slider_adds_and_a_lens_switch_resets() {
+        let now = Instant::now();
+        let mut cams = cameras();
+        for c in cams.iter_mut() {
+            c.caps = caps_all();
+        }
+        let mut c = Controller::new(&spec(), &cams, Options::default());
+        open(&mut c, now);
+        // A dark area: +2 EV.
+        let s = settings_of(&c.tap(0.5, 0.5, Some(29.5), now));
+        assert!((s.ev - 2.0).abs() < 1e-3);
+        let s = settings_of(&c.set_ev(-1.0));
+        assert!((s.ev - 1.0).abs() < 1e-3);
+        assert_eq!(c.view().exposure.ev_user, -1.0);
+        // Switching to the tele: a fresh start, EV back to 0.
+        match commands(&c.set_zoom(5.0, ZoomSource::Preset, now)).as_slice() {
+            [Command::Start { controls, .. }] => {
+                assert_eq!(controls.settings.unwrap().ev, 0.0);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(c.view().exposure.ev_user, 0.0);
+    }
+
+    #[test]
+    fn lock_holds_what_the_camera_reported_and_a_tap_releases_it() {
+        let now = Instant::now();
+        let mut cams = cameras();
+        for c in cams.iter_mut() {
+            c.caps = caps_all();
+        }
+        let mut c = Controller::new(&spec(), &cams, Options::default());
+        open(&mut c, now); // its frame reported 10 ms at gain 1
+        let s = settings_of(&c.lock(now));
+        assert_eq!(s.shutter, Setting::Manual(10_000));
+        assert_eq!(s.gain, Setting::Manual(1.0));
+        assert!(c.view().exposure.locked);
+        let s = settings_of(&c.tap(0.5, 0.5, None, now));
+        assert_eq!(s.shutter, Setting::Auto);
+        assert!(!c.view().exposure.locked);
+    }
+
+    #[test]
+    fn without_the_controls_lock_explains_and_pro_values_stay_auto() {
+        let now = Instant::now();
+        let mut c = Controller::new(&spec(), &cameras(), Options::default());
+        open(&mut c, now);
+        assert!(matches!(c.lock(now).as_slice(), [Output::Error(_)]));
+        let s = settings_of(&c.set_shutter(Setting::Manual(4_000)));
+        assert_eq!(
+            s.shutter,
+            Setting::Auto,
+            "libcamera 4.8 offers no manual exposure"
+        );
+        assert_eq!(
+            c.view().exposure.pro.shutter,
+            Setting::Manual(4_000),
+            "kept for when it does"
+        );
+    }
+
+    #[test]
+    fn pro_values_reach_stills_and_keep_across_lenses() {
+        let now = Instant::now();
+        let mut cams = cameras();
+        for c in cams.iter_mut() {
+            c.caps = caps_all();
+        }
+        let mut c = Controller::new(&spec(), &cams, Options::default());
+        open(&mut c, now);
+        c.set_shutter(Setting::Manual(4_000));
+        let s = settings_of(&c.set_iso(Setting::Manual(400)));
+        assert_eq!(s.gain, Setting::Manual(8.0), "ISO 400 at base 50");
+        let s = settings_of(&c.set_lens_position(Setting::Manual(0.3)));
+        assert_eq!(s.lens, Setting::Manual(0.3));
+        match commands(&c.shutter(now)).as_slice() {
+            [Command::Start {
+                stream, controls, ..
+            }] => {
+                assert_eq!(stream.purpose, Purpose::Still);
+                let s = controls.settings.unwrap();
+                assert_eq!(s.shutter, Setting::Manual(4_000));
+                assert_eq!(s.lens, Setting::Manual(0.3));
+                assert!(!controls.af_continuous);
+            }
+            other => panic!("{other:?}"),
+        }
+        let mut c = Controller::new(&spec(), &cams, Options::default());
+        open(&mut c, now);
+        c.set_shutter(Setting::Manual(4_000));
+        match commands(&c.set_zoom(0.5, ZoomSource::Preset, now)).as_slice() {
+            [Command::Start { controls, .. }] => {
+                assert_eq!(controls.settings.unwrap().shutter, Setting::Manual(4_000));
+            }
+            other => panic!("{other:?}"),
+        }
+        let s = settings_of(&{
+            let g = 2;
+            c.on_event(started(g, "uw"), now);
+            c.on_event(frame(g, "uw", 4_000), now);
+            c.reset_exposure()
+        });
+        assert_eq!(s, crate::backend::ExposureSettings::default());
     }
 
     #[test]

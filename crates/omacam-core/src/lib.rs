@@ -15,6 +15,7 @@ pub mod backend;
 pub mod capture;
 pub mod controller;
 pub mod exposure;
+pub mod exposure_control;
 pub mod focus;
 pub mod lens;
 pub mod orientation;

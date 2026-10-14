@@ -252,6 +252,14 @@ pub fn dialog(
         &on_change,
         |s, v| s.volume_shutter = v,
     ));
+    adv.add(&switch(
+        "Keep Pro settings",
+        "Off: every launch starts fully automatic",
+        s.keep_pro,
+        &state,
+        &on_change,
+        |s, v| s.keep_pro = v,
+    ));
     adv.add(&later(
         "Lens switching",
         "Automatic by zoom; a manual choice is coming later",

@@ -161,6 +161,27 @@ impl VideoResolution {
     }
 }
 
+/// The Pro panel's manual values, kept when `keep_pro` is on.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SavedPro {
+    pub shutter_us: Option<i32>,
+    pub iso: Option<u32>,
+    /// "daylight", "cloudy", "incandescent", "fluorescent", or kelvin.
+    pub white_balance: Option<SavedWb>,
+    pub focus: Option<f32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SavedWb {
+    Daylight,
+    Cloudy,
+    Incandescent,
+    Fluorescent,
+    Kelvin(u32),
+}
+
 pub const DEFAULT_QUALITY: u8 = 92;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -185,6 +206,10 @@ pub struct Settings {
     pub tap_to_focus: bool,
     pub debug_overlay: bool,
     pub video_resolution: VideoResolution,
+    /// Keep the Pro panel's manual values across launches (off: every
+    /// launch starts fully automatic).
+    pub keep_pro: bool,
+    pub pro: SavedPro,
 }
 
 impl Default for Settings {
@@ -203,6 +228,8 @@ impl Default for Settings {
             tap_to_focus: true,
             debug_overlay: false,
             video_resolution: VideoResolution::FullHd,
+            keep_pro: false,
+            pro: SavedPro::default(),
         }
     }
 }
@@ -294,6 +321,7 @@ mod tests {
         assert!(s.mirror_front, "front photos saved as previewed");
         assert!(s.tap_to_focus);
         assert!(!s.debug_overlay);
+        assert!(!s.keep_pro, "Pro values reset at every launch");
         assert_eq!(s.aspect, Aspect::Full);
         assert_eq!(s.resolution, Resolution::Full);
         assert_eq!(s.jpeg_quality, 92);
@@ -325,6 +353,13 @@ mod tests {
             tap_to_focus: false,
             debug_overlay: true,
             video_resolution: VideoResolution::Hd,
+            keep_pro: true,
+            pro: SavedPro {
+                shutter_us: Some(4_000),
+                iso: Some(200),
+                white_balance: Some(SavedWb::Kelvin(4300)),
+                focus: None,
+            },
         };
         s.save(&p).unwrap();
         let text = std::fs::read_to_string(&p).unwrap();

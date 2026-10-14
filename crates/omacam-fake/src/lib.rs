@@ -14,6 +14,19 @@ use omacam_core::backend::{
     Location, PixelLayout, Size,
 };
 
+/// The manual controls a camera might offer: all of them.
+pub fn full_caps(movable_lens: bool) -> omacam_core::backend::Caps {
+    omacam_core::backend::Caps {
+        ev: Some((-8.0, 8.0)),
+        exposure_time: Some((100, 66_666)),
+        gain: Some((1.0, 16.0)),
+        manual_exposure: true,
+        awb_modes: true,
+        colour_temperature: Some((2500, 8000)),
+        lens_position: movable_lens.then_some((0.0, 10.0)),
+    }
+}
+
 /// The Pixel 7 Pro's four cameras, as libcamera names them.
 pub fn cheetah_cameras() -> Vec<CameraInfo> {
     // Main and ultrawide focus (and, in the fake, take focus windows);
@@ -33,6 +46,9 @@ pub fn cheetah_cameras() -> Vec<CameraInfo> {
                 width: 4080,
                 height: 3072,
             }),
+            // Everything libcamera can offer, so the Pro panel can be
+            // tried here; the phone's libcamera may offer less.
+            caps: full_caps(af),
         }
     };
     vec![
@@ -161,6 +177,8 @@ struct Stream {
     sequence: u32,
     next_frame: Instant,
     controls: Controls,
+    /// The exposure settings in force (kept across partial updates).
+    settings: omacam_core::backend::ExposureSettings,
     tint: [u8; 3],
 }
 
@@ -198,15 +216,34 @@ fn render(stream: &Stream) -> Vec<u8> {
     let stride = w * 4;
     let mut px = vec![0u8; stride * h];
     let bar = (stream.sequence as usize * 8) % w;
+    // What the settings would do to a real picture: EV and a manual
+    // exposure brighten or darken it, white balance shifts its colour.
+    use omacam_core::backend::{Awb, AwbPreset, Setting};
+    let set = &stream.settings;
+    let mut light = 2f32.powf(set.ev);
+    if let Setting::Manual(t) = set.shutter {
+        light *= t as f32 / 10_000.0;
+    }
+    if let Setting::Manual(g) = set.gain {
+        light *= g;
+    }
+    let (rw, bw) = match set.white_balance {
+        Setting::Manual(Awb::Preset(AwbPreset::Cloudy)) => (1.15, 0.9),
+        Setting::Manual(Awb::Preset(AwbPreset::Incandescent)) => (0.75, 1.3),
+        Setting::Manual(Awb::Preset(AwbPreset::Fluorescent)) => (0.9, 1.1),
+        Setting::Manual(Awb::Kelvin(k)) => (k as f32 / 5500.0, 5500.0 / k as f32),
+        _ => (1.0, 1.0),
+    };
+    let tone = |v: f32, w: f32| (v * light * w).clamp(0.0, 255.0) as u8;
     for y in 0..h {
         for x in 0..w {
             let i = y * stride + x * 4;
             let fx = x as f32 / w as f32;
             let fy = y as f32 / h as f32;
             let mut rgb = [
-                (stream.tint[0] as f32 * (0.4 + 0.6 * fx)) as u8,
-                (stream.tint[1] as f32 * (0.4 + 0.6 * fy)) as u8,
-                stream.tint[2],
+                tone(stream.tint[0] as f32 * (0.4 + 0.6 * fx), rw),
+                tone(stream.tint[1] as f32 * (0.4 + 0.6 * fy), 1.0),
+                tone(stream.tint[2] as f32, bw),
             ];
             let cross = x.abs_diff(w / 2) < 3 || y.abs_diff(h / 2) < 3;
             let corner = x < w / 8 && y < h / 8;
@@ -293,6 +330,7 @@ fn handle(
                 notice,
                 sequence: 0,
                 next_frame: now,
+                settings: controls.settings.unwrap_or_default(),
                 controls,
             });
         }
@@ -309,6 +347,9 @@ fn handle(
             controls,
         } => {
             if let Some(s) = stream.as_mut().filter(|s| s.generation == generation) {
+                if let Some(settings) = controls.settings {
+                    s.settings = settings;
+                }
                 s.controls = controls;
             }
         }
@@ -353,8 +394,9 @@ fn step(s: &mut Stream, sink: &EventSink, opts: &Options, epoch: Instant) {
         meta: FrameMeta {
             sequence: s.sequence,
             timestamp_ns: now.duration_since(epoch).as_nanos() as u64,
-            exposure_us: Some(exposure),
-            analogue_gain: Some(1.0),
+            exposure_us: Some(s.settings.shutter.manual().unwrap_or(exposure)),
+            analogue_gain: Some(s.settings.gain.manual().unwrap_or(1.0)),
+            lens_position: Some(s.settings.lens.manual().unwrap_or(1.5)),
             ..FrameMeta::default()
         },
     }));
@@ -421,6 +463,7 @@ mod tests {
             sequence: 0,
             next_frame: Instant::now(),
             controls: Controls::default(),
+            settings: Default::default(),
             tint: [100, 100, 100],
         };
         let px = render(&s);

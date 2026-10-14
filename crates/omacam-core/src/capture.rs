@@ -102,6 +102,7 @@ pub fn lock_from(meta: Option<&FrameMeta>) -> Controls {
         lens_position: m.lens_position,
         af_continuous: false,
         focus: None,
+        settings: None,
     }
 }
 

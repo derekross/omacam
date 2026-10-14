@@ -33,6 +33,12 @@ pub struct Info {
     pub subsec: Option<String>,
     /// Only when location tags are on (off by default, Q5).
     pub gps: Option<Gps>,
+    /// Exposure set by hand (shutter or ISO): ExposureMode 1, else 0.
+    pub manual_exposure: bool,
+    /// White balance set by hand: WhiteBalance 1, else 0.
+    pub manual_white_balance: bool,
+    /// Exposure compensation, EV.
+    pub exposure_bias: Option<f32>,
 }
 
 /// A position for the GPS IFD.
@@ -55,6 +61,7 @@ const SHORT: u16 = 3;
 const LONG: u16 = 4;
 const RATIONAL: u16 = 5;
 const UNDEFINED: u16 = 7;
+const SRATIONAL: u16 = 10;
 
 /// One IFD entry: tag, type, count and its bytes (little-endian).
 struct Entry {
@@ -267,6 +274,19 @@ pub fn tiff(info: &Info) -> Vec<u8> {
     if let Some(f) = info.focal_length_mm {
         exif.push(ratio(0x920a, f, 100));
     }
+    exif.push(short(0xa402, u16::from(info.manual_exposure)));
+    exif.push(short(0xa403, u16::from(info.manual_white_balance)));
+    if let Some(ev) = info.exposure_bias {
+        // SRATIONAL: hundredths of an EV.
+        let mut data = ((ev * 100.0).round() as i32).to_le_bytes().to_vec();
+        data.extend_from_slice(&100i32.to_le_bytes());
+        exif.push(Entry {
+            tag: 0x9204,
+            kind: SRATIONAL,
+            count: 1,
+            data,
+        });
+    }
     if let Some(m) = &info.lens_make {
         exif.push(ascii(0xa433, m));
     }
@@ -368,6 +388,9 @@ mod tests {
             lens_model: Some("Pixel 7 Pro Main camera 7.05mm f/1.85".into()),
             subsec: Some("042".into()),
             gps: None,
+            manual_exposure: true,
+            manual_white_balance: false,
+            exposure_bias: Some(-0.7),
         }
     }
 
@@ -412,6 +435,9 @@ mod tests {
         );
         assert_eq!(get(Tag::LensMake), "\"Google\"");
         assert_eq!(get(Tag::SubSecTimeOriginal), "\"042\"");
+        assert_eq!(get(Tag::ExposureMode), "manual exposure");
+        assert_eq!(get(Tag::WhiteBalance), "auto white balance");
+        assert_eq!(get(Tag::ExposureBiasValue), "-0.7");
         assert!(
             exif.get_field(Tag::GPSLatitude, ::exif::In::PRIMARY)
                 .is_none(),

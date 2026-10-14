@@ -80,6 +80,108 @@ pub struct CameraInfo {
     /// `ScalerCropMaximum`: the sensor area the processed frames show,
     /// in the coordinates `AfWindows` uses.
     pub crop_maximum: Option<Rect>,
+    /// The exposure, white balance and focus controls it offers.
+    pub caps: Caps,
+}
+
+/// What a camera's control map offers for manual exposure, white balance
+/// and focus. A control the map doesn't list stays disabled in the UI.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Caps {
+    /// ExposureValue, EV range.
+    pub ev: Option<(f32, f32)>,
+    /// ExposureTime, microseconds.
+    pub exposure_time: Option<(i32, i32)>,
+    /// AnalogueGain.
+    pub gain: Option<(f32, f32)>,
+    /// ExposureTimeMode/AnalogueGainMode (or the older AeEnable): manual
+    /// exposure is possible at all.
+    pub manual_exposure: bool,
+    /// AwbMode presets.
+    pub awb_modes: bool,
+    /// ColourTemperature (with AwbEnable off), kelvin.
+    pub colour_temperature: Option<(i32, i32)>,
+    /// LensPosition with AfMode Manual: manual focus.
+    pub lens_position: Option<(f32, f32)>,
+}
+
+impl Caps {
+    pub fn manual_shutter(&self) -> bool {
+        self.manual_exposure && self.exposure_time.is_some()
+    }
+
+    pub fn manual_gain(&self) -> bool {
+        self.manual_exposure && self.gain.is_some()
+    }
+
+    pub fn white_balance(&self) -> bool {
+        self.awb_modes || self.colour_temperature.is_some()
+    }
+}
+
+/// A control left to the camera, or set by hand.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum Setting<T> {
+    #[default]
+    Auto,
+    Manual(T),
+}
+
+impl<T: Copy> Setting<T> {
+    pub fn manual(self) -> Option<T> {
+        match self {
+            Setting::Auto => None,
+            Setting::Manual(v) => Some(v),
+        }
+    }
+
+    pub fn is_auto(&self) -> bool {
+        matches!(self, Setting::Auto)
+    }
+}
+
+/// White balance by preset or colour temperature.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Awb {
+    Preset(AwbPreset),
+    Kelvin(u32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AwbPreset {
+    Daylight,
+    Cloudy,
+    Incandescent,
+    Fluorescent,
+}
+
+impl AwbPreset {
+    pub const ALL: [AwbPreset; 4] = [
+        AwbPreset::Daylight,
+        AwbPreset::Cloudy,
+        AwbPreset::Incandescent,
+        AwbPreset::Fluorescent,
+    ];
+
+    /// The colour temperature a preset stands for, for cameras that take
+    /// a temperature but no presets.
+    pub fn kelvin(self) -> u32 {
+        match self {
+            AwbPreset::Daylight => 5500,
+            AwbPreset::Cloudy => 6500,
+            AwbPreset::Incandescent => 2850,
+            AwbPreset::Fluorescent => 4000,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            AwbPreset::Daylight => "Daylight",
+            AwbPreset::Cloudy => "Cloudy",
+            AwbPreset::Incandescent => "Incandescent",
+            AwbPreset::Fluorescent => "Fluorescent",
+        }
+    }
 }
 
 /// Byte layout of a single-plane RGB frame, named by DRM fourcc as
@@ -167,6 +269,23 @@ pub struct Controls {
     /// Focus once (AfMode Auto, AfTrigger Start), on `window` when given
     /// and the camera takes AfWindows, else wherever its AF looks.
     pub focus: Option<FocusRequest>,
+    /// The exposure, white balance and focus settings to apply (None:
+    /// leave as they are). Unlike the hints above, these hold.
+    pub settings: Option<ExposureSettings>,
+}
+
+/// What the user set: everything Auto by default.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ExposureSettings {
+    /// ExposureValue, EV.
+    pub ev: f32,
+    /// ExposureTime, microseconds.
+    pub shutter: Setting<i32>,
+    /// AnalogueGain.
+    pub gain: Setting<f32>,
+    pub white_balance: Setting<Awb>,
+    /// LensPosition (Auto: the autofocus decides).
+    pub lens: Setting<f32>,
 }
 
 /// A one-shot focus scan.

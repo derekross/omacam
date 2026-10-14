@@ -22,7 +22,8 @@ use std::time::{Duration, Instant};
 
 use libcamera::camera::ActiveCamera;
 use libcamera::camera_manager::CameraManager;
-use libcamera::control::{ControlEntry, ControlList};
+use libcamera::control::{ControlEntry, ControlInfoMap, ControlList};
+use libcamera::control_value::ControlValue;
 use libcamera::framebuffer::{AsFrameBuffer, FrameMetadataStatus};
 use libcamera::framebuffer_allocator::{FrameBuffer, FrameBufferAllocator};
 use libcamera::framebuffer_map::MemoryMappedFrameBuffer;
@@ -33,8 +34,9 @@ use libcamera::stream::{Stream, StreamRole};
 use libcamera::{controls, properties};
 
 use omacam_core::backend::{
-    AfState, Backend, CameraInfo, Command, Controls, Event, EventSink, Frame, FrameData, FrameMeta,
-    Location, PixelLayout, Purpose, Rect, ReleaseToken, Size, StreamRequest,
+    AfState, Awb, AwbPreset, Backend, CameraInfo, Caps, Command, Controls, Event, EventSink,
+    ExposureSettings, Frame, FrameData, FrameMeta, Location, PixelLayout, Purpose, Rect,
+    ReleaseToken, Setting, Size, StreamRequest,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -288,6 +290,8 @@ impl Worker {
                             width: r.0.width,
                             height: r.0.height,
                         });
+                let caps = caps(ctrls);
+                tracing::info!(camera = cam.id(), ?caps, "camera controls");
                 CameraInfo {
                     id: cam.id().to_string(),
                     location,
@@ -296,6 +300,7 @@ impl Worker {
                     autofocus: has(<controls::AfMode as ControlEntry>::ID),
                     af_windows: has(<controls::AfWindows as ControlEntry>::ID),
                     crop_maximum,
+                    caps,
                 }
             })
             .collect()
@@ -702,11 +707,107 @@ impl Worker {
     }
 }
 
+fn number(v: ControlValue) -> Option<f64> {
+    match v {
+        ControlValue::Float(x) => x.first().map(|v| *v as f64),
+        ControlValue::Int32(x) => x.first().map(|v| *v as f64),
+        ControlValue::Int64(x) => x.first().map(|v| *v as f64),
+        ControlValue::Uint32(x) => x.first().map(|v| *v as f64),
+        _ => None,
+    }
+}
+
+/// A control's range, when the map lists it with numeric bounds.
+fn range(map: &ControlInfoMap, id: u32) -> Option<(f64, f64)> {
+    let info = map.find(id).ok()?;
+    let (lo, hi) = (number(info.min())?, number(info.max())?);
+    (hi >= lo).then_some((lo, hi))
+}
+
+/// What the camera offers for manual exposure, white balance and focus.
+/// Everything is looked up by control id, so a libcamera without one of
+/// them just leaves that control disabled in the app.
+fn caps(map: &ControlInfoMap) -> Caps {
+    let has = |id: u32| map.find(id).is_ok();
+    let id = |c: u32| c;
+    Caps {
+        ev: range(map, id(<controls::ExposureValue as ControlEntry>::ID))
+            .map(|(a, b)| (a as f32, b as f32)),
+        exposure_time: range(map, <controls::ExposureTime as ControlEntry>::ID)
+            .map(|(a, b)| (a as i32, b as i32)),
+        gain: range(map, <controls::AnalogueGain as ControlEntry>::ID)
+            .map(|(a, b)| (a as f32, b as f32)),
+        manual_exposure: has(<controls::ExposureTimeMode as ControlEntry>::ID)
+            || has(<controls::AeEnable as ControlEntry>::ID),
+        awb_modes: has(<controls::AwbMode as ControlEntry>::ID),
+        colour_temperature: range(map, <controls::ColourTemperature as ControlEntry>::ID)
+            .filter(|_| has(<controls::AwbEnable as ControlEntry>::ID))
+            .map(|(a, b)| (a as i32, b as i32)),
+        lens_position: range(map, <controls::LensPosition as ControlEntry>::ID)
+            .filter(|_| has(<controls::AfMode as ControlEntry>::ID))
+            .map(|(a, b)| (a as f32, b as f32)),
+    }
+}
+
+/// Exposure, white balance and manual focus on a control list. Modes go
+/// with values: a manual exposure time is ExposureTimeMode Manual plus
+/// ExposureTime (or AeEnable off on a libcamera without the modes), and
+/// Auto puts the mode back.
+fn set_settings(list: &mut ControlList, s: &ExposureSettings) {
+    let _ = list.set(controls::ExposureValue(s.ev));
+    match s.shutter {
+        Setting::Manual(t) => {
+            let _ = list.set(controls::ExposureTimeMode::Manual);
+            let _ = list.set(controls::ExposureTime(t));
+        }
+        Setting::Auto => {
+            let _ = list.set(controls::ExposureTimeMode::Auto);
+        }
+    }
+    match s.gain {
+        Setting::Manual(g) => {
+            let _ = list.set(controls::AnalogueGainMode::Manual);
+            let _ = list.set(controls::AnalogueGain(g));
+        }
+        Setting::Auto => {
+            let _ = list.set(controls::AnalogueGainMode::Auto);
+        }
+    }
+    // The older switch, for a libcamera without the mode controls.
+    let _ = list.set(controls::AeEnable(s.shutter.is_auto() && s.gain.is_auto()));
+    match s.white_balance {
+        Setting::Auto => {
+            let _ = list.set(controls::AwbEnable(true));
+            let _ = list.set(controls::AwbMode::AwbAuto);
+        }
+        Setting::Manual(Awb::Preset(p)) => {
+            let _ = list.set(controls::AwbEnable(true));
+            let _ = list.set(match p {
+                AwbPreset::Daylight => controls::AwbMode::AwbDaylight,
+                AwbPreset::Cloudy => controls::AwbMode::AwbCloudy,
+                AwbPreset::Incandescent => controls::AwbMode::AwbIncandescent,
+                AwbPreset::Fluorescent => controls::AwbMode::AwbFluorescent,
+            });
+        }
+        Setting::Manual(Awb::Kelvin(k)) => {
+            let _ = list.set(controls::AwbEnable(false));
+            let _ = list.set(controls::ColourTemperature(k as i32));
+        }
+    }
+    if let Setting::Manual(p) = s.lens {
+        let _ = list.set(controls::AfMode::Manual);
+        let _ = list.set(controls::LensPosition(p));
+    }
+}
+
 /// Put `c` on a control list. A control the camera doesn't have fails to
 /// set; that's fine.
 fn set_controls(list: &mut ControlList, c: &Controls, exposure_hints: bool) {
     if c.af_continuous {
         let _ = list.set(controls::AfMode::Continuous);
+    }
+    if let Some(s) = &c.settings {
+        set_settings(list, s);
     }
     if let Some(focus) = c.focus {
         // One scan: auto mode, the tapped window when the camera takes

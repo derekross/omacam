@@ -153,6 +153,23 @@ pub fn draw(
         }
     }
     snapshot.pop();
+    if let Some(bins) = decor.histogram.as_ref().filter(|b| !b.is_empty()) {
+        let (hw, hh) = (120.0f32, 48.0f32);
+        let (x0, y0) = (rect.x() + 10.0, rect.y() + 40.0);
+        snapshot.append_color(
+            &gdk::RGBA::new(0.0, 0.0, 0.0, 0.45),
+            &graphene::Rect::new(x0, y0, hw, hh),
+        );
+        let bw = hw / bins.len() as f32;
+        let bar = gdk::RGBA::new(1.0, 1.0, 1.0, 0.8);
+        for (i, b) in bins.iter().enumerate() {
+            let h = (b.clamp(0.0, 1.0) * (hh - 4.0)).max(0.5);
+            snapshot.append_color(
+                &bar,
+                &graphene::Rect::new(x0 + i as f32 * bw, y0 + hh - 2.0 - h, bw.max(1.0), h),
+            );
+        }
+    }
     if let Some(ring) = decor.ring {
         let (ur, vr) = picture_to_shown(ring.u, ring.v, upright, shown);
         let (cx, cy) = (
@@ -174,6 +191,8 @@ pub struct Decor {
     /// Grid lines: 0 for none, 3 for thirds, 4 for quarters.
     pub grid: u32,
     pub ring: Option<Ring>,
+    /// A luma histogram (bins, each 0..1) to draw over the top left.
+    pub histogram: Option<Vec<f32>>,
 }
 
 /// A focus ring at a point of the whole upright picture (0..1).
@@ -287,6 +306,26 @@ impl Viewfinder {
             self.imp().decor.replace(decor);
             self.queue_draw();
         }
+    }
+
+    /// Where a point of the whole upright picture (0..1) is drawn, in
+    /// widget coordinates.
+    pub fn widget_point(&self, u: f64, v: f64) -> Option<(f32, f32)> {
+        let tex = self.texture()?;
+        let p = self.placement();
+        let (tw, th) = (tex.width() as f32, tex.height() as f32);
+        let upright = if p.rotation % 180 == 90 {
+            (th, tw)
+        } else {
+            (tw, th)
+        };
+        let shown = crop_to_aspect(upright, self.decor().aspect);
+        let rect = fit(shown, (self.width() as f32, self.height() as f32), 0.0);
+        let (su, sv) = picture_to_shown(u, v, upright, shown);
+        Some((
+            rect.x() + rect.width() * su as f32,
+            rect.y() + rect.height() * sv as f32,
+        ))
     }
 
     /// A widget point to the whole upright picture (0..1), if on it.

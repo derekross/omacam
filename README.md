@@ -25,9 +25,12 @@ finds.
 - Photos from the full-resolution mode (12.5 MP from the main camera),
   cropped to the zoom and saved upright as JPEG in `~/Pictures/Camera`.
 - Switching between the back and the front camera.
-- Tap the picture to focus there (on cameras whose autofocus takes a
-  window; otherwise the camera focuses on the centre, and a fixed-focus
-  camera says so).
+- Tap the picture to focus and meter there, then slide the EV control
+  beside the ring; long-press for AE/AF lock.
+- A Pro panel: shutter, ISO, white balance and manual focus, each with
+  Auto, and a histogram. Each control appears as the camera offers it
+  (today's libcamera offers manual focus on the main camera; the rest
+  light up as libcamera adds them).
 - The last photo as a thumbnail; tap it to open it.
 - Video: 1080p or 720p at 30 fps, H.264 with Opus sound in MP4, saved in
   `~/Videos/Camera`, with zoom while recording (within the lens in use).
@@ -42,7 +45,7 @@ finds.
 - The cameras are let go while the window is hidden, so other apps (a
   browser, a video call) can use them.
 
-Not yet: exposure compensation, lens switching while recording, other
+Not yet: lens switching while recording, other
 video frame rates, location tags, RAW, a level, HDR and night modes. See
 [docs/architecture.md](docs/architecture.md) for the plan.
 

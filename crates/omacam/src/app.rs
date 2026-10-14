@@ -75,8 +75,31 @@ window.omacam, window.omacam viewfinder { background: black; }
 }
 scale.zoom-slider trough { min-height: 4px; }
 scale.zoom-slider { color: white; }
+.pro-panel { padding: 0 8px; }
+.pro-chip {
+  min-height: 44px; padding: 2px 4px; border-radius: 12px;
+  background: rgba(0,0,0,0.5); color: rgba(255,255,255,0.85); box-shadow: none;
+}
+.pro-chip.manual, .pro-chip:checked { color: var(--accent-bg-color); }
+.pro-chip-name { font-size: 10px; opacity: 0.75; }
+.pro-chip-value { font-size: 13px; font-weight: bold; font-feature-settings: "tnum"; }
+.pro-editor { background: rgba(0,0,0,0.55); border-radius: 14px; padding: 6px 10px; }
+.pro-auto, .pro-preset {
+  min-height: 36px; min-width: 36px; padding: 0 8px; border-radius: 999px;
+  background: rgba(255,255,255,0.12); color: white; box-shadow: none; font-size: 12px;
+}
+.pro-auto:checked, .pro-preset:checked { background: var(--accent-bg-color); color: var(--accent-fg-color); }
+.pro-value { color: white; font-weight: bold; font-feature-settings: "tnum"; }
+.lock-chip {
+  background: var(--accent-bg-color); color: var(--accent-fg-color); font-weight: bold;
+  border-radius: 999px; padding: 4px 12px;
+}
+scale.ev-slider { color: #ffd54f; }
+
 "#;
 
+/// How long the EV slider stays after a tap or a drag.
+const EV_SHOWN: Duration = Duration::from_secs(4);
 /// How long the slider and the zoom readout stay after the last change.
 const HIDE_AFTER: Duration = Duration::from_millis(1500);
 /// How long the window may lose focus before the cameras are let go.
@@ -151,6 +174,17 @@ struct App {
     last_photo: RefCell<Option<PathBuf>>,
     last_error: RefCell<Option<(String, Instant)>>,
     built_presets: RefCell<Vec<f64>>,
+    pro_toggle: gtk::ToggleButton,
+    pro_panel: RefCell<Option<Rc<crate::pro::ProPanel>>>,
+    picture_bottom: gtk::Box,
+    lock_chip: gtk::Label,
+    ev_slider: gtk::Scale,
+    setting_ev: Cell<bool>,
+    /// The EV slider shows until then (after a tap or a drag).
+    ev_shown_until: Cell<Option<Instant>>,
+    histogram: Cell<bool>,
+    /// The last frame on screen, for metering a tap and the histogram.
+    last_pixels: RefCell<Option<(omacam_core::backend::SharedPixels, u32, u32, u32)>>,
     settings: RefCell<Settings>,
     settings_path: PathBuf,
     /// The self-timer: its tick source and the seconds left.
@@ -322,12 +356,35 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
     // come and go without moving anything.
     let picture_bottom = gtk::Box::new(gtk::Orientation::Vertical, 6);
     picture_bottom.set_valign(gtk::Align::End);
-    picture_bottom.set_halign(gtk::Align::Center);
+    // Full width, for the Pro panel; the label and slider centre
+    // themselves.
+    picture_bottom.set_halign(gtk::Align::Fill);
     picture_bottom.set_margin_bottom(8);
     lens_label.set_halign(gtk::Align::Center);
     picture_bottom.append(&slider_revealer);
     picture_bottom.append(&lens_label);
     overlay.add_overlay(&picture_bottom);
+
+    // Over the top of the picture: the AE/AF lock chip; beside the focus
+    // ring, the EV slider (placed when shown).
+    let lock_chip = gtk::Label::new(Some("AE/AF lock"));
+    lock_chip.add_css_class("lock-chip");
+    lock_chip.set_halign(gtk::Align::Center);
+    lock_chip.set_valign(gtk::Align::Start);
+    lock_chip.set_margin_top(50);
+    lock_chip.set_visible(false);
+    lock_chip.set_can_target(false);
+    overlay.add_overlay(&lock_chip);
+    let ev_slider = gtk::Scale::with_range(gtk::Orientation::Vertical, -2.0, 2.0, 0.1);
+    ev_slider.set_inverted(true);
+    ev_slider.set_draw_value(false);
+    ev_slider.add_mark(0.0, gtk::PositionType::Right, None);
+    ev_slider.add_css_class("ev-slider");
+    ev_slider.set_size_request(-1, 170);
+    ev_slider.set_halign(gtk::Align::Start);
+    ev_slider.set_valign(gtk::Align::Start);
+    ev_slider.set_visible(false);
+    overlay.add_overlay(&ev_slider);
 
     // Below the picture: the zoom buttons and the shutter row, in a bar of
     // their own, so the picture is letterboxed above them.
@@ -344,6 +401,9 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
     mode_box.set_halign(gtk::Align::Center);
     mode_box.append(&mode_photo);
     mode_box.append(&mode_video);
+    let pro_toggle = gtk::ToggleButton::with_label("Pro");
+    pro_toggle.set_tooltip_text(Some("Shutter, ISO, white balance and focus"));
+    mode_box.append(&pro_toggle);
     if omacam_record::init().is_err() {
         mode_video.set_sensitive(false);
         mode_video.set_tooltip_text(Some("GStreamer didn't start"));
@@ -405,6 +465,15 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
         last_photo: RefCell::new(None),
         last_error: RefCell::new(None),
         built_presets: RefCell::new(Vec::new()),
+        pro_toggle: pro_toggle.clone(),
+        pro_panel: RefCell::new(None),
+        picture_bottom: picture_bottom.clone(),
+        lock_chip,
+        ev_slider,
+        setting_ev: Cell::new(false),
+        ev_shown_until: Cell::new(None),
+        histogram: Cell::new(false),
+        last_pixels: RefCell::new(None),
         settings: RefCell::new(settings),
         settings_path,
         countdown: RefCell::new(None),
@@ -499,8 +568,34 @@ async fn run_script(app: Rc<App>, steps: Vec<crate::script::Step>) {
                     app.mode_photo.set_active(true);
                 }
             }
-            Step::Tap(u, v) => {
-                if let Some(out) = app.with_controller(|c| c.tap(u, v, Instant::now())) {
+            Step::Tap(u, v) => app.tap_at(u, v),
+            Step::Pro(on) => app.pro_toggle.set_active(on),
+            Step::ProEdit(which) => {
+                use crate::pro::Kind;
+                let kind = match which.as_str() {
+                    "shutter" => Kind::Shutter,
+                    "iso" => Kind::Iso,
+                    "wb" => Kind::WhiteBalance,
+                    _ => Kind::Focus,
+                };
+                if let Some(p) = app.pro_panel.borrow().as_ref() {
+                    p.select(kind);
+                }
+                app.refresh();
+            }
+            Step::ProShutter(us) => app.pro_action(crate::pro::Action::Shutter(if us == 0 {
+                omacam_core::backend::Setting::Auto
+            } else {
+                omacam_core::backend::Setting::Manual(us as i32)
+            })),
+            Step::Lock => {
+                if let Some(out) = app.with_controller(|c| c.lock(Instant::now())) {
+                    app.apply(out);
+                }
+            }
+            Step::Ev(ev) => {
+                app.ev_shown_until.set(Some(Instant::now() + EV_SHOWN));
+                if let Some(out) = app.with_controller(|c| c.set_ev(ev as f32)) {
                     app.apply(out);
                 }
             }
@@ -689,7 +784,7 @@ impl App {
                     if self.settings.borrow().shutter_sound {
                         play_shutter_sound();
                     }
-                    self.save(p)
+                    self.save(*p)
                 }
                 Output::Error(msg) => self.error(&msg),
             }
@@ -720,6 +815,10 @@ impl App {
                 let out = if first {
                     let mut c = Controller::new(&self.cli.lens_table(), &cameras, opts);
                     c.set_facing(self.cli.start_facing());
+                    let settings = self.settings.borrow().clone();
+                    if settings.keep_pro {
+                        App::restore_pro(&mut c, &settings.pro);
+                    }
                     if let Some(z) = self.cli.zoom {
                         c.set_zoom(z, ZoomSource::Preset, now);
                     }
@@ -804,6 +903,14 @@ impl App {
             self.shown_luma.set(mean_luma(&frame));
             self.shown_ae
                 .set((frame.meta.exposure_us, frame.meta.analogue_gain));
+        }
+        if let (FrameData::Shared(px), 4) = (&frame.data, frame.layout.bytes_per_pixel()) {
+            *self.last_pixels.borrow_mut() = Some((
+                px.clone(),
+                frame.size.width,
+                frame.size.height,
+                frame.stride,
+            ));
         }
         let format = (
             frame.size.width,
@@ -1070,9 +1177,18 @@ impl App {
         } else {
             settings.aspect.portrait_ratio()
         };
+        let histogram = if self.histogram.get() {
+            self.last_pixels
+                .borrow()
+                .as_ref()
+                .map(|(px, w, h, stride)| luma_histogram(px.as_ref(), *w, *h, *stride, 32))
+        } else {
+            None
+        };
         self.viewfinder.set_decor(Decor {
             aspect,
             grid: settings.grid.lines(),
+            histogram,
             ring,
         });
         let focus_note = match view.focus.map(|f| f.status) {
@@ -1085,6 +1201,33 @@ impl App {
             self.zoom_indicator.set_visible(true);
         } else if self.countdown.borrow().is_none() && self.hide_source.borrow().is_none() {
             self.zoom_indicator.set_visible(false);
+        }
+        // Exposure: the lock chip, the EV slider beside the ring, the Pro
+        // panel.
+        let ex = &view.exposure;
+        self.lock_chip.set_visible(ex.locked);
+        let ev_on = ex.caps.ev.is_some()
+            && self
+                .ev_shown_until
+                .get()
+                .is_some_and(|t| Instant::now() < t);
+        let anchor = view
+            .focus
+            .and_then(|f| self.viewfinder.widget_point(f.u, f.v));
+        if ev_on {
+            if let Some((x, y)) = anchor {
+                let w = self.viewfinder.width() as f32;
+                let x = if x + 70.0 < w { x + 44.0 } else { x - 70.0 };
+                self.ev_slider.set_margin_start(x.max(0.0) as i32);
+                self.ev_slider.set_margin_top((y - 85.0).max(0.0) as i32);
+            }
+            self.setting_ev.set(true);
+            self.ev_slider.set_value(ex.ev_user as f64);
+            self.setting_ev.set(false);
+        }
+        self.ev_slider.set_visible(ev_on && anchor.is_some());
+        if let Some(p) = self.pro_panel.borrow().as_ref() {
+            p.update(ex);
         }
         self.debug.set_visible(self.debug_enabled());
         if self.debug_enabled() {
@@ -1276,6 +1419,12 @@ impl App {
             }
         });
         let a = Rc::downgrade(self);
+        self.pro_toggle.connect_toggled(move |b| {
+            if let Some(a) = a.upgrade() {
+                a.set_pro(b.is_active());
+            }
+        });
+        let a = Rc::downgrade(self);
         self.mode_video.connect_toggled(move |b| {
             let Some(a) = a.upgrade() else { return };
             let mode = if b.is_active() {
@@ -1299,11 +1448,36 @@ impl App {
             let Some((u, v)) = a.viewfinder.picture_point(x, y) else {
                 return;
             };
-            if let Some(out) = a.with_controller(|c| c.tap(u, v, Instant::now())) {
+            a.tap_at(u, v);
+        });
+        self.viewfinder.add_controller(tap);
+
+        // Long press: AE/AF lock.
+        let press = gtk::GestureLongPress::new();
+        let a = Rc::downgrade(self);
+        press.connect_pressed(move |_, x, y| {
+            let Some(a) = a.upgrade() else { return };
+            if a.viewfinder.picture_point(x, y).is_none() {
+                return;
+            }
+            if let Some(out) = a.with_controller(|c| c.lock(Instant::now())) {
                 a.apply(out);
             }
         });
-        self.viewfinder.add_controller(tap);
+        self.viewfinder.add_controller(press);
+
+        // The EV slider beside the focus ring.
+        let a = Rc::downgrade(self);
+        self.ev_slider.connect_value_changed(move |s| {
+            let Some(a) = a.upgrade() else { return };
+            if a.setting_ev.get() {
+                return;
+            }
+            a.ev_shown_until.set(Some(Instant::now() + EV_SHOWN));
+            if let Some(out) = a.with_controller(|c| c.set_ev(s.value() as f32)) {
+                a.apply(out);
+            }
+        });
 
         // Volume keys take a photo, when they reach the app at all: the
         // phone's shell binds them for the system volume, and hands them
@@ -1546,7 +1720,7 @@ impl App {
                 // Focus once as recording starts (continuous AF holds once
                 // it has found focus; a fresh scan catches a new subject).
                 let now = Instant::now();
-                if let Some(out) = self.with_controller(|c| c.tap(0.5, 0.5, now)) {
+                if let Some(out) = self.with_controller(|c| c.refocus(now)) {
                     self.apply(out);
                 }
                 *self.recording.borrow_mut() = Some(Recording {
@@ -1630,6 +1804,114 @@ impl App {
         if let Some(out) = self.with_controller(|c| c.shutter(Instant::now())) {
             self.apply(out);
         }
+    }
+
+    /// A tap on the picture at (u, v): focus and meter there.
+    fn tap_at(self: &Rc<Self>, u: f64, v: f64) {
+        let luma = self.luma_around(u, v);
+        let now = Instant::now();
+        if let Some(out) = self.with_controller(|c| c.tap(u, v, luma, now)) {
+            self.apply(out);
+        }
+        self.ev_shown_until.set(Some(now + EV_SHOWN));
+        self.refresh();
+    }
+
+    /// The mean luma (0-255) of the frame around a point of the picture.
+    fn luma_around(&self, u: f64, v: f64) -> Option<f64> {
+        let camera = self.shown_camera.borrow().clone()?;
+        let t = self.controller.borrow().as_ref()?.transform(&camera)?;
+        let (x, y) = omacam_core::focus::picture_to_frame(u, v, &t);
+        let pixels = self.last_pixels.borrow();
+        let (px, w, h, stride) = pixels.as_ref()?;
+        Some(region_luma(px.as_ref(), *w, *h, *stride, x, y, 0.04))
+    }
+
+    /// Save the Pro values, when the setting keeps them.
+    fn save_pro(&self) {
+        use crate::settings::{SavedPro, SavedWb};
+        use omacam_core::backend::{Awb, AwbPreset};
+        let Some(view) = self.controller.borrow().as_ref().map(|c| c.view().exposure) else {
+            return;
+        };
+        let mut s = self.settings.borrow_mut();
+        if !s.keep_pro {
+            return;
+        }
+        s.pro = SavedPro {
+            shutter_us: view.pro.shutter.manual(),
+            iso: view
+                .pro
+                .gain
+                .manual()
+                .map(|g| omacam_core::exposure_control::iso(g as f64, view.base_iso)),
+            white_balance: view.pro.white_balance.manual().map(|w| match w {
+                Awb::Preset(AwbPreset::Daylight) => SavedWb::Daylight,
+                Awb::Preset(AwbPreset::Cloudy) => SavedWb::Cloudy,
+                Awb::Preset(AwbPreset::Incandescent) => SavedWb::Incandescent,
+                Awb::Preset(AwbPreset::Fluorescent) => SavedWb::Fluorescent,
+                Awb::Kelvin(k) => SavedWb::Kelvin(k),
+            }),
+            focus: view.pro.lens.manual(),
+        };
+        if let Err(e) = s.save(&self.settings_path) {
+            tracing::warn!(error = %e, "settings not saved");
+        }
+    }
+
+    /// Put saved Pro values back (at start, when the setting keeps them).
+    fn restore_pro(c: &mut Controller, saved: &crate::settings::SavedPro) {
+        use crate::settings::SavedWb;
+        use omacam_core::backend::{Awb, AwbPreset, Setting};
+        fn m<T>(o: Option<T>) -> Setting<T> {
+            o.map(Setting::Manual).unwrap_or(Setting::Auto)
+        }
+        c.set_shutter(m(saved.shutter_us));
+        c.set_iso(m(saved.iso));
+        c.set_lens_position(m(saved.focus));
+        c.set_white_balance(m(saved.white_balance.map(|w| match w {
+            SavedWb::Daylight => Awb::Preset(AwbPreset::Daylight),
+            SavedWb::Cloudy => Awb::Preset(AwbPreset::Cloudy),
+            SavedWb::Incandescent => Awb::Preset(AwbPreset::Incandescent),
+            SavedWb::Fluorescent => Awb::Preset(AwbPreset::Fluorescent),
+            SavedWb::Kelvin(k) => Awb::Kelvin(k),
+        })));
+    }
+
+    fn pro_action(self: &Rc<Self>, action: crate::pro::Action) {
+        use crate::pro::Action;
+        let out = self.with_controller(|c| match action {
+            Action::Shutter(s) => c.set_shutter(s),
+            Action::Iso(s) => c.set_iso(s),
+            Action::WhiteBalance(s) => c.set_white_balance(s),
+            Action::Focus(s) => c.set_lens_position(s),
+            Action::AllAuto => c.reset_exposure(),
+            Action::Histogram(_) => Vec::new(),
+        });
+        if let Action::Histogram(on) = action {
+            self.histogram.set(on);
+        }
+        if let Some(out) = out {
+            self.apply(out);
+        }
+        self.save_pro();
+    }
+
+    fn set_pro(self: &Rc<Self>, on: bool) {
+        if on && self.pro_panel.borrow().is_none() {
+            let a = Rc::downgrade(self);
+            let panel = crate::pro::ProPanel::new(move |action| {
+                if let Some(a) = a.upgrade() {
+                    a.pro_action(action);
+                }
+            });
+            self.picture_bottom.prepend(&panel.root);
+            *self.pro_panel.borrow_mut() = Some(panel);
+        }
+        if let Some(p) = self.pro_panel.borrow().as_ref() {
+            p.root.set_visible(on);
+        }
+        self.refresh();
     }
 
     fn open_settings(self: &Rc<Self>) {
@@ -1823,7 +2105,12 @@ fn encode_and_write(
         width: img.width,
         height: img.height,
         exposure_us: m.exposure_us,
-        iso: m.analogue_gain.map(|_| (gain * 100.0).round() as u32),
+        iso: m
+            .analogue_gain
+            .map(|_| omacam_core::exposure_control::iso(gain, p.lens.base_iso)),
+        manual_exposure: !p.settings.shutter.is_auto() || !p.settings.gain.is_auto(),
+        manual_white_balance: !p.settings.white_balance.is_auto(),
+        exposure_bias: Some(p.settings.ev),
         f_number: p.lens.f_number,
         // The crop narrows the view like a longer lens.
         focal_length_35mm: p
@@ -1920,4 +2207,51 @@ fn start_control_socket(tx: async_channel::Sender<Msg>) {
                 }
             }
         });
+}
+
+/// The mean luma (0-255) of the square around frame point (x, y), 0..1,
+/// `size` of the shorter side across, in 4-byte BGRX/RGBX pixels (the
+/// green channel and the two others weigh the same in both orders).
+fn region_luma(px: &[u8], w: u32, h: u32, stride: u32, x: f64, y: f64, size: f64) -> f64 {
+    let half = ((w.min(h) as f64 * size) / 2.0).max(1.0);
+    let (cx, cy) = (x * w as f64, y * h as f64);
+    let x0 = (cx - half).max(0.0) as u32;
+    let x1 = ((cx + half) as u32).min(w.saturating_sub(1));
+    let y0 = (cy - half).max(0.0) as u32;
+    let y1 = ((cy + half) as u32).min(h.saturating_sub(1));
+    let (mut sum, mut n) = (0.0, 0u32);
+    let step = ((x1 - x0) / 32).max(1);
+    for yy in (y0..=y1).step_by(step as usize) {
+        for xx in (x0..=x1).step_by(step as usize) {
+            let i = (yy * stride + xx * 4) as usize;
+            if let Some(p) = px.get(i..i + 3) {
+                sum += 0.114 * p[0] as f64 + 0.587 * p[1] as f64 + 0.299 * p[2] as f64;
+                n += 1;
+            }
+        }
+    }
+    if n == 0 {
+        MID_LUMA
+    } else {
+        sum / n as f64
+    }
+}
+
+const MID_LUMA: f64 = 118.0;
+
+/// A luma histogram of a 4-byte-per-pixel frame, `bins` bins scaled so the
+/// fullest is 1, from a sparse sample.
+fn luma_histogram(px: &[u8], w: u32, h: u32, stride: u32, bins: usize) -> Vec<f32> {
+    let mut counts = vec![0u32; bins];
+    for y in (0..h).step_by(8) {
+        for x in (0..w).step_by(8) {
+            let i = (y * stride + x * 4) as usize;
+            if let Some(p) = px.get(i..i + 3) {
+                let l = 0.114 * p[0] as f32 + 0.587 * p[1] as f32 + 0.299 * p[2] as f32;
+                counts[((l / 256.0) * bins as f32) as usize % bins] += 1;
+            }
+        }
+    }
+    let max = counts.iter().copied().max().unwrap_or(1).max(1) as f32;
+    counts.into_iter().map(|c| c as f32 / max).collect()
 }

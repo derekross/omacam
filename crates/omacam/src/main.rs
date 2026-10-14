@@ -4,6 +4,7 @@ mod app;
 mod exif;
 mod photo;
 mod prefs;
+mod pro;
 mod script;
 mod sensors;
 mod settings;

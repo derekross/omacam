@@ -33,7 +33,11 @@ docker run --rm --user "$(id -u):$(id -g)" -e W="$w" -e H="$h" -e SCALE="$scale"
     shot /out/focus.png; settings photo; wait 1; shot /out/settings-photo.png;
     settings video; wait 0.5; shot /out/settings-video.png; settings advanced; wait 0.5;
     shot /out/settings-advanced.png; close-settings; wait 0.5; flip; wait 1.5;
-    shot /out/front.png; flip; wait 1.5; mode video; wait 0.5; shot /out/video-mode.png;
+    shot /out/front.png; flip; wait 1.5;
+    tap 0.3 0.35; wait 0.3; ev 1.2; wait 0.3; shot /out/tap-ev.png; lock; wait 0.5; shot /out/locked.png;
+    tap 0.5 0.5; pro on; wait 0.5; shot /out/pro.png; pro-edit shutter; wait 0.5; pro-shutter 4000; wait 0.8;
+    shot /out/pro-shutter.png; pro-edit wb; wait 0.5; shot /out/pro-wb.png; pro off; wait 0.3;
+    mode video; wait 0.5; shot /out/video-mode.png;
     shutter; wait 2; zoom 2; wait 1; shot /out/recording.png; shutter; wait 3;
     shot /out/after-video.png; quit"
 ' 2>&1 | grep -E "WARN|ERROR|window saved" || true

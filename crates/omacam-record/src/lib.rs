@@ -758,11 +758,13 @@ mod tests {
             audio,
         })
         .unwrap();
+        let mut pushed = Vec::new();
         for i in 0..45u32 {
             let frame: Vec<u8> = (0..stride / 4 * h)
                 .flat_map(|p| [(p % w) as u8, (i * 8) as u8, (p / w) as u8, 255])
                 .collect();
             rec.push(frame).unwrap();
+            pushed.push(std::time::Instant::now());
             // Zooms whose crops round to aspects a little off 16:9: the
             // stream must not renegotiate (mp4mux refuses that).
             if i == 10 {
@@ -785,12 +787,21 @@ mod tests {
                     assert!(bytes.windows(4).any(|w| w == b"Opus"), "Opus track");
                 }
                 let (video, sound) = read_back(&saved, audio == Audio::Test);
-                // 45 frames pushed every 33 ms: all kept, from zero, at 30.
+                // 45 frames pushed about every 33 ms: all kept, from zero,
+                // at the rate they were pushed (a busy machine pushes
+                // slower than 30; the timestamps must follow).
                 assert!(video.len() >= 40, "{} video frames", video.len());
                 assert!(video[0] < 0.02, "video starts at {}", video[0]);
                 let span = video[video.len() - 1] - video[0];
                 let fps = (video.len() - 1) as f64 / span;
-                assert!((25.0..35.0).contains(&fps), "{fps:.1} fps");
+                let wall = pushed[pushed.len() - 1]
+                    .duration_since(pushed[0])
+                    .as_secs_f64();
+                let pushed_fps = (pushed.len() - 1) as f64 / wall;
+                assert!(
+                    (fps - pushed_fps).abs() / pushed_fps < 0.1,
+                    "{fps:.1} fps in the file, {pushed_fps:.1} pushed"
+                );
                 if let Some((first, last, gaps)) = sound {
                     assert!((-0.001..0.1).contains(&first), "sound starts at {first}");
                     assert!(last <= span + 0.15, "sound ends at {last}, video at {span}");

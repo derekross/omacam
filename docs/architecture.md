@@ -195,6 +195,44 @@ of no frames, which a video can't hide. Videos go to
 and videos in their own folders, and the file manager and players look
 there; Pixel's single DCIM folder is an Android convention.
 
+## Exposure, white balance and focus (§3.5)
+
+Automatic by default, with manual control where the camera allows it:
+
+- **Tap** focuses (AfWindows where the camera takes them, else its own
+  window) and **meters** the tapped area. libcamera has no standard
+  control for an exposure region, so metering is done by brightness: the
+  mean luma of the area around the tap is brought to mid-grey (118 of
+  255) through `ExposureValue`, at most ±2 EV.
+- **The EV slider** appears beside the focus ring for a few seconds after
+  a tap, -2..+2 EV on top of the metering; the next tap or a lens switch
+  resets it.
+- **Long press: AE/AF lock.** The exposure time, gain and lens position
+  the last frame reported are held as manual values (ExposureTimeMode and
+  AnalogueGainMode Manual, AfMode Manual); an "AE/AF lock" chip shows; a
+  tap releases it.
+- **Pro panel** (the Pro toggle beside Photo/Video): shutter, ISO, white
+  balance (Day, Cloudy, Tungsten, Fluorescent presets through AwbMode, or
+  their colour temperature through ColourTemperature where only that
+  exists) and manual focus (LensPosition), each with an "A" (auto) state.
+  Their chips show auto's live choice from the frame metadata when on
+  auto. ISO is analogue gain × the sensor's base ISO (`base_iso` in the
+  lens table: 50, an estimate). A histogram of the picture's luma can be
+  shown over the picture. Pro values hold across lens switches, apply to
+  stills and video alike, and reset at each launch unless "Keep Pro
+  settings" is on.
+- **What the camera offers decides what's enabled.** Every control is
+  looked up in the camera's ControlInfoMap at startup (logged as "camera
+  controls"); a chip whose control is missing is greyed with a tooltip.
+  On the phone's libcamera 0.7.2-4.8 the main camera offers AfMode,
+  AfTrigger and LensPosition (0-1) and none of the exposure or white
+  balance controls, so today manual focus works and the rest wait for
+  libcamera; the code paths are tested with a fake camera that offers
+  everything.
+- EXIF records what was used: exposure time, ISO, ExposureMode (manual
+  when shutter or ISO was set by hand), WhiteBalance, and the exposure
+  bias.
+
 ## Sharing the cameras
 
 libcamera locks a camera per process. omacam releases every camera and its

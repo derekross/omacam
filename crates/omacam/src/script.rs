@@ -25,6 +25,16 @@ pub enum Step {
     Tap(f64, f64),
     /// Switch to photo or video (`shutter` then records and stops).
     Mode(String),
+    /// Show or hide the Pro panel.
+    Pro(bool),
+    /// Open a Pro editor: shutter, iso, wb or focus.
+    ProEdit(String),
+    /// Set a manual shutter time (µs; 0 for auto), as the Pro panel would.
+    ProShutter(u32),
+    /// AE/AF lock (a long press).
+    Lock,
+    /// The EV slider.
+    Ev(f64),
     Quit,
 }
 
@@ -60,6 +70,16 @@ pub fn parse(text: &str) -> Result<Vec<Step>, String> {
             }),
             "close-settings" => Step::CloseSettings,
             "mode" if arg == "photo" || arg == "video" => Step::Mode(arg.into()),
+            "pro" if arg == "on" || arg == "off" => Step::Pro(arg == "on"),
+            "pro-edit" if ["shutter", "iso", "wb", "focus"].contains(&arg) => {
+                Step::ProEdit(arg.into())
+            }
+            "pro-shutter" => Step::ProShutter(number()? as u32),
+            "lock" => Step::Lock,
+            "ev" => Step::Ev(
+                arg.parse::<f64>()
+                    .map_err(|_| format!("ev: a number, got {arg:?}"))?,
+            ),
             "mode" => return Err(format!("mode: photo or video, got {arg:?}")),
             "tap" => {
                 let mut it = arg.split_whitespace().map(|v| v.parse::<f64>());
@@ -112,6 +132,16 @@ mod tests {
             vec![Step::Mode("video".into())]
         );
         assert!(parse("mode film").is_err());
+        assert_eq!(
+            parse("pro on; pro-edit iso; lock; ev -1.3; pro-shutter 4000").unwrap(),
+            vec![
+                Step::Pro(true),
+                Step::ProEdit("iso".into()),
+                Step::Lock,
+                Step::Ev(-1.3),
+                Step::ProShutter(4000)
+            ]
+        );
         assert_eq!(parse("tap 0.25 0.75").unwrap(), vec![Step::Tap(0.25, 0.75)]);
         assert_eq!(
             parse("settings video; close-settings").unwrap(),

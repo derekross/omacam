@@ -47,6 +47,10 @@ pub struct Lens {
     pub autofocus: bool,
     pub af_windows: bool,
     pub crop_maximum: Option<crate::backend::Rect>,
+    /// The camera's manual controls.
+    pub caps: crate::backend::Caps,
+    /// ISO at analogue gain 1, for showing gain as ISO.
+    pub base_iso: f64,
     pub mirror: bool,
     /// The camera's Rotation in libcamera's sense (correct by turning
     /// counter-clockwise). Filled from the camera's own Rotation property
@@ -91,6 +95,7 @@ struct LensEntry {
     f_number: Option<f64>,
     focal_length_35mm: Option<u32>,
     focal_length_mm: Option<f64>,
+    base_iso: Option<f64>,
     preview: Option<[u32; 2]>,
     still: Option<[u32; 2]>,
     #[serde(default)]
@@ -125,6 +130,9 @@ pub const CHEETAH: &str = include_str!("../../../data/cheetah.toml");
 
 /// Highest zoom when the table doesn't say.
 pub const DEFAULT_MAX_ZOOM: f64 = 8.0;
+/// ISO at gain 1 when the table doesn't say: phone sensors are about
+/// 50 at their base gain.
+pub const DEFAULT_BASE_ISO: f64 = 50.0;
 /// Highest digital zoom of the front camera.
 pub const FRONT_MAX_ZOOM: f64 = 4.0;
 
@@ -192,6 +200,8 @@ impl TableSpec {
                     autofocus: e.autofocus && cam.autofocus,
                     af_windows: cam.af_windows,
                     crop_maximum: cam.crop_maximum,
+                    caps: cam.caps.clone(),
+                    base_iso: e.base_iso.unwrap_or(DEFAULT_BASE_ISO),
                     mirror: e.mirror,
                     rotation: e.rotation.unwrap_or(cam.rotation % 360),
                 });
@@ -222,6 +232,8 @@ impl TableSpec {
                 autofocus: cam.autofocus,
                 af_windows: cam.af_windows,
                 crop_maximum: cam.crop_maximum,
+                caps: cam.caps.clone(),
+                base_iso: DEFAULT_BASE_ISO,
                 mirror: role == Role::Front,
                 rotation: cam.rotation % 360,
             });
