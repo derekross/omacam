@@ -149,10 +149,11 @@ fn list(cli: &Cli) -> anyhow::Result<()> {
         let lens = table.index_of(&cam.id).map(|i| table.get(i));
         match lens {
             Some(l) => println!(
-                "{:<10} {:>5.2}x  rotation {:>3}  {}  ({})",
+                "{:<10} {:>5.2}x  rotation {:>3} (turned {:>3} clockwise)  {}  ({})",
                 format!("{:?}", l.role).to_lowercase(),
                 l.zoom,
                 l.rotation,
+                l.upright_clockwise(),
                 cam.id,
                 cam.model
             ),

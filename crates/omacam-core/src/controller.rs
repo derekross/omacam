@@ -67,7 +67,9 @@ pub struct Transform {
     /// Magnification of the frame (crop), may be below 1 for a frozen frame
     /// of a narrower lens.
     pub scale: f64,
+    /// Clockwise degrees that turn the frame upright.
     pub rotation: u32,
+    /// Mirror (left-right) after turning upright: the selfie preview.
     pub mirror: bool,
 }
 
@@ -238,7 +240,7 @@ impl Controller {
         };
         Some(Transform {
             scale,
-            rotation: lens.rotation,
+            rotation: lens.upright_clockwise(),
             mirror: lens.mirror,
         })
     }
@@ -464,7 +466,7 @@ impl Controller {
         let zoom = self.side().map(|s| s.planner.zoom()).unwrap_or(1.0);
         Output::Picture(Picture {
             crop: (zoom / lens.zoom).max(1.0),
-            rotation: lens.rotation,
+            rotation: lens.upright_clockwise(),
             zoom,
             lens,
             frame,
@@ -712,6 +714,18 @@ mirror = true
     }
 
     #[test]
+    fn transforms_turn_each_camera_upright() {
+        // main 90, uw 270, tele 90 (this test's table), front 90: turn
+        // counter-clockwise by Rotation, so clockwise by 360 - Rotation.
+        let c = Controller::new(&spec(), &cameras(), Options::default());
+        assert_eq!(c.transform("main").unwrap().rotation, 270);
+        assert_eq!(c.transform("uw").unwrap().rotation, 90);
+        assert_eq!(c.transform("tele").unwrap().rotation, 270);
+        let front = c.transform("front").unwrap();
+        assert_eq!((front.rotation, front.mirror), (270, true));
+    }
+
+    #[test]
     fn flip_goes_to_the_front_camera_and_back() {
         let now = Instant::now();
         let mut c = Controller::new(&spec(), &cameras(), Options::default());
@@ -772,7 +786,7 @@ mirror = true
         match c.on_event(frame(g, "main", 10_000), now).as_slice() {
             [Output::Picture(p)] => {
                 assert_eq!(p.crop, 2.0);
-                assert_eq!(p.rotation, 90);
+                assert_eq!(p.rotation, 270, "main: Rotation 90 is 270 clockwise");
             }
             other => panic!("{other:?}"),
         }

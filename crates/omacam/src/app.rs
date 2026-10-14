@@ -22,10 +22,7 @@ use crate::{CaptureMode, Cli};
 
 const CSS: &str = r#"
 window.omacam, window.omacam viewfinder { background: black; }
-.omacam-controls {
-  padding: 8px 16px 24px 16px;
-  background: linear-gradient(to top, rgba(0,0,0,0.7), rgba(0,0,0,0));
-}
+.omacam-controls { padding: 10px 24px 18px 24px; background: black; }
 .zoom-pills { background: rgba(0,0,0,0.45); border-radius: 999px; padding: 4px; }
 .zoom-pill {
   min-width: 44px; min-height: 44px; padding: 0; border-radius: 999px;
@@ -38,14 +35,14 @@ window.omacam, window.omacam viewfinder { background: black; }
   font-size: 15px;
 }
 .shutter {
-  min-width: 72px; min-height: 72px; padding: 0; border-radius: 999px;
+  min-width: 72px; min-height: 72px; padding: 0; margin: 0; border-radius: 999px;
   background: white;
   box-shadow: 0 0 0 5px rgba(255,255,255,0.35);
 }
 .shutter:active { background: #d8d8d8; }
 .shutter.busy { background: var(--accent-bg-color); }
 .round-button {
-  min-width: 56px; min-height: 56px; padding: 0; border-radius: 999px;
+  min-width: 56px; min-height: 56px; padding: 0; margin: 0; border-radius: 999px;
   background: rgba(255,255,255,0.16); color: white;
 }
 
@@ -98,7 +95,6 @@ struct App {
     window: adw::ApplicationWindow,
     toasts: adw::ToastOverlay,
     viewfinder: Viewfinder,
-    controls: gtk::Box,
     pills: gtk::Box,
     pill_buttons: RefCell<Vec<(f64, gtk::Button)>>,
     slider: gtk::Scale,
@@ -227,32 +223,52 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
     thumb.add_css_class("round-button");
     thumb.add_css_class("thumb");
     thumb.set_overflow(gtk::Overflow::Hidden);
-    thumb.set_valign(gtk::Align::Center);
     thumb.set_tooltip_text(Some("Last photo"));
     thumb.set_sensitive(false);
     let shutter = gtk::Button::new();
     shutter.add_css_class("shutter");
     shutter.set_tooltip_text(Some("Take a photo"));
-    shutter.set_halign(gtk::Align::Center);
-    shutter.set_hexpand(true);
     let flip = round_button("camera-switch-symbolic", "Switch camera");
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    row.append(&thumb);
-    row.append(&shutter);
-    row.append(&flip);
+    // Fixed-size circles: never stretched by the row, whatever the window.
+    for (b, size) in [(&thumb, 56), (&shutter, 72), (&flip, 56)] {
+        b.set_size_request(size, size);
+        b.set_halign(gtk::Align::Center);
+        b.set_valign(gtk::Align::Center);
+        b.set_hexpand(false);
+        b.set_vexpand(false);
+    }
+    let row = gtk::CenterBox::new();
+    row.set_start_widget(Some(&thumb));
+    row.set_center_widget(Some(&shutter));
+    row.set_end_widget(Some(&flip));
+    row.set_vexpand(false);
 
-    let controls = gtk::Box::new(gtk::Orientation::Vertical, 14);
-    controls.add_css_class("omacam-controls");
-    controls.set_valign(gtk::Align::End);
+    // Over the bottom of the picture: the lens name and the slider, which
+    // come and go without moving anything.
+    let picture_bottom = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    picture_bottom.set_valign(gtk::Align::End);
+    picture_bottom.set_halign(gtk::Align::Center);
+    picture_bottom.set_margin_bottom(8);
     lens_label.set_halign(gtk::Align::Center);
-    controls.append(&lens_label);
-    controls.append(&slider_revealer);
+    picture_bottom.append(&slider_revealer);
+    picture_bottom.append(&lens_label);
+    overlay.add_overlay(&picture_bottom);
+
+    // Below the picture: the zoom buttons and the shutter row, in a bar of
+    // their own, so the picture is letterboxed above them.
+    let controls = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    controls.add_css_class("omacam-controls");
+    controls.set_vexpand(false);
     controls.append(&pills);
     controls.append(&row);
-    overlay.add_overlay(&controls);
+
+    let page = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    overlay.set_vexpand(true);
+    page.append(&overlay);
+    page.append(&controls);
 
     let toasts = adw::ToastOverlay::new();
-    toasts.set_child(Some(&overlay));
+    toasts.set_child(Some(&page));
     window.set_content(Some(&toasts));
 
     let (tx, rx) = async_channel::unbounded::<Msg>();
@@ -261,7 +277,6 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
         window: window.clone(),
         toasts,
         viewfinder,
-        controls,
         pills,
         pill_buttons: RefCell::new(Vec::new()),
         slider,
@@ -942,8 +957,6 @@ impl App {
     }
 
     fn tick(self: &Rc<Self>) {
-        let inset = self.controls.height() as f32;
-        self.viewfinder.set_inset(inset);
         if let Some(out) = self.with_controller(|c| c.tick(Instant::now())) {
             if !out.is_empty() {
                 self.apply(out);

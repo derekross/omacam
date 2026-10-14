@@ -88,10 +88,14 @@ full-resolution frame.
 
 ## Display (§3.2)
 
-Each frame becomes a texture drawn by the `Viewfinder` widget: rotated by
-the camera's `Rotation` property (main 90°, ultrawide 270°, telephoto 270°,
-front 90° on today's device tree), mirrored for the front camera, scaled by
-the zoom crop, and fitted whole into the window.
+Each frame becomes a texture drawn by the `Viewfinder` widget: turned
+upright, mirrored for the front camera, scaled by the zoom crop, and fitted
+whole into the area above the control bar. libcamera's `Rotation` property
+is the correction to apply *counter-clockwise* (`property_ids_core.yaml`,
+"Example two - Phone camera"), so a frame is turned 360 - Rotation degrees
+clockwise: on today's device tree the main and front cameras (Rotation 90)
+turn 270° clockwise, the ultrawide and telephoto (270) turn 90°. Photos are
+turned the same way before encoding.
 
 Two paths, `--display`:
 

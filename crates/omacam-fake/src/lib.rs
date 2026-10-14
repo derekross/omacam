@@ -44,7 +44,7 @@ pub fn cheetah_cameras() -> Vec<CameraInfo> {
         cam(
             "/base/soc@0/usi@109300c0/i2c@10930000/camera-sensor@2d",
             Location::Back,
-            90,
+            270,
             "s5kgm5",
         ),
     ]

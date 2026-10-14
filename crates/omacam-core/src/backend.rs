@@ -46,8 +46,10 @@ pub struct CameraInfo {
     /// The library's stable id (for libcamera, the sensor's DT path).
     pub id: String,
     pub location: Location,
-    /// Clockwise degrees that turn the sensor image upright (libcamera's
-    /// `Rotation` property).
+    /// libcamera's `Rotation` property: how far the image is turned on the
+    /// sensor, which a viewer corrects by turning it this many degrees
+    /// counter-clockwise (property_ids_core.yaml, "Example two - Phone
+    /// camera"). See [`crate::lens::upright_clockwise`].
     pub rotation: u32,
     pub model: String,
 }

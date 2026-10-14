@@ -43,9 +43,27 @@ pub struct Lens {
     pub still: Option<Size>,
     pub autofocus: bool,
     pub mirror: bool,
-    /// Clockwise degrees to turn the image upright. Filled from the
-    /// camera's own Rotation property unless the table overrides it.
+    /// The camera's Rotation in libcamera's sense (correct by turning
+    /// counter-clockwise). Filled from the camera's own Rotation property
+    /// unless the table overrides it. See [`Lens::upright_clockwise`].
     pub rotation: u32,
+}
+
+/// Clockwise degrees that turn a frame upright, for a camera whose
+/// libcamera `Rotation` is `rotation`. libcamera defines Rotation as the
+/// counter-clockwise difference between the sensor's reference system and
+/// the projected scene's, and says the image needs a correction of that
+/// many degrees counter-clockwise: Rotation 90 means turning the frame
+/// 90 degrees counter-clockwise, which is 270 clockwise.
+pub fn upright_clockwise(rotation: u32) -> u32 {
+    (360 - rotation % 360) % 360
+}
+
+impl Lens {
+    /// Clockwise degrees that turn this camera's frames upright.
+    pub fn upright_clockwise(&self) -> u32 {
+        upright_clockwise(self.rotation)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -286,7 +304,7 @@ mod tests {
             cam(
                 "/base/soc@0/usi@109300c0/i2c@10930000/camera-sensor@2d",
                 Location::Back,
-                90,
+                270,
             ),
         ]
     }
@@ -310,6 +328,28 @@ mod tests {
         assert!(!tele.autofocus);
         assert!(t.get(t.by_role(Role::Front).unwrap()).mirror);
         assert_eq!(t.max_zoom(Facing::Back), 15.0);
+    }
+
+    /// What the Pixel 7 Pro's cameras report (`omacam --list`, 2026-10-14,
+    /// kernel 00545) and how far each frame must turn clockwise to be
+    /// upright: main and front Rotation 90, ultrawide and telephoto 270.
+    #[test]
+    fn cheetah_frames_turn_upright_counter_clockwise_by_rotation() {
+        let t = TableSpec::cheetah().resolve(&cheetah_cameras());
+        let cw = |role| t.get(t.by_role(role).unwrap()).upright_clockwise();
+        assert_eq!(cw(Role::Main), 270);
+        assert_eq!(cw(Role::Ultrawide), 90);
+        assert_eq!(cw(Role::Tele), 90);
+        assert_eq!(cw(Role::Front), 270);
+    }
+
+    #[test]
+    fn upright_clockwise_inverts_libcamera_rotation() {
+        assert_eq!(upright_clockwise(0), 0);
+        assert_eq!(upright_clockwise(90), 270);
+        assert_eq!(upright_clockwise(180), 180);
+        assert_eq!(upright_clockwise(270), 90);
+        assert_eq!(upright_clockwise(360), 0);
     }
 
     #[test]
