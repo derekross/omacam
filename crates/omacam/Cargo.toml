@@ -1,0 +1,28 @@
+[package]
+name = "omacam"
+description = "Camera: a phone camera app for Omarchy Mobile"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# The real cameras. Needs libcamera at build time (see docs/development.md).
+libcamera = ["dep:omacam-libcamera"]
+
+[dependencies]
+omacam-core.workspace = true
+omacam-fake.workspace = true
+omacam-libcamera = { workspace = true, optional = true }
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+async-channel.workspace = true
+turbojpeg.workspace = true
+gtk4.workspace = true
+libadwaita.workspace = true

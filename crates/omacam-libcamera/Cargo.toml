@@ -1,0 +1,15 @@
+[package]
+name = "omacam-libcamera"
+description = "omacam's libcamera backend, through libcamera-rs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+omacam-core.workspace = true
+libcamera.workspace = true
+tracing.workspace = true

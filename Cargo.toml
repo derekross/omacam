@@ -3,6 +3,16 @@ resolver = "2"
 members = [
     "crates/omacam-core",
     "crates/omacam-fake",
+    "crates/omacam-libcamera",
+    "crates/omacam",
+]
+# The libcamera backend needs libcamera's headers and library at build time.
+# `cargo build` at the root builds the app with it; the laptop checks in
+# scripts/check.sh leave it out (see docs/development.md).
+default-members = [
+    "crates/omacam-core",
+    "crates/omacam-fake",
+    "crates/omacam",
 ]
 
 [workspace.package]
