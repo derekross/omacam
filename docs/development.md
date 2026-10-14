@@ -99,7 +99,8 @@ rather than taking it).
   ```
 
   Steps: `wait SECONDS`, `zoom Z` (a preset button), `pinch Z`, `flip`,
-  `shutter`, `shot PATH` and `quit`. After each step the app logs a `state`
+  `shutter`, `tap U V` (a tap on the picture), `settings PAGE`
+  (photo, video, advanced), `close-settings`, `shot PATH` and `quit`. After each step the app logs a `state`
   line: lens, zoom, frame size, frame rate, the last switch time. `shot`
   renders the window to a PNG itself; with the panel off, when the
   compositor draws nothing, it renders the viewfinder alone.

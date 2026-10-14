@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use crate::backend::{CameraInfo, Command, Event, Frame, FrameMeta, Purpose, StreamRequest};
 use crate::capture::{self, CaptureController, Step};
 use crate::exposure;
+use crate::focus::{self, FocusController};
 use crate::lens::{Facing, Lens, LensTable, Role, TableSpec};
 use crate::switch::{Action, FrameKind, SwitchController, Target};
 use crate::zoom::{Ladder, ZoomPlanner, ZoomSource};
@@ -26,6 +27,8 @@ pub struct Options {
     pub still_buffers: u32,
     /// Start a new lens with the old one's exposure, scaled by aperture.
     pub transfer_exposure: bool,
+    /// Taps on the picture focus there.
+    pub tap_to_focus: bool,
 }
 
 impl Default for Options {
@@ -35,6 +38,7 @@ impl Default for Options {
             preview_buffers: 4,
             still_buffers: 2,
             transfer_exposure: true,
+            tap_to_focus: true,
         }
     }
 }
@@ -89,6 +93,8 @@ pub struct ViewState {
     pub capturing: bool,
     pub can_flip: bool,
     pub last_switch: Option<Duration>,
+    /// The focus ring, after a tap.
+    pub focus: Option<focus::Indicator>,
 }
 
 struct Side {
@@ -125,6 +131,7 @@ pub struct Controller {
     facing: Facing,
     switch: SwitchController,
     capture: CaptureController,
+    focus: FocusController,
     last_meta: Option<(usize, FrameMeta)>,
     suspended: bool,
     retry_at: Option<Instant>,
@@ -148,6 +155,7 @@ impl Controller {
             facing,
             switch: SwitchController::new(),
             capture: CaptureController::new(),
+            focus: FocusController::new(),
             last_meta: None,
             suspended: true,
             retry_at: None,
@@ -214,6 +222,7 @@ impl Controller {
             capturing: self.capture.is_busy(),
             can_flip: self.back.is_some() && self.front.is_some(),
             last_switch: self.switch.last_switch_time(),
+            focus: self.focus.indicator(),
         }
     }
 
@@ -263,7 +272,12 @@ impl Controller {
         let zoom = self.side().and_then(|s| s.planner.next_tick(now));
         let retry = self.retry_at.map(|t| t.saturating_duration_since(now));
         let capture = self.capture.is_busy().then_some(Duration::from_millis(100));
-        [zoom, retry, capture].into_iter().flatten().min()
+        let focus = self
+            .focus
+            .indicator()
+            .is_some()
+            .then_some(Duration::from_millis(100));
+        [zoom, retry, capture, focus].into_iter().flatten().min()
     }
 
     fn target(&self, purpose: Purpose) -> Option<Target> {
@@ -398,6 +412,55 @@ impl Controller {
         out
     }
 
+    /// Change whether taps focus (a setting).
+    pub fn set_tap_to_focus(&mut self, on: bool) {
+        self.opts.tap_to_focus = on;
+    }
+
+    /// Change the photo mode (a setting).
+    pub fn set_capture_mode(&mut self, mode: capture::Mode) {
+        self.opts.capture_mode = mode;
+    }
+
+    /// A tap on the drawn picture at (u, v), 0..1 from its top left.
+    pub fn tap(&mut self, u: f64, v: f64, now: Instant) -> Vec<Output> {
+        let mut out = Vec::new();
+        if !self.opts.tap_to_focus || self.capture.is_busy() || self.switch.is_switching() {
+            return out;
+        }
+        let Some((generation, target)) = self.switch.streaming() else {
+            return out;
+        };
+        if target.purpose != Purpose::Preview {
+            return out;
+        }
+        let lens = self.table.get(target.lens).clone();
+        let Some(t) = self.transform(&lens.id) else {
+            return out;
+        };
+        let request = self.focus.tap(
+            u,
+            v,
+            &t,
+            focus::Capability {
+                autofocus: lens.autofocus,
+                af_windows: lens.af_windows,
+                area: lens.crop_maximum,
+            },
+            now,
+        );
+        if let Some(focus) = request {
+            out.push(Output::Backend(Command::SetControls {
+                generation,
+                controls: crate::backend::Controls {
+                    focus: Some(focus),
+                    ..Default::default()
+                },
+            }));
+        }
+        out
+    }
+
     /// Choose the side to open on, before [`Controller::resume`]. Ignored
     /// when that side has no camera.
     pub fn set_facing(&mut self, facing: Facing) {
@@ -484,6 +547,19 @@ impl Controller {
         } else if self.side_mut().and_then(|s| s.planner.tick(now)).is_some() {
             self.request_preview(now, &mut out);
         }
+        if self.focus.tick(now) == focus::Action::ResumeContinuous {
+            if let Some((generation, target)) = self.switch.streaming() {
+                if self.table.get(target.lens).autofocus && target.purpose == Purpose::Preview {
+                    out.push(Output::Backend(Command::SetControls {
+                        generation,
+                        controls: crate::backend::Controls {
+                            af_continuous: true,
+                            ..Default::default()
+                        },
+                    }));
+                }
+            }
+        }
         if self.retry_at.is_some_and(|t| now >= t) {
             self.retry_at = None;
             self.request_preview(now, &mut out);
@@ -509,6 +585,7 @@ impl Controller {
             Event::Cameras(_) => {}
             Event::Notice { message } => out.push(Output::Error(message)),
             Event::Started { generation, .. } => {
+                self.focus.reset();
                 let actions = self.switch.on_started(generation);
                 self.run(actions, &mut out);
             }
@@ -543,6 +620,7 @@ impl Controller {
         let (lens_idx, purpose) = (target.lens, target.purpose);
         match purpose {
             Purpose::Preview => {
+                self.focus.on_meta(&frame.meta, now);
                 self.last_meta = Some((lens_idx, frame.meta.clone()));
                 match self.capture.on_preview_frame(&frame.meta, now) {
                     Step::Keep => out.push(self.picture(frame, lens_idx)),
@@ -576,6 +654,8 @@ mod tests {
             location,
             rotation,
             model: "sensor".into(),
+            autofocus: true,
+            ..CameraInfo::default()
         };
         vec![
             cam("main", Location::Back, 90),
@@ -812,6 +892,57 @@ mirror = true
         let half = c.view().presets[0];
         c.set_zoom(half, ZoomSource::Preset, now);
         assert_eq!(c.transform("uw").unwrap().scale, 1.0);
+    }
+
+    #[test]
+    fn a_tap_focuses_the_streaming_lens_and_continuous_af_returns() {
+        let now = Instant::now();
+        let mut cams = cameras();
+        for c in cams.iter_mut() {
+            c.af_windows = true;
+            c.crop_maximum = Some(crate::backend::Rect {
+                x: 0,
+                y: 0,
+                width: 4080,
+                height: 3072,
+            });
+        }
+        let mut c = Controller::new(&spec(), &cams, Options::default());
+        let g = open(&mut c, now);
+        match commands(&c.tap(0.25, 0.25, now)).as_slice() {
+            [Command::SetControls {
+                generation,
+                controls,
+            }] => {
+                assert_eq!(*generation, g);
+                assert!(controls.focus.unwrap().window.is_some());
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(c.view().focus.unwrap().status, focus::Status::Scanning);
+        let later = now + focus::SCAN_TIMEOUT + focus::NOTICE;
+        c.tick(now + focus::SCAN_TIMEOUT);
+        let out = c.tick(later);
+        assert!(matches!(
+            commands(&out).as_slice(),
+            [Command::SetControls { controls, .. }] if controls.af_continuous
+        ));
+    }
+
+    #[test]
+    fn taps_on_a_fixed_focus_lens_or_when_off_send_nothing() {
+        let now = Instant::now();
+        let mut c = Controller::new(&spec(), &cameras(), Options::default());
+        open(&mut c, now);
+        c.set_zoom(5.0, ZoomSource::Preset, now);
+        let (g, _, _) = (2, "tele", Purpose::Preview);
+        c.on_event(started(g, "tele"), now);
+        c.on_event(frame(g, "tele", 10_000), now);
+        assert!(commands(&c.tap(0.5, 0.5, now)).is_empty());
+        assert_eq!(c.view().focus.unwrap().status, focus::Status::FixedFocus);
+        c.set_tap_to_focus(false);
+        c.set_zoom(1.0, ZoomSource::Preset, now);
+        assert!(c.tap(0.5, 0.5, now).is_empty());
     }
 
     #[test]

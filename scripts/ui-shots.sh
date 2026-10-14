@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Screenshots of the UI on synthetic frames, at the size the app gets on
-# the Pixel 7 Pro (456x900 logical at scale 3, the 480x1040 screen minus
-# the shell's bars), in a headless Weston's kiosk shell inside a Docker
-# container: never on your own desktop. SIZE=WxH and SCALE=n change it.
+# the Pixel 7 Pro (456x900 logical: the 480x1040 screen minus the shell's
+# bars), in a headless Weston's kiosk shell inside a Docker container:
+# never on your own desktop. SIZE=WxH changes it. (The phone draws at
+# scale 3; headless Weston's --scale doesn't reach GTK, so the shots are
+# at scale 1 with the same layout.)
 # Writes target/ui-shots/*.png. Needs Docker; builds the app (no libcamera).
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -16,7 +18,7 @@ fi
 cargo build --release --locked -p omacam
 out=target/ui-shots
 rm -rf "$out"; mkdir -p "$out"; chmod 777 "$out"
-size=${SIZE:-456x900}; scale=${SCALE:-3}
+size=${SIZE:-456x900}; scale=1
 w=$(( ${size%x*} * scale )); h=$(( ${size#*x} * scale ))
 docker run --rm --user "$(id -u):$(id -g)" -e W="$w" -e H="$h" -e SCALE="$scale" \
   -v "$PWD/target/release/omacam:/omacam:ro" -v "$PWD/$out:/out" "$IMAGE" bash -c '
@@ -27,6 +29,10 @@ docker run --rm --user "$(id -u):$(id -g)" -e W="$w" -e H="$h" -e SCALE="$scale"
   WAYLAND_DISPLAY=wayland-9 GSK_RENDERER=cairo timeout 60 /omacam --fake --debug --output-dir /out/photos --script "
     wait 2; shot /out/main-1x.png; zoom 2; wait 1; shot /out/main-2x.png;
     pinch 0.6; wait 1.5; shot /out/ultrawide.png; zoom 5; wait 1.5; shot /out/tele.png;
-    shutter; wait 3; shot /out/after-photo.png; flip; wait 1.5; shot /out/front.png; quit"
+    shutter; wait 3; shot /out/after-photo.png; zoom 1; wait 1.5; tap 0.3 0.3; wait 0.3;
+    shot /out/focus.png; settings photo; wait 1; shot /out/settings-photo.png;
+    settings video; wait 0.5; shot /out/settings-video.png; settings advanced; wait 0.5;
+    shot /out/settings-advanced.png; close-settings; wait 0.5; flip; wait 1.5;
+    shot /out/front.png; quit"
 ' 2>&1 | grep -E "WARN|ERROR|window saved" || true
 ls "$out"

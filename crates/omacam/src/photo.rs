@@ -7,8 +7,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use omacam_core::backend::PixelLayout;
 
-/// JPEG quality: stock-like files without the size of 95+.
-pub const QUALITY: i32 = 92;
 /// Side of the square thumbnail (twice the button, for scale 2).
 pub const THUMB: u32 = 112;
 
@@ -87,7 +85,70 @@ pub fn crop_and_rotate(raw: &Raw<'_>, crop: f64, rotation: u32) -> Result<Bgrx> 
     })
 }
 
-pub fn encode_jpeg(img: &Bgrx) -> Result<Vec<u8>> {
+/// The largest centred part of `img` with `aspect` (width over height).
+pub fn crop_to_aspect(img: Bgrx, aspect: Option<f64>) -> Bgrx {
+    let Some(a) = aspect.filter(|a| a.is_finite() && *a > 0.0) else {
+        return img;
+    };
+    let (w, h) = (img.width as f64, img.height as f64);
+    let (cw, ch) = if w / h > a { (h * a, h) } else { (w, w / a) };
+    let (cw, ch) = ((cw as u32).max(1) & !1, (ch as u32).max(1) & !1);
+    let (cw, ch) = (cw.clamp(1, img.width), ch.clamp(1, img.height));
+    if (cw, ch) == (img.width, img.height) {
+        return img;
+    }
+    let (x0, y0) = ((img.width - cw) / 2, (img.height - ch) / 2);
+    let mut data = Vec::with_capacity((cw * ch * 4) as usize);
+    for y in y0..y0 + ch {
+        let row = (y * img.width + x0) as usize * 4;
+        data.extend_from_slice(&img.data[row..row + cw as usize * 4]);
+    }
+    Bgrx {
+        width: cw,
+        height: ch,
+        data,
+    }
+}
+
+/// Half the width and height, each output pixel the mean of four.
+pub fn half(img: &Bgrx) -> Bgrx {
+    let (w, h) = ((img.width / 2).max(1), (img.height / 2).max(1));
+    let mut data = vec![0u8; (w * h * 4) as usize];
+    let src =
+        |x: u32, y: u32| ((y.min(img.height - 1) * img.width + x.min(img.width - 1)) * 4) as usize;
+    for y in 0..h {
+        for x in 0..w {
+            let d = ((y * w + x) * 4) as usize;
+            for c in 0..4 {
+                let sum = img.data[src(2 * x, 2 * y) + c] as u32
+                    + img.data[src(2 * x + 1, 2 * y) + c] as u32
+                    + img.data[src(2 * x, 2 * y + 1) + c] as u32
+                    + img.data[src(2 * x + 1, 2 * y + 1) + c] as u32;
+                data[d + c] = ((sum + 2) / 4) as u8;
+            }
+        }
+    }
+    Bgrx {
+        width: w,
+        height: h,
+        data,
+    }
+}
+
+/// Mirror left-right in place.
+pub fn mirror(img: &mut Bgrx) {
+    let w = img.width as usize;
+    for row in img.data.chunks_exact_mut(w * 4) {
+        for x in 0..w / 2 {
+            let (a, b) = (x * 4, (w - 1 - x) * 4);
+            for c in 0..4 {
+                row.swap(a + c, b + c);
+            }
+        }
+    }
+}
+
+pub fn encode_jpeg(img: &Bgrx, quality: i32) -> Result<Vec<u8>> {
     let image = turbojpeg::Image {
         pixels: img.data.as_slice(),
         width: img.width as usize,
@@ -95,7 +156,7 @@ pub fn encode_jpeg(img: &Bgrx) -> Result<Vec<u8>> {
         height: img.height as usize,
         format: turbojpeg::PixelFormat::BGRX,
     };
-    let jpeg = turbojpeg::compress(image, QUALITY, turbojpeg::Subsamp::Sub2x2)
+    let jpeg = turbojpeg::compress(image, quality.clamp(1, 100), turbojpeg::Subsamp::Sub2x2)
         .context("JPEG encoding failed")?;
     Ok(jpeg.to_vec())
 }
@@ -235,10 +296,39 @@ mod tests {
             height: 240,
             data: vec![128; 320 * 240 * 4],
         };
-        let jpeg = encode_jpeg(&img).unwrap();
+        let jpeg = encode_jpeg(&img, 92).unwrap();
         assert_eq!(&jpeg[..2], &[0xff, 0xd8]);
         let t = thumbnail(&img);
         assert_eq!((t.width, t.height), (112, 112));
+    }
+
+    #[test]
+    fn aspect_crop_half_and_mirror() {
+        let mut d = Vec::new();
+        for y in 0..8u8 {
+            for x in 0..4u8 {
+                d.extend_from_slice(&[x, y, 0, 255]);
+            }
+        }
+        let img = Bgrx {
+            width: 4,
+            height: 8,
+            data: d,
+        };
+        let sq = crop_to_aspect(img.clone(), Some(1.0));
+        assert_eq!((sq.width, sq.height), (4, 4));
+        // The centre rows: 2..6.
+        assert_eq!(sq.data[1], 2);
+        assert_eq!(crop_to_aspect(img.clone(), None), img);
+        let h = half(&img);
+        assert_eq!((h.width, h.height), (2, 4));
+        // B is x: the mean of 0, 1, 0, 1 rounds to 1.
+        assert_eq!(h.data[0], 1);
+        let mut m = img.clone();
+        mirror(&mut m);
+        assert_eq!(m.data[0], 3, "the left pixel is the old right one");
+        mirror(&mut m);
+        assert_eq!(m, img);
     }
 
     #[test]

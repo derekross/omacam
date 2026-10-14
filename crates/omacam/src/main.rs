@@ -1,8 +1,11 @@
 //! omacam: a phone camera for Omarchy Mobile, shown as "Camera".
 
 mod app;
+mod exif;
 mod photo;
+mod prefs;
 mod script;
+mod settings;
 mod theme;
 mod viewfinder;
 
@@ -63,6 +66,9 @@ pub struct Cli {
     /// Save photos here instead of the Pictures folder's Camera directory.
     #[arg(long)]
     output_dir: Option<PathBuf>,
+    /// Send a command to the running omacam and exit (`shutter`).
+    #[arg(long, value_name = "COMMAND")]
+    remote: Option<String>,
     /// Start on the front camera.
     #[arg(long)]
     front: bool,
@@ -215,6 +221,19 @@ fn main() -> gtk::glib::ExitCode {
             eprintln!("omacam: --script: {e}");
             return gtk::glib::ExitCode::FAILURE;
         }
+    }
+    if let Some(cmd) = &cli.remote {
+        use std::io::Write;
+        let path = app::control_socket_path();
+        return match std::os::unix::net::UnixStream::connect(&path)
+            .and_then(|mut s| s.write_all(format!("{cmd}\n").as_bytes()))
+        {
+            Ok(()) => gtk::glib::ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("omacam: {}: {e}", path.display());
+                gtk::glib::ExitCode::FAILURE
+            }
+        };
     }
     if cli.list {
         return match list(&cli) {

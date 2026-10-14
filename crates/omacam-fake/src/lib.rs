@@ -16,11 +16,24 @@ use omacam_core::backend::{
 
 /// The Pixel 7 Pro's four cameras, as libcamera names them.
 pub fn cheetah_cameras() -> Vec<CameraInfo> {
-    let cam = |id: &str, location, rotation, model: &str| CameraInfo {
-        id: id.into(),
-        location,
-        rotation,
-        model: model.into(),
+    // Main and ultrawide focus (and, in the fake, take focus windows);
+    // the telephoto's lens doesn't answer and the front is fixed-focus.
+    let cam = |id: &str, location, rotation, model: &str| {
+        let af = matches!(model, "s5kgn1" | "imx386");
+        CameraInfo {
+            id: id.into(),
+            location,
+            rotation,
+            model: model.into(),
+            autofocus: af,
+            af_windows: af,
+            crop_maximum: Some(omacam_core::backend::Rect {
+                x: 0,
+                y: 0,
+                width: 4080,
+                height: 3072,
+            }),
+        }
     };
     vec![
         cam(

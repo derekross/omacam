@@ -41,7 +41,10 @@ pub struct Lens {
     pub focal_length_35mm: Option<u32>,
     pub preview: Option<Size>,
     pub still: Option<Size>,
+    /// Table says it focuses, and the camera has autofocus.
     pub autofocus: bool,
+    pub af_windows: bool,
+    pub crop_maximum: Option<crate::backend::Rect>,
     pub mirror: bool,
     /// The camera's Rotation in libcamera's sense (correct by turning
     /// counter-clockwise). Filled from the camera's own Rotation property
@@ -182,7 +185,9 @@ impl TableSpec {
                     focal_length_35mm: e.focal_length_35mm,
                     preview: e.preview.map(|[w, h]| Size::new(w, h)),
                     still: e.still.map(|[w, h]| Size::new(w, h)),
-                    autofocus: e.autofocus,
+                    autofocus: e.autofocus && cam.autofocus,
+                    af_windows: cam.af_windows,
+                    crop_maximum: cam.crop_maximum,
                     mirror: e.mirror,
                     rotation: e.rotation.unwrap_or(cam.rotation % 360),
                 });
@@ -209,7 +214,9 @@ impl TableSpec {
                 focal_length_35mm: None,
                 preview: None,
                 still: None,
-                autofocus: false,
+                autofocus: cam.autofocus,
+                af_windows: cam.af_windows,
+                crop_maximum: cam.crop_maximum,
                 mirror: role == Role::Front,
                 rotation: cam.rotation % 360,
             });
@@ -284,6 +291,8 @@ mod tests {
             location,
             rotation,
             model: "sensor".into(),
+            autofocus: true,
+            ..CameraInfo::default()
         };
         vec![
             cam(
@@ -370,12 +379,16 @@ mod tests {
                 location: Location::External,
                 rotation: 0,
                 model: "Webcam".into(),
+                autofocus: true,
+                ..CameraInfo::default()
             },
             CameraInfo {
                 id: "usb-2".into(),
                 location: Location::External,
                 rotation: 0,
                 model: "Second".into(),
+                autofocus: true,
+                ..CameraInfo::default()
             },
         ];
         let t = TableSpec::cheetah().resolve(&cams);
@@ -395,6 +408,8 @@ mod tests {
             location: Location::Back,
             rotation: 90,
             model: "m".into(),
+            autofocus: true,
+            ..CameraInfo::default()
         }];
         assert_eq!(spec.resolve(&cams).get(0).rotation, 180);
         assert!(TableSpec::parse("[[lens]]\nrole = \"main\"\nid = \"a\"\nzoom = 0\n").is_err());

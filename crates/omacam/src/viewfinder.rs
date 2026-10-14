@@ -68,7 +68,7 @@ mod imp {
     pub struct Viewfinder {
         pub texture: RefCell<Option<gdk::Texture>>,
         pub placement: Cell<Placement>,
-        pub inset: Cell<f32>,
+        pub decor: RefCell<Decor>,
     }
 
     #[glib::object_subclass]
@@ -92,7 +92,7 @@ mod imp {
                 (widget.width() as f32, widget.height() as f32),
                 self.texture.borrow().as_ref(),
                 self.placement.get(),
-                self.inset.get(),
+                &self.decor.borrow(),
             );
         }
     }
@@ -105,7 +105,7 @@ pub fn draw(
     size: (f32, f32),
     texture: Option<&gdk::Texture>,
     p: Placement,
-    inset: f32,
+    decor: &Decor,
 ) {
     let (w, h) = size;
     snapshot.append_color(&gdk::RGBA::BLACK, &graphene::Rect::new(0.0, 0.0, w, h));
@@ -115,8 +115,10 @@ pub fn draw(
     let (tw, th) = (tex.width() as f32, tex.height() as f32);
     let quarter = p.rotation % 180 == 90;
     let upright = if quarter { (th, tw) } else { (tw, th) };
-    let rect = fit(upright, (w, h), inset);
-    let s = rect.width() / upright.0;
+    let shown = crop_to_aspect(upright, decor.aspect);
+    let rect = fit(shown, (w, h), 0.0);
+    // Pixels of screen per pixel of frame.
+    let s = rect.width() / shown.0;
     snapshot.push_clip(&rect);
     snapshot.save();
     snapshot.translate(&graphene::Point::new(
@@ -136,7 +138,102 @@ pub fn draw(
         &graphene::Rect::new(-dw / 2.0, -dh / 2.0, dw, dh),
     );
     snapshot.restore();
+    if decor.grid > 1 {
+        let line = gdk::RGBA::new(1.0, 1.0, 1.0, 0.35);
+        for i in 1..decor.grid {
+            let f = i as f32 / decor.grid as f32;
+            snapshot.append_color(
+                &line,
+                &graphene::Rect::new(rect.x() + rect.width() * f, rect.y(), 1.0, rect.height()),
+            );
+            snapshot.append_color(
+                &line,
+                &graphene::Rect::new(rect.x(), rect.y() + rect.height() * f, rect.width(), 1.0),
+            );
+        }
+    }
     snapshot.pop();
+    if let Some(ring) = decor.ring {
+        let (ur, vr) = picture_to_shown(ring.u, ring.v, upright, shown);
+        let (cx, cy) = (
+            rect.x() + rect.width() * ur as f32,
+            rect.y() + rect.height() * vr as f32,
+        );
+        let r = 34.0;
+        let bounds = graphene::Rect::new(cx - r, cy - r, 2.0 * r, 2.0 * r);
+        let rounded = gsk::RoundedRect::from_rect(bounds, r);
+        snapshot.append_border(&rounded, &[2.5; 4], &[ring.color; 4]);
+    }
+}
+
+/// What the viewfinder draws over the picture.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Decor {
+    /// Width over height of the photo, upright; None shows the whole frame.
+    pub aspect: Option<f64>,
+    /// Grid lines: 0 for none, 3 for thirds, 4 for quarters.
+    pub grid: u32,
+    pub ring: Option<Ring>,
+}
+
+/// A focus ring at a point of the whole upright picture (0..1).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Ring {
+    pub u: f64,
+    pub v: f64,
+    pub color: gdk::RGBA,
+}
+
+/// The largest centred part of an upright frame with the given aspect
+/// (width over height); the whole frame for None.
+pub fn crop_to_aspect(upright: (f32, f32), aspect: Option<f64>) -> (f32, f32) {
+    let Some(a) = aspect.filter(|a| a.is_finite() && *a > 0.0) else {
+        return upright;
+    };
+    let (w, h) = upright;
+    let a = a as f32;
+    if w / h > a {
+        (h * a, h)
+    } else {
+        (w, w / a)
+    }
+}
+
+/// A point of the whole upright picture to the shown (aspect-cropped) one.
+fn picture_to_shown(u: f64, v: f64, upright: (f32, f32), shown: (f32, f32)) -> (f64, f64) {
+    (
+        0.5 + (u - 0.5) * (upright.0 / shown.0) as f64,
+        0.5 + (v - 0.5) * (upright.1 / shown.1) as f64,
+    )
+}
+
+/// A widget point to the whole upright picture (0..1), if it's on the
+/// shown picture.
+pub fn widget_to_picture(
+    x: f32,
+    y: f32,
+    widget: (f32, f32),
+    upright: (f32, f32),
+    aspect: Option<f64>,
+) -> Option<(f64, f64)> {
+    let shown = crop_to_aspect(upright, aspect);
+    let rect = fit(shown, widget, 0.0);
+    if rect.width() <= 0.0
+        || x < rect.x()
+        || y < rect.y()
+        || x > rect.x() + rect.width()
+        || y > rect.y() + rect.height()
+    {
+        return None;
+    }
+    let (ur, vr) = (
+        ((x - rect.x()) / rect.width()) as f64,
+        ((y - rect.y()) / rect.height()) as f64,
+    );
+    Some((
+        0.5 + (ur - 0.5) * (shown.0 / upright.0) as f64,
+        0.5 + (vr - 0.5) * (shown.1 / upright.1) as f64,
+    ))
 }
 
 glib::wrapper! {
@@ -181,10 +278,34 @@ impl Viewfinder {
         self.imp().placement.get()
     }
 
-    /// Height of the controls drawn over the bottom.
-    pub fn set_inset(&self, inset: f32) {
-        self.imp().inset.set(inset);
-        self.queue_draw();
+    pub fn decor(&self) -> Decor {
+        self.imp().decor.borrow().clone()
+    }
+
+    pub fn set_decor(&self, decor: Decor) {
+        if *self.imp().decor.borrow() != decor {
+            self.imp().decor.replace(decor);
+            self.queue_draw();
+        }
+    }
+
+    /// A widget point to the whole upright picture (0..1), if on it.
+    pub fn picture_point(&self, x: f64, y: f64) -> Option<(f64, f64)> {
+        let tex = self.texture()?;
+        let p = self.placement();
+        let (tw, th) = (tex.width() as f32, tex.height() as f32);
+        let upright = if p.rotation % 180 == 90 {
+            (th, tw)
+        } else {
+            (tw, th)
+        };
+        widget_to_picture(
+            x as f32,
+            y as f32,
+            (self.width() as f32, self.height() as f32),
+            upright,
+            self.decor().aspect,
+        )
     }
 
     pub fn clear(&self) {
@@ -265,6 +386,45 @@ mod tests {
             }
             z += 0.05;
         }
+    }
+
+    #[test]
+    fn aspect_crops_keep_the_centre_and_the_requested_shape() {
+        // Main camera upright: 1136x2008.
+        let up = (1136.0, 2008.0);
+        assert_eq!(crop_to_aspect(up, None), up);
+        let (w, h) = crop_to_aspect(up, Some(3.0 / 4.0));
+        assert!((w / h - 0.75).abs() < 1e-4 && w <= 1136.0 && h <= 2008.0);
+        let (w, h) = crop_to_aspect(up, Some(1.0));
+        assert_eq!((w, h), (1136.0, 1136.0));
+    }
+
+    #[test]
+    fn taps_on_the_shown_picture_map_to_the_whole_picture() {
+        let up = (1136.0, 2008.0);
+        let widget = (456.0, 730.0);
+        // The centre is the centre.
+        let shown = crop_to_aspect(up, Some(1.0));
+        let r = fit(shown, widget, 0.0);
+        let c = widget_to_picture(
+            r.x() + r.width() / 2.0,
+            r.y() + r.height() / 2.0,
+            widget,
+            up,
+            Some(1.0),
+        )
+        .unwrap();
+        assert!((c.0 - 0.5).abs() < 1e-6 && (c.1 - 0.5).abs() < 1e-6);
+        // The top edge of a square crop is well inside the whole picture.
+        let top = widget_to_picture(r.x() + 1.0, r.y(), widget, up, Some(1.0)).unwrap();
+        assert!(top.1 > 0.2 && top.1 < 0.25, "{top:?}");
+        // Off the picture: nothing.
+        assert!(
+            widget_to_picture(1.0, r.y() - 5.0, widget, up, Some(1.0)).is_none() || r.y() < 5.0
+        );
+        // And back.
+        let (u, v) = picture_to_shown(top.0, top.1, up, shown);
+        assert!((v - 0.0).abs() < 1e-4 && u > 0.0);
     }
 
     #[test]

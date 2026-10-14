@@ -22,11 +22,11 @@ use std::time::{Duration, Instant};
 
 use libcamera::camera::ActiveCamera;
 use libcamera::camera_manager::CameraManager;
-use libcamera::control::ControlList;
+use libcamera::control::{ControlEntry, ControlList};
 use libcamera::framebuffer::{AsFrameBuffer, FrameMetadataStatus};
 use libcamera::framebuffer_allocator::{FrameBuffer, FrameBufferAllocator};
 use libcamera::framebuffer_map::MemoryMappedFrameBuffer;
-use libcamera::geometry::Size as LcSize;
+use libcamera::geometry::{Rectangle, Size as LcSize};
 use libcamera::pixel_format::PixelFormat;
 use libcamera::request::{Request, RequestStatus, ReuseFlag};
 use libcamera::stream::{Stream, StreamRole};
@@ -34,7 +34,7 @@ use libcamera::{controls, properties};
 
 use omacam_core::backend::{
     AfState, Backend, CameraInfo, Command, Controls, Event, EventSink, Frame, FrameData, FrameMeta,
-    Location, PixelLayout, Purpose, ReleaseToken, Size, StreamRequest,
+    Location, PixelLayout, Purpose, Rect, ReleaseToken, Size, StreamRequest,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -225,11 +225,26 @@ impl Worker {
                     .get::<properties::Model>()
                     .map(|m| m.0)
                     .unwrap_or_default();
+                let ctrls = cam.controls();
+                let has = |id: u32| ctrls.find(id).is_ok();
+                let crop_maximum =
+                    props
+                        .get::<properties::ScalerCropMaximum>()
+                        .ok()
+                        .map(|r| Rect {
+                            x: r.0.x,
+                            y: r.0.y,
+                            width: r.0.width,
+                            height: r.0.height,
+                        });
                 CameraInfo {
                     id: cam.id().to_string(),
                     location,
                     rotation,
                     model,
+                    autofocus: has(<controls::AfMode as ControlEntry>::ID),
+                    af_windows: has(<controls::AfWindows as ControlEntry>::ID),
+                    crop_maximum,
                 }
             })
             .collect()
@@ -637,6 +652,21 @@ impl Worker {
 fn set_controls(list: &mut ControlList, c: &Controls, exposure_hints: bool) {
     if c.af_continuous {
         let _ = list.set(controls::AfMode::Continuous);
+    }
+    if let Some(focus) = c.focus {
+        // One scan: auto mode, the tapped window when the camera takes
+        // windows, then the trigger, all in the same request.
+        let _ = list.set(controls::AfMode::Auto);
+        if let Some(w) = focus.window {
+            let _ = list.set(controls::AfMetering::Windows);
+            let _ = list.set(controls::AfWindows(vec![Rectangle {
+                x: w.x,
+                y: w.y,
+                width: w.width,
+                height: w.height,
+            }]));
+        }
+        let _ = list.set(controls::AfTrigger::Start);
     }
     if exposure_hints {
         if let Some(t) = c.exposure_us {

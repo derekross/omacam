@@ -25,12 +25,22 @@ finds.
 - Photos from the full-resolution mode (12.5 MP from the main camera),
   cropped to the zoom and saved upright as JPEG in `~/Pictures/Camera`.
 - Switching between the back and the front camera.
+- Tap the picture to focus there (on cameras whose autofocus takes a
+  window; otherwise the camera focuses on the centre, and a fixed-focus
+  camera says so).
 - The last photo as a thumbnail; tap it to open it.
+- Photos with EXIF data (time, exposure, ISO, aperture, focal length, zoom;
+  no serial numbers, no location) and the shutter sound.
+- Settings from the gear: aspect ratio (full, 4:3, 16:9, 1:1), resolution,
+  JPEG quality, a 3 or 10 s timer, a 3x3 or 4x4 grid, mirrored selfies,
+  the shutter sound, where photos are saved, volume keys as the shutter,
+  tap to focus, and the debug overlay. They are kept in
+  `~/.config/omacam/settings.toml`.
 - The cameras are let go while the window is hidden, so other apps (a
   browser, a video call) can use them.
 
-Not yet: tap to focus, exposure compensation, video, the shutter sound,
-location tags, EXIF data, HDR and night modes. See
+Not yet: exposure compensation, video, location tags, RAW, a level, HDR
+and night modes. See
 [docs/architecture.md](docs/architecture.md) for the plan.
 
 ## Install
@@ -55,7 +65,12 @@ omacam --list            # the cameras and the role each one plays
 omacam --front           # open on the front camera
 omacam --zoom 2          # open at 2x
 omacam --capture quick   # photos from the preview, without the mode switch
+omacam --remote shutter  # take a photo with the running omacam
 ```
+
+Volume keys take photos when they reach the window. On Omarchy Mobile the
+shell binds them for the system volume, so it has to hand them over with
+`omacam --remote shutter` while the camera is in front.
 
 `--display dmabuf` shows the camera's buffers without copying them, which
 saves CPU and battery; it needs a Mesa with the panthor export fix, and

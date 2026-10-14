@@ -32,16 +32,26 @@ impl fmt::Display for Size {
     }
 }
 
+/// A rectangle in pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Rect {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
 /// Where a camera points.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Location {
     Front,
+    #[default]
     Back,
     External,
 }
 
 /// A camera as the backend found it.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct CameraInfo {
     /// The library's stable id (for libcamera, the sensor's DT path).
     pub id: String,
@@ -52,6 +62,13 @@ pub struct CameraInfo {
     /// camera"). See [`crate::lens::upright_clockwise`].
     pub rotation: u32,
     pub model: String,
+    /// The camera has autofocus (an `AfMode` control).
+    pub autofocus: bool,
+    /// Its autofocus takes `AfWindows` (focus where the user taps).
+    pub af_windows: bool,
+    /// `ScalerCropMaximum`: the sensor area the processed frames show,
+    /// in the coordinates `AfWindows` uses.
+    pub crop_maximum: Option<Rect>,
 }
 
 /// Byte layout of a single-plane RGB frame, named by DRM fourcc as
@@ -136,6 +153,15 @@ pub struct Controls {
     pub lens_position: Option<f32>,
     /// Ask for continuous autofocus where the camera has it.
     pub af_continuous: bool,
+    /// Focus once (AfMode Auto, AfTrigger Start), on `window` when given
+    /// and the camera takes AfWindows, else wherever its AF looks.
+    pub focus: Option<FocusRequest>,
+}
+
+/// A one-shot focus scan.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct FocusRequest {
+    pub window: Option<Rect>,
 }
 
 /// Per-frame metadata, where the camera reports it.

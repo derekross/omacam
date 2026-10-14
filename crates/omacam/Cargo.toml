@@ -27,3 +27,8 @@ async-channel.workspace = true
 turbojpeg.workspace = true
 gtk4.workspace = true
 libadwaita.workspace = true
+serde.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+kamadak-exif = "0.6"

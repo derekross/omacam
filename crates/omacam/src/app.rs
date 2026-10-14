@@ -13,11 +13,15 @@ use libadwaita as adw;
 
 use omacam_core::backend::{Backend, Command, Event, Frame, FrameData, PixelLayout};
 use omacam_core::controller::{Options, Output, Picture};
+use omacam_core::focus::Status as FocusStatus;
+use omacam_core::lens::Role;
 use omacam_core::zoom::ZoomSource;
 use omacam_core::{capture, Controller};
 
+use crate::exif;
 use crate::photo;
-use crate::viewfinder::{Placement, Viewfinder};
+use crate::settings::Settings;
+use crate::viewfinder::{Decor, Placement, Ring, Viewfinder};
 use crate::{CaptureMode, Cli};
 
 const CSS: &str = r#"
@@ -70,6 +74,8 @@ enum Msg {
     /// The newest frame is in the frame slot.
     FrameReady,
     Saved(Result<(PathBuf, photo::Bgrx), String>),
+    /// A command on the control socket (`omacam --remote shutter`).
+    Remote(String),
 }
 
 struct Fps {
@@ -130,6 +136,12 @@ struct App {
     last_photo: RefCell<Option<PathBuf>>,
     last_error: RefCell<Option<(String, Instant)>>,
     built_presets: RefCell<Vec<f64>>,
+    settings: RefCell<Settings>,
+    settings_path: PathBuf,
+    /// The self-timer: its tick source and the seconds left.
+    countdown: RefCell<Option<glib::SourceId>>,
+    countdown_left: Cell<u32>,
+    settings_dialog: RefCell<Option<adw::PreferencesDialog>>,
 }
 
 pub fn run(cli: Cli) -> glib::ExitCode {
@@ -182,7 +194,9 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
     let debug = gtk::Label::new(None);
     debug.add_css_class("debug");
     debug.set_xalign(0.0);
-    debug.set_visible(cli.debug);
+    let settings_path = Settings::default_path();
+    let settings = Settings::load(&settings_path);
+    debug.set_visible(cli.debug || settings.debug_overlay);
     let top = gtk::Box::new(gtk::Orientation::Vertical, 4);
     top.set_valign(gtk::Align::Start);
     top.set_halign(gtk::Align::Start);
@@ -190,6 +204,14 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
     top.set_margin_start(12);
     top.append(&debug);
     overlay.add_overlay(&top);
+    let gear = round_button("emblem-system-symbolic", "Settings");
+    gear.add_css_class("top-button");
+    gear.set_halign(gtk::Align::End);
+    gear.set_valign(gtk::Align::Start);
+    gear.set_margin_top(10);
+    gear.set_margin_end(10);
+    gear.set_size_request(44, 44);
+    overlay.add_overlay(&gear);
 
     // Centre: zoom readout while zooming, and status text.
     let zoom_indicator = gtk::Label::new(None);
@@ -316,7 +338,21 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
         last_photo: RefCell::new(None),
         last_error: RefCell::new(None),
         built_presets: RefCell::new(Vec::new()),
+        settings: RefCell::new(settings),
+        settings_path,
+        countdown: RefCell::new(None),
+        countdown_left: Cell::new(0),
+        settings_dialog: RefCell::new(None),
     });
+    {
+        let a = Rc::downgrade(&app);
+        gear.connect_clicked(move |_| {
+            if let Some(a) = a.upgrade() {
+                a.open_settings();
+            }
+        });
+    }
+    start_control_socket(app.tx.clone());
 
     app.start_backend();
     app.connect_input();
@@ -366,6 +402,24 @@ async fn run_script(app: Rc<App>, steps: Vec<crate::script::Step>) {
                 Ok(()) => tracing::info!(path = %path.display(), "window saved"),
                 Err(e) => tracing::warn!(error = %e, "window not saved"),
             },
+            Step::Settings(page) => {
+                if app.settings_dialog.borrow().is_none() {
+                    app.open_settings();
+                }
+                if let Some(d) = app.settings_dialog.borrow().as_ref() {
+                    d.set_visible_page_name(&page);
+                }
+            }
+            Step::CloseSettings => {
+                if let Some(d) = app.settings_dialog.borrow_mut().take() {
+                    d.close();
+                }
+            }
+            Step::Tap(u, v) => {
+                if let Some(out) = app.with_controller(|c| c.tap(u, v, Instant::now())) {
+                    app.apply(out);
+                }
+            }
             Step::Quit => {
                 app.window.close();
                 return;
@@ -524,7 +578,12 @@ impl App {
                     }
                 }
                 Output::Show(frame) => self.show(frame),
-                Output::Picture(p) => self.save(p),
+                Output::Picture(p) => {
+                    if self.settings.borrow().shutter_sound {
+                        play_shutter_sound();
+                    }
+                    self.save(p)
+                }
                 Output::Error(msg) => self.error(&msg),
             }
         }
@@ -545,6 +604,7 @@ impl App {
                         CaptureMode::Quick => capture::Mode::Quick,
                     },
                     transfer_exposure: self.cli.exposure_hints,
+                    tap_to_focus: self.settings.borrow().tap_to_focus,
                     ..Options::default()
                 };
                 let mut c = Controller::new(&self.cli.lens_table(), &cameras, opts);
@@ -591,6 +651,10 @@ impl App {
                 *self.last_photo.borrow_mut() = Some(path);
             }
             Msg::Saved(Err(e)) => self.error(&format!("Photo not saved: {e}")),
+            Msg::Remote(cmd) => match cmd.as_str() {
+                "shutter" => self.press_shutter(),
+                other => tracing::warn!(command = other, "unknown remote command"),
+            },
         }
     }
 
@@ -654,18 +718,37 @@ impl App {
         let vf = self.viewfinder.clone();
         glib::timeout_add_local_once(Duration::from_millis(120), move || vf.set_opacity(1.0));
 
-        let dir = self.cli.output_dir.clone().unwrap_or_else(|| {
-            glib::user_special_dir(glib::UserDirectory::Pictures)
-                .unwrap_or_else(|| glib::home_dir().join("Pictures"))
-                .join("Camera")
-        });
-        let stamp = glib::DateTime::now_local()
-            .and_then(|d| d.format("%Y%m%d_%H%M%S"))
-            .map(|s| s.to_string())
-            .unwrap_or_else(|_| "photo".into());
+        let settings = self.settings.borrow().clone();
+        let dir = self
+            .cli
+            .output_dir
+            .clone()
+            .unwrap_or_else(|| settings.photo_dir());
+        let now = glib::DateTime::now_local().ok();
+        let fmt = |f: &str| {
+            now.as_ref()
+                .and_then(|d| d.format(f).ok())
+                .map(|s| s.to_string())
+        };
+        let stamp = fmt("%Y%m%d_%H%M%S").unwrap_or_else(|| "photo".into());
+        let (make, model) = exif::device();
+        let opts = PhotoOptions {
+            quality: settings.jpeg_quality as i32,
+            aspect: settings.aspect.portrait_ratio(),
+            medium: settings.resolution == crate::settings::Resolution::Medium,
+            mirror: settings.mirror_front && p.lens.role == Role::Front,
+            exif: exif::Info {
+                make,
+                model,
+                software: format!("omacam {}", env!("CARGO_PKG_VERSION")),
+                datetime: fmt("%Y:%m:%d %H:%M:%S").unwrap_or_default(),
+                offset: fmt("%:z"),
+                ..exif::Info::default()
+            },
+        };
         let tx = self.tx.clone();
         std::thread::spawn(move || {
-            let result = encode_and_write(&p, &dir, &stamp).map_err(|e| format!("{e:#}"));
+            let result = encode_and_write(&p, &dir, &stamp, opts).map_err(|e| format!("{e:#}"));
             let _ = tx.send_blocking(Msg::Saved(result));
         });
     }
@@ -736,7 +819,37 @@ impl App {
         if let Some(cam) = self.shown_camera.borrow().as_ref() {
             self.viewfinder.set_placement(self.placement_for(cam));
         }
-        if self.cli.debug {
+        let settings = self.settings.borrow().clone();
+        let ring = view.focus.map(|f| Ring {
+            u: f.u,
+            v: f.v,
+            color: match f.status {
+                FocusStatus::Scanning => gdk::RGBA::new(1.0, 1.0, 1.0, 0.9),
+                FocusStatus::Focused => gdk::RGBA::new(1.0, 0.84, 0.31, 1.0),
+                FocusStatus::Failed => gdk::RGBA::new(1.0, 0.42, 0.42, 1.0),
+                FocusStatus::FixedFocus | FocusStatus::Unavailable => {
+                    gdk::RGBA::new(1.0, 1.0, 1.0, 0.4)
+                }
+            },
+        });
+        self.viewfinder.set_decor(Decor {
+            aspect: settings.aspect.portrait_ratio(),
+            grid: settings.grid.lines(),
+            ring,
+        });
+        let focus_note = match view.focus.map(|f| f.status) {
+            Some(FocusStatus::FixedFocus) => Some("Fixed focus"),
+            Some(FocusStatus::Unavailable) => Some("Focus unavailable"),
+            _ => None,
+        };
+        if let Some(note) = focus_note {
+            self.zoom_indicator.set_label(note);
+            self.zoom_indicator.set_visible(true);
+        } else if self.countdown.borrow().is_none() && self.hide_source.borrow().is_none() {
+            self.zoom_indicator.set_visible(false);
+        }
+        self.debug.set_visible(self.debug_enabled());
+        if self.debug_enabled() {
             let fps = self.fps.borrow().value;
             let (w, h) = self.shown_size.get();
             let switch = view
@@ -921,11 +1034,45 @@ impl App {
         let a = Rc::downgrade(self);
         self.shutter.connect_clicked(move |_| {
             if let Some(a) = a.upgrade() {
-                if let Some(out) = a.with_controller(|c| c.shutter(Instant::now())) {
-                    a.apply(out);
-                }
+                a.press_shutter();
             }
         });
+
+        // Tap the picture to focus there.
+        let tap = gtk::GestureClick::new();
+        let a = Rc::downgrade(self);
+        tap.connect_released(move |g, n, x, y| {
+            let Some(a) = a.upgrade() else { return };
+            if n != 1 {
+                return;
+            }
+            let _ = g;
+            let Some((u, v)) = a.viewfinder.picture_point(x, y) else {
+                return;
+            };
+            if let Some(out) = a.with_controller(|c| c.tap(u, v, Instant::now())) {
+                a.apply(out);
+            }
+        });
+        self.viewfinder.add_controller(tap);
+
+        // Volume keys take a photo, when they reach the app at all: the
+        // phone's shell binds them for the system volume, and hands them
+        // over through `omacam --remote shutter` instead.
+        let keys = gtk::EventControllerKey::new();
+        let a = Rc::downgrade(self);
+        keys.connect_key_pressed(move |_, key, _, _| {
+            let Some(a) = a.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
+            let volume = matches!(key, gdk::Key::AudioLowerVolume | gdk::Key::AudioRaiseVolume);
+            if volume && a.settings.borrow().volume_shutter {
+                a.press_shutter();
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+        self.window.add_controller(keys);
         let a = Rc::downgrade(self);
         self.flip.connect_clicked(move |_| {
             if let Some(a) = a.upgrade() {
@@ -999,12 +1146,81 @@ impl App {
 
     fn tick(self: &Rc<Self>) {
         if let Some(out) = self.with_controller(|c| c.tick(Instant::now())) {
+            let focus = self.controller.borrow().as_ref().is_some_and(|c| {
+                c.view().focus.is_some() || self.viewfinder.decor().ring.is_some()
+            });
             if !out.is_empty() {
                 self.apply(out);
-            } else if self.cli.debug {
+            } else if self.debug_enabled() || focus {
                 self.refresh();
             }
         }
+    }
+
+    fn debug_enabled(&self) -> bool {
+        self.cli.debug || self.settings.borrow().debug_overlay
+    }
+
+    /// The shutter button, a volume key or the control socket: start the
+    /// self-timer if one is set, or cancel a running one.
+    fn press_shutter(self: &Rc<Self>) {
+        if let Some(id) = self.countdown.borrow_mut().take() {
+            id.remove();
+            self.zoom_indicator.set_visible(false);
+            return;
+        }
+        let seconds = self.settings.borrow().timer.seconds();
+        if seconds == 0 {
+            self.take_photo();
+            return;
+        }
+        self.countdown_left.set(seconds);
+        self.zoom_indicator.set_label(&seconds.to_string());
+        self.zoom_indicator.set_visible(true);
+        let a = Rc::downgrade(self);
+        let id = glib::timeout_add_local(Duration::from_secs(1), move || {
+            let Some(a) = a.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            let left = a.countdown_left.get().saturating_sub(1);
+            a.countdown_left.set(left);
+            if left == 0 {
+                a.countdown.borrow_mut().take();
+                a.zoom_indicator.set_visible(false);
+                a.take_photo();
+                return glib::ControlFlow::Break;
+            }
+            a.zoom_indicator.set_label(&left.to_string());
+            glib::ControlFlow::Continue
+        });
+        *self.countdown.borrow_mut() = Some(id);
+    }
+
+    fn take_photo(self: &Rc<Self>) {
+        if let Some(out) = self.with_controller(|c| c.shutter(Instant::now())) {
+            self.apply(out);
+        }
+    }
+
+    fn open_settings(self: &Rc<Self>) {
+        let a = Rc::downgrade(self);
+        let dialog = crate::prefs::dialog(&self.settings.borrow(), move |s| {
+            let Some(a) = a.upgrade() else { return };
+            *a.settings.borrow_mut() = s.clone();
+            if let Err(e) = s.save(&a.settings_path) {
+                a.error(&format!("Settings not saved: {e}"));
+            }
+            a.with_controller(|c| c.set_tap_to_focus(s.tap_to_focus));
+            a.refresh();
+        });
+        // A phone-width window gets the sheet from the bottom, in reach of
+        // the thumb (libadwaita's own switch happens below 450 px).
+        if self.window.width() < 600 {
+            dialog.set_presentation_mode(adw::DialogPresentationMode::BottomSheet);
+            dialog.set_content_height(self.window.height() * 3 / 4);
+        }
+        dialog.present(Some(&self.window));
+        *self.settings_dialog.borrow_mut() = Some(dialog);
     }
 
     /// Wait until the window has painted a frame (at most 500 ms), so its
@@ -1048,10 +1264,8 @@ impl App {
     /// nothing out; then only the viewfinder is drawn, at the default
     /// window size.
     fn render_png(&self, path: &std::path::Path) -> anyhow::Result<()> {
-        let content = self
-            .window
-            .content()
-            .ok_or_else(|| anyhow::anyhow!("no content"))?;
+        // The whole window, so a dialog over the content shows too.
+        let content: gtk::Widget = self.window.clone().upcast();
         let (mut w, mut h) = (content.width() as f32, content.height() as f32);
         let mut node = None;
         if w > 0.0 && h > 0.0 && content.is_mapped() {
@@ -1074,7 +1288,7 @@ impl App {
                 (w, h),
                 self.viewfinder.texture().as_ref(),
                 self.viewfinder.placement(),
-                0.0,
+                &self.viewfinder.decor(),
             );
             node = snapshot.to_node();
         }
@@ -1132,10 +1346,24 @@ impl App {
     }
 }
 
+/// How to turn a captured frame into the saved photo.
+struct PhotoOptions {
+    quality: i32,
+    /// Width over height, upright; None keeps the frame's shape.
+    aspect: Option<f64>,
+    /// Half the width and height.
+    medium: bool,
+    /// Mirror left-right (front camera photos saved as previewed).
+    mirror: bool,
+    /// Device and time; the rest is filled from the picture.
+    exif: exif::Info,
+}
+
 fn encode_and_write(
     p: &Picture,
     dir: &std::path::Path,
     stamp: &str,
+    opts: PhotoOptions,
 ) -> anyhow::Result<(PathBuf, photo::Bgrx)> {
     let FrameData::Memory(data) = &p.frame.data else {
         anyhow::bail!("the still frame wasn't copied to memory");
@@ -1149,7 +1377,29 @@ fn encode_and_write(
         layout: p.frame.layout,
     };
     let img = photo::crop_and_rotate(&raw, p.crop, p.rotation)?;
-    let jpeg = photo::encode_jpeg(&img)?;
+    let mut img = photo::crop_to_aspect(img, opts.aspect);
+    if opts.mirror {
+        photo::mirror(&mut img);
+    }
+    let img = if opts.medium { photo::half(&img) } else { img };
+    let jpeg = photo::encode_jpeg(&img, opts.quality)?;
+    let m = &p.frame.meta;
+    let gain = m.analogue_gain.unwrap_or(1.0) as f64 * m.digital_gain.unwrap_or(1.0) as f64;
+    let info = exif::Info {
+        width: img.width,
+        height: img.height,
+        exposure_us: m.exposure_us,
+        iso: m.analogue_gain.map(|_| (gain * 100.0).round() as u32),
+        f_number: p.lens.f_number,
+        // The crop narrows the view like a longer lens.
+        focal_length_35mm: p
+            .lens
+            .focal_length_35mm
+            .map(|f| (f as f64 * p.crop).round() as u32),
+        digital_zoom: Some(p.crop),
+        ..opts.exif
+    };
+    let jpeg = exif::insert(&jpeg, &info);
     std::fs::create_dir_all(dir)?;
     let path = photo::next_path(dir, stamp);
     photo::write_atomically(&path, &jpeg)?;
@@ -1162,4 +1412,74 @@ fn encode_and_write(
         "photo encoded"
     );
     Ok((path, photo::thumbnail(&img)))
+}
+
+/// The freedesktop camera shutter sound, through libcanberra's player, or
+/// PipeWire's or PulseAudio's player on the sound file. Fire and forget.
+fn play_shutter_sound() {
+    const FILE: &str = "/usr/share/sounds/freedesktop/stereo/camera-shutter.oga";
+    let argv: Option<Vec<&str>> = if glib::find_program_in_path("canberra-gtk-play").is_some() {
+        Some(vec![
+            "canberra-gtk-play",
+            "-i",
+            "camera-shutter",
+            "-d",
+            "Camera",
+        ])
+    } else if std::path::Path::new(FILE).exists() {
+        ["pw-play", "paplay"]
+            .into_iter()
+            .find(|p| glib::find_program_in_path(p).is_some())
+            .map(|p| vec![p, FILE])
+    } else {
+        None
+    };
+    let Some(argv) = argv else {
+        tracing::debug!("no way to play the shutter sound");
+        return;
+    };
+    let argv: Vec<&std::ffi::OsStr> = argv.iter().map(std::ffi::OsStr::new).collect();
+    if let Err(e) = gio::Subprocess::newv(
+        &argv,
+        gio::SubprocessFlags::STDOUT_SILENCE | gio::SubprocessFlags::STDERR_SILENCE,
+    ) {
+        tracing::debug!(error = %e, "shutter sound");
+    }
+}
+
+/// `$XDG_RUNTIME_DIR/omacam/control`: one command per line, from
+/// `omacam --remote CMD` (the phone shell's volume keys send `shutter`).
+pub fn control_socket_path() -> PathBuf {
+    glib::user_runtime_dir().join("omacam/control")
+}
+
+fn start_control_socket(tx: async_channel::Sender<Msg>) {
+    use std::io::BufRead;
+    let path = control_socket_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::remove_file(&path);
+    let listener = match std::os::unix::net::UnixListener::bind(&path) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "no control socket");
+            return;
+        }
+    };
+    let _ = std::thread::Builder::new()
+        .name("omacam-control".into())
+        .spawn(move || {
+            for stream in listener.incoming().flatten() {
+                for line in std::io::BufReader::new(stream)
+                    .lines()
+                    .map_while(Result::ok)
+                {
+                    let cmd = line.trim().to_string();
+                    if !cmd.is_empty() && tx.send_blocking(Msg::Remote(cmd)).is_err() {
+                        return;
+                    }
+                }
+            }
+        });
 }
