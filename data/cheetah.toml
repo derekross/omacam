@@ -32,9 +32,9 @@ zoom = 0.45
 f_number = 2.2
 focal_length_35mm = 11
 preview = [2016, 1508]
-# The full 4032x3016 mode overruns the CSIS write DMA until the sensor
-# lengthens its lines (CAMERA-APP-PLAN K1): use the binned mode.
-still = [2016, 1508]
+# The full mode, since kernel 00545 keeps its lines under the CSIS write
+# DMA's limit (330 MB/s; CAMERA-PLAN CAM-M.5l).
+still = [4032, 3016]
 autofocus = true
 
 [[lens]]

@@ -323,6 +323,7 @@ mod tests {
         let uw = t.get(t.by_role(Role::Ultrawide).unwrap());
         assert_eq!(uw.zoom, 0.45);
         assert_eq!(uw.rotation, 270, "rotation comes from the camera");
+        assert_eq!(uw.still, Some(Size::new(4032, 3016)), "the full mode");
         let tele = t.get(t.by_role(Role::Tele).unwrap());
         assert_eq!(tele.zoom, 4.78);
         assert!(!tele.autofocus);
