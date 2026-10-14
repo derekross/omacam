@@ -24,9 +24,14 @@ pub const EV_LIMIT: f32 = 2.0;
 /// A held exposure (AE/AF lock).
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Lock {
-    shutter: i32,
-    gain: f32,
+    /// AeEnable=false: the camera holds its exposure (libcamera 4.10).
+    ae_hold: bool,
+    /// Otherwise the reported exposure, held as manual values.
+    manual: Option<(i32, f32)>,
+    /// The reported lens position, held as manual focus...
     lens: Option<f32>,
+    /// ...or continuous focus paused (AfPause).
+    af_pause: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -36,6 +41,8 @@ pub struct Exposure {
     ev_meter: f32,
     ev_user: f32,
     lock: Option<Lock>,
+    /// The last tap metered its window (AeMeteringMode Spot).
+    spot: bool,
 }
 
 fn clamp_ev(ev: f32, caps: &Caps) -> f32 {
@@ -68,8 +75,8 @@ impl Exposure {
         } else {
             0.0
         };
-        let (shutter, gain) = match self.lock {
-            Some(l) => (Setting::Manual(l.shutter), Setting::Manual(l.gain)),
+        let (shutter, gain) = match self.lock.and_then(|l| l.manual) {
+            Some((t, g)) => (Setting::Manual(t), Setting::Manual(g)),
             None => (self.pro.shutter, self.pro.gain),
         };
         let shutter = match (shutter, caps.manual_shutter(), caps.exposure_time) {
@@ -82,14 +89,20 @@ impl Exposure {
         };
         let white_balance = match self.pro.white_balance {
             Setting::Manual(Awb::Preset(p)) if caps.awb_modes => Setting::Manual(Awb::Preset(p)),
-            Setting::Manual(Awb::Preset(p)) => match caps.colour_temperature {
-                Some((lo, hi)) => {
+            // No presets: the preset's temperature, or its gains.
+            Setting::Manual(Awb::Preset(p)) => match (caps.colour_temperature, caps.colour_gains) {
+                (Some((lo, hi)), _) => {
                     Setting::Manual(Awb::Kelvin((p.kelvin() as i32).clamp(lo, hi) as u32))
                 }
-                None => Setting::Auto,
+                (None, Some(range)) => Setting::Manual(Awb::Gains(clamp_gains(p.gains(), range))),
+                _ => Setting::Auto,
             },
             Setting::Manual(Awb::Kelvin(k)) => match caps.colour_temperature {
                 Some((lo, hi)) => Setting::Manual(Awb::Kelvin((k as i32).clamp(lo, hi) as u32)),
+                None => Setting::Auto,
+            },
+            Setting::Manual(Awb::Gains(g)) => match caps.colour_gains {
+                Some(range) => Setting::Manual(Awb::Gains(clamp_gains(g, range))),
                 None => Setting::Auto,
             },
             Setting::Auto => Setting::Auto,
@@ -104,12 +117,16 @@ impl Exposure {
             }
             _ => Setting::Auto,
         };
+        let ae_hold = self.lock.is_some_and(|l| l.ae_hold) && caps.ae_enable;
         ExposureSettings {
             ev,
             shutter,
             gain,
             white_balance,
             lens,
+            ae_hold,
+            af_hold: self.lock.is_some_and(|l| l.af_pause) && caps.af_pause && lens.is_auto(),
+            spot: self.spot && caps.ae_metering,
         }
     }
 
@@ -120,8 +137,11 @@ impl Exposure {
         let before = self.clone();
         self.lock = None;
         self.ev_user = 0.0;
-        self.ev_meter = match (luma, caps.ev.is_some()) {
-            (Some(l), true) if l > 0.5 => clamp_ev((MID_GREY / l).log2() as f32, caps),
+        // Real spot metering where the camera offers it; else bring the
+        // area's brightness to mid-grey through EV.
+        self.spot = caps.ae_metering;
+        self.ev_meter = match (luma, caps.ev.is_some(), self.spot) {
+            (Some(l), true, false) if l > 0.5 => clamp_ev((MID_GREY / l).log2() as f32, caps),
             _ => 0.0,
         };
         *self != before
@@ -135,20 +155,26 @@ impl Exposure {
         self.ev_user = total - self.ev_meter;
     }
 
-    /// AE/AF lock at what the last frame reported. Needs the exposure time
-    /// and gain in its metadata and a camera that takes them by hand.
+    /// AE/AF lock. With AeEnable the camera holds its own exposure; else
+    /// the exposure time and gain the last frame reported are held as
+    /// manual values (which needs them in the metadata and manual
+    /// exposure). Focus holds at the reported lens position, or through
+    /// AfPause.
     pub fn lock(&mut self, meta: Option<&FrameMeta>, caps: &Caps) -> bool {
-        let Some(m) = meta else { return false };
-        let (Some(t), Some(g)) = (m.exposure_us, m.analogue_gain) else {
-            return false;
-        };
-        if !caps.manual_shutter() || !caps.manual_gain() {
+        let manual = meta
+            .and_then(|m| m.exposure_us.zip(m.analogue_gain))
+            .filter(|_| caps.manual_shutter() && caps.manual_gain());
+        if !caps.ae_enable && manual.is_none() {
             return false;
         }
+        let lens = meta
+            .and_then(|m| m.lens_position)
+            .filter(|_| caps.lens_position.is_some());
         self.lock = Some(Lock {
-            shutter: t,
-            gain: g,
-            lens: m.lens_position.filter(|_| caps.lens_position.is_some()),
+            ae_hold: caps.ae_enable,
+            manual: if caps.ae_enable { None } else { manual },
+            lens,
+            af_pause: lens.is_none() && caps.af_pause,
         });
         true
     }
@@ -163,6 +189,7 @@ impl Exposure {
         self.ev_meter = 0.0;
         self.ev_user = 0.0;
         self.lock = None;
+        self.spot = false;
     }
 
     pub fn set_shutter(&mut self, s: Setting<i32>) {
@@ -185,6 +212,10 @@ impl Exposure {
     pub fn reset(&mut self) {
         *self = Exposure::default();
     }
+}
+
+fn clamp_gains(g: [f32; 2], (lo, hi): (f32, f32)) -> [f32; 2] {
+    [g[0].clamp(lo, hi), g[1].clamp(lo, hi)]
 }
 
 /// Gain to ISO for a sensor whose ISO at gain 1 is `base`.
@@ -256,7 +287,76 @@ mod tests {
             awb_modes: true,
             colour_temperature: Some((2500, 7500)),
             lens_position: Some((0.0, 1.0)),
+            ae_enable: false,
+            ae_metering: false,
+            af_pause: false,
+            colour_gains: None,
         }
+    }
+
+    /// The table libcamera 4.10 offers on the main camera: no presets or
+    /// temperature, gains instead; AeEnable for the lock; spot metering.
+    fn libcamera_4_10_main() -> Caps {
+        Caps {
+            ev: Some((-2.0, 2.0)),
+            exposure_time: Some((10, 33_000)),
+            gain: Some((1.0, 16.0)),
+            manual_exposure: true,
+            awb_modes: false,
+            colour_temperature: None,
+            lens_position: Some((0.0, 1.0)),
+            ae_enable: true,
+            ae_metering: true,
+            af_pause: true,
+            colour_gains: Some((0.25, 4.0)),
+        }
+    }
+
+    #[test]
+    fn on_libcamera_4_10_a_tap_spot_meters_and_the_lock_uses_ae_enable() {
+        let caps = libcamera_4_10_main();
+        let mut e = Exposure::new();
+        e.tap(Some(29.5), &caps);
+        let s = e.effective(&caps);
+        assert!(s.spot, "real spot metering");
+        assert_eq!(s.ev, 0.0, "no brightness EV when the camera meters");
+        // Lock without metadata: AeEnable holds; focus pauses.
+        assert!(e.lock(None, &caps));
+        let s = e.effective(&caps);
+        assert!(s.ae_hold && s.af_hold);
+        assert_eq!(s.shutter, Setting::Auto);
+        // With a reported lens position: held as manual focus instead.
+        let meta = FrameMeta {
+            lens_position: Some(0.42),
+            ..FrameMeta::default()
+        };
+        e.lock(Some(&meta), &caps);
+        let s = e.effective(&caps);
+        assert!(s.ae_hold && !s.af_hold);
+        assert_eq!(s.lens, Setting::Manual(0.42));
+        e.tap(None, &caps);
+        assert!(!e.effective(&caps).ae_hold);
+    }
+
+    #[test]
+    fn presets_become_gains_where_there_is_no_temperature() {
+        let caps = libcamera_4_10_main();
+        let mut e = Exposure::new();
+        e.set_white_balance(Setting::Manual(Awb::Preset(AwbPreset::Incandescent)));
+        assert_eq!(
+            e.effective(&caps).white_balance,
+            Setting::Manual(Awb::Gains(AwbPreset::Incandescent.gains()))
+        );
+        // The ultrawide offers a temperature: the preset's kelvin.
+        let uw = Caps {
+            colour_temperature: Some((2890, 7900)),
+            ..caps
+        };
+        assert_eq!(
+            e.effective(&uw).white_balance,
+            Setting::Manual(Awb::Kelvin(2890)),
+            "2850 K clamped into 2890..7900"
+        );
     }
 
     #[test]

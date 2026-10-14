@@ -34,8 +34,8 @@ use libcamera::stream::{Stream, StreamRole};
 use libcamera::{controls, properties};
 
 use omacam_core::backend::{
-    AfState, Awb, AwbPreset, Backend, CameraInfo, Caps, Command, Controls, Event, EventSink,
-    ExposureSettings, Frame, FrameData, FrameMeta, Location, PixelLayout, Purpose, Rect,
+    AeState, AfState, Awb, AwbPreset, Backend, CameraInfo, Caps, Command, Controls, Event,
+    EventSink, ExposureSettings, Frame, FrameData, FrameMeta, Location, PixelLayout, Purpose, Rect,
     ReleaseToken, Setting, Size, StreamRequest,
 };
 
@@ -280,16 +280,28 @@ impl Worker {
                     .unwrap_or_default();
                 let ctrls = cam.controls();
                 let has = |id: u32| ctrls.find(id).is_ok();
-                let crop_maximum =
-                    props
-                        .get::<properties::ScalerCropMaximum>()
-                        .ok()
-                        .map(|r| Rect {
-                            x: r.0.x,
-                            y: r.0.y,
-                            width: r.0.width,
-                            height: r.0.height,
-                        });
+                // The coordinates AfWindows use: ScalerCropMaximum where the
+                // camera reports it, else (libcamera 4.10's simple pipeline)
+                // the sensor's active area, from its origin.
+                let crop_maximum = props
+                    .get::<properties::ScalerCropMaximum>()
+                    .ok()
+                    .map(|r| Rect {
+                        x: r.0.x,
+                        y: r.0.y,
+                        width: r.0.width,
+                        height: r.0.height,
+                    })
+                    .or_else(|| {
+                        let areas = props.get::<properties::PixelArrayActiveAreas>().ok()?;
+                        let a = areas.0.first()?;
+                        Some(Rect {
+                            x: 0,
+                            y: 0,
+                            width: a.width,
+                            height: a.height,
+                        })
+                    });
                 let caps = caps(ctrls);
                 tracing::info!(camera = cam.id(), ?caps, "camera controls");
                 CameraInfo {
@@ -707,6 +719,17 @@ impl Worker {
     }
 }
 
+/// ColourGains is an array control: its range is per element.
+fn colour_gains_range(map: &ControlInfoMap) -> Option<(f32, f32)> {
+    let info = map.find(<controls::ColourGains as ControlEntry>::ID).ok()?;
+    let first = |v: ControlValue| match v {
+        ControlValue::Float(x) => x.first().copied(),
+        _ => None,
+    };
+    let (lo, hi) = (first(info.min())?, first(info.max())?);
+    (hi >= lo).then_some((lo, hi))
+}
+
 fn number(v: ControlValue) -> Option<f64> {
     match v {
         ControlValue::Float(x) => x.first().map(|v| *v as f64),
@@ -746,6 +769,12 @@ fn caps(map: &ControlInfoMap) -> Caps {
         lens_position: range(map, <controls::LensPosition as ControlEntry>::ID)
             .filter(|_| has(<controls::AfMode as ControlEntry>::ID))
             .map(|(a, b)| (a as f32, b as f32)),
+        ae_enable: has(<controls::AeEnable as ControlEntry>::ID),
+        ae_metering: has(<controls::AeMeteringMode as ControlEntry>::ID)
+            && has(<controls::AfWindows as ControlEntry>::ID),
+        af_pause: has(<controls::AfPause as ControlEntry>::ID),
+        colour_gains: colour_gains_range(map)
+            .filter(|_| has(<controls::AwbEnable as ControlEntry>::ID)),
     }
 }
 
@@ -755,26 +784,37 @@ fn caps(map: &ControlInfoMap) -> Caps {
 /// Auto puts the mode back.
 fn set_settings(list: &mut ControlList, s: &ExposureSettings) {
     let _ = list.set(controls::ExposureValue(s.ev));
-    match s.shutter {
-        Setting::Manual(t) => {
-            let _ = list.set(controls::ExposureTimeMode::Manual);
-            let _ = list.set(controls::ExposureTime(t));
+    if s.ae_hold {
+        // AE lock: the camera holds what it has. Mode controls in the same
+        // request would win over it, so none are sent.
+        let _ = list.set(controls::AeEnable(false));
+    } else {
+        match s.shutter {
+            Setting::Manual(t) => {
+                let _ = list.set(controls::ExposureTimeMode::Manual);
+                let _ = list.set(controls::ExposureTime(t));
+            }
+            Setting::Auto => {
+                let _ = list.set(controls::ExposureTimeMode::Auto);
+            }
         }
-        Setting::Auto => {
-            let _ = list.set(controls::ExposureTimeMode::Auto);
+        match s.gain {
+            Setting::Manual(g) => {
+                let _ = list.set(controls::AnalogueGainMode::Manual);
+                let _ = list.set(controls::AnalogueGain(g));
+            }
+            Setting::Auto => {
+                let _ = list.set(controls::AnalogueGainMode::Auto);
+            }
         }
+        // The older switch, for a libcamera without the mode controls.
+        let _ = list.set(controls::AeEnable(s.shutter.is_auto() && s.gain.is_auto()));
     }
-    match s.gain {
-        Setting::Manual(g) => {
-            let _ = list.set(controls::AnalogueGainMode::Manual);
-            let _ = list.set(controls::AnalogueGain(g));
-        }
-        Setting::Auto => {
-            let _ = list.set(controls::AnalogueGainMode::Auto);
-        }
-    }
-    // The older switch, for a libcamera without the mode controls.
-    let _ = list.set(controls::AeEnable(s.shutter.is_auto() && s.gain.is_auto()));
+    let _ = list.set(if s.spot {
+        controls::AeMeteringMode::MeteringSpot
+    } else {
+        controls::AeMeteringMode::MeteringMatrix
+    });
     match s.white_balance {
         Setting::Auto => {
             let _ = list.set(controls::AwbEnable(true));
@@ -793,11 +833,34 @@ fn set_settings(list: &mut ControlList, s: &ExposureSettings) {
             let _ = list.set(controls::AwbEnable(false));
             let _ = list.set(controls::ColourTemperature(k as i32));
         }
+        Setting::Manual(Awb::Gains(g)) => {
+            let _ = list.set(controls::AwbEnable(false));
+            let _ = list.set(controls::ColourGains(g));
+        }
     }
-    if let Setting::Manual(p) = s.lens {
-        let _ = list.set(controls::AfMode::Manual);
-        let _ = list.set(controls::LensPosition(p));
+    match s.lens {
+        Setting::Manual(p) => {
+            let _ = list.set(controls::AfMode::Manual);
+            let _ = list.set(controls::LensPosition(p));
+        }
+        Setting::Auto => {
+            let _ = list.set(if s.af_hold {
+                controls::AfPause::Immediate
+            } else {
+                controls::AfPause::Resume
+            });
+        }
     }
+}
+
+fn set_window(list: &mut ControlList, w: &Rect) {
+    let _ = list.set(controls::AfMetering::Windows);
+    let _ = list.set(controls::AfWindows(vec![Rectangle {
+        x: w.x,
+        y: w.y,
+        width: w.width,
+        height: w.height,
+    }]));
 }
 
 /// Put `c` on a control list. A control the camera doesn't have fails to
@@ -809,18 +872,15 @@ fn set_controls(list: &mut ControlList, c: &Controls, exposure_hints: bool) {
     if let Some(s) = &c.settings {
         set_settings(list, s);
     }
+    if let Some(w) = &c.metering_window {
+        set_window(list, w);
+    }
     if let Some(focus) = c.focus {
         // One scan: auto mode, the tapped window when the camera takes
         // windows, then the trigger, all in the same request.
         let _ = list.set(controls::AfMode::Auto);
         if let Some(w) = focus.window {
-            let _ = list.set(controls::AfMetering::Windows);
-            let _ = list.set(controls::AfWindows(vec![Rectangle {
-                x: w.x,
-                y: w.y,
-                width: w.width,
-                height: w.height,
-            }]));
+            set_window(list, &w);
         }
         let _ = list.set(controls::AfTrigger::Start);
     }
@@ -853,5 +913,10 @@ fn frame_meta(req: &Request) -> FrameMeta {
             controls::AfState::Failed => AfState::Failed,
         }),
         lens_position: md.get::<controls::LensPosition>().ok().map(|v| v.0),
+        ae_state: md.get::<controls::AeState>().ok().map(|s| match s {
+            controls::AeState::Idle => AeState::Idle,
+            controls::AeState::Searching => AeState::Searching,
+            controls::AeState::Converged => AeState::Converged,
+        }),
     }
 }

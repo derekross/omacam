@@ -64,17 +64,20 @@ pub fn frame_to_picture(x: f64, y: f64, t: &Transform) -> (f64, f64) {
 
 /// A focus window centred on a frame point, inside `area`.
 pub fn window(x: f64, y: f64, area: Rect) -> Rect {
-    let side = ((area.width.min(area.height) as f64) * WINDOW_FRACTION).max(1.0) as u32;
-    let side = side.min(area.width).min(area.height);
+    // A square of WINDOW_FRACTION of the shorter side, but at least 10 %
+    // of each side (libcamera 4.10's minimum for AfWindows).
+    let base = (area.width.min(area.height) as f64 * WINDOW_FRACTION).max(1.0);
+    let w = (base.max(area.width as f64 * 0.1) as u32).min(area.width);
+    let h = (base.max(area.height as f64 * 0.1) as u32).min(area.height);
     let cx = area.x as f64 + x * area.width as f64;
     let cy = area.y as f64 + y * area.height as f64;
-    let max_x = area.x + (area.width - side) as i32;
-    let max_y = area.y + (area.height - side) as i32;
+    let max_x = area.x + (area.width - w) as i32;
+    let max_y = area.y + (area.height - h) as i32;
     Rect {
-        x: ((cx - side as f64 / 2.0).round() as i32).clamp(area.x, max_x),
-        y: ((cy - side as f64 / 2.0).round() as i32).clamp(area.y, max_y),
-        width: side,
-        height: side,
+        x: ((cx - w as f64 / 2.0).round() as i32).clamp(area.x, max_x),
+        y: ((cy - h as f64 / 2.0).round() as i32).clamp(area.y, max_y),
+        width: w,
+        height: h,
     }
 }
 
@@ -356,7 +359,17 @@ mod tests {
             assert!(w.x >= area.x && w.y >= area.y);
             assert!(w.x + w.width as i32 <= area.x + area.width as i32);
             assert!(w.y + w.height as i32 <= area.y + area.height as i32);
+            assert!(w.width as f64 >= area.width as f64 * 0.1);
+            assert!(w.height as f64 >= area.height as f64 * 0.1);
         }
+        // A wide area: at least 10 % of its width.
+        let wide = Rect {
+            x: 0,
+            y: 0,
+            width: 8000,
+            height: 1000,
+        };
+        assert_eq!(window(0.5, 0.5, wide).width, 800);
     }
 
     #[test]

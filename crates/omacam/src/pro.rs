@@ -164,13 +164,14 @@ impl ProPanel {
                     caps.white_balance(),
                     view.pro.white_balance.manual().map(|w| match w {
                         Awb::Preset(p) => match p {
-                            AwbPreset::Daylight => "Day",
-                            AwbPreset::Cloudy => "Cloudy",
-                            AwbPreset::Incandescent => "Tungsten",
-                            AwbPreset::Fluorescent => "Fluor.",
+                            AwbPreset::Daylight => "Sun",
+                            AwbPreset::Cloudy => "Cloud",
+                            AwbPreset::Incandescent => "Bulb",
+                            AwbPreset::Fluorescent => "Tube",
                         }
                         .to_string(),
                         Awb::Kelvin(k) => format!("{k} K"),
+                        Awb::Gains(_) => "Manual".into(),
                     }),
                     None,
                 ),
@@ -308,12 +309,18 @@ impl ProPanel {
                     }
                 });
                 self.editor.append(&auto);
+                // Four equal presets in their own homogeneous row, with
+                // short labels: at the phone's 480 px logical width the
+                // long names pushed the last chip off the right edge.
+                let presets = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+                presets.set_homogeneous(true);
+                presets.set_hexpand(true);
                 for preset in AwbPreset::ALL {
                     let short = match preset {
-                        AwbPreset::Daylight => "Day",
-                        AwbPreset::Cloudy => "Cloudy",
-                        AwbPreset::Incandescent => "Tungsten",
-                        AwbPreset::Fluorescent => "Fluor.",
+                        AwbPreset::Daylight => "Sun",
+                        AwbPreset::Cloudy => "Cloud",
+                        AwbPreset::Incandescent => "Bulb",
+                        AwbPreset::Fluorescent => "Tube",
                     };
                     let b = gtk::ToggleButton::with_label(short);
                     b.set_tooltip_text(Some(preset.label()));
@@ -327,8 +334,9 @@ impl ProPanel {
                             a3(Action::WhiteBalance(Setting::Manual(Awb::Preset(preset))));
                         }
                     });
-                    self.editor.append(&b);
+                    presets.append(&b);
                 }
+                self.editor.append(&presets);
             }
         }
         let reset = gtk::Button::with_label("All auto");

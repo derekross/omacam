@@ -103,6 +103,15 @@ pub struct Caps {
     pub colour_temperature: Option<(i32, i32)>,
     /// LensPosition with AfMode Manual: manual focus.
     pub lens_position: Option<(f32, f32)>,
+    /// AeEnable: false holds the current exposure (AE lock).
+    pub ae_enable: bool,
+    /// AeMeteringMode, so a tap can meter its window (Spot).
+    pub ae_metering: bool,
+    /// AfPause, to hold continuous focus (AF lock).
+    pub af_pause: bool,
+    /// ColourGains [red, blue] range (with AwbEnable off): white balance by
+    /// gains where there's no ColourTemperature.
+    pub colour_gains: Option<(f32, f32)>,
 }
 
 impl Caps {
@@ -115,7 +124,12 @@ impl Caps {
     }
 
     pub fn white_balance(&self) -> bool {
-        self.awb_modes || self.colour_temperature.is_some()
+        self.awb_modes || self.colour_temperature.is_some() || self.colour_gains.is_some()
+    }
+
+    /// Can AE/AF lock hold the exposure: AeEnable, or manual exposure.
+    pub fn can_lock(&self) -> bool {
+        self.ae_enable || (self.manual_shutter() && self.manual_gain())
     }
 }
 
@@ -145,6 +159,9 @@ impl<T: Copy> Setting<T> {
 pub enum Awb {
     Preset(AwbPreset),
     Kelvin(u32),
+    /// Red and blue gains (a preset on a camera without presets or a
+    /// temperature).
+    Gains([f32; 2]),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,6 +188,18 @@ impl AwbPreset {
             AwbPreset::Cloudy => 6500,
             AwbPreset::Incandescent => 2850,
             AwbPreset::Fluorescent => 4000,
+        }
+    }
+
+    /// Red and blue gains for a preset on a camera that takes only gains:
+    /// typical values for a phone sensor's white balance under each light,
+    /// to calibrate against the AWB's own gains measured under it.
+    pub fn gains(self) -> [f32; 2] {
+        match self {
+            AwbPreset::Daylight => [1.9, 1.6],
+            AwbPreset::Cloudy => [2.1, 1.45],
+            AwbPreset::Incandescent => [1.25, 2.6],
+            AwbPreset::Fluorescent => [1.6, 2.1],
         }
     }
 
@@ -272,6 +301,9 @@ pub struct Controls {
     /// The exposure, white balance and focus settings to apply (None:
     /// leave as they are). Unlike the hints above, these hold.
     pub settings: Option<ExposureSettings>,
+    /// The tapped window, for spot metering (AfMetering Windows +
+    /// AfWindows; AeMeteringMode Spot meters it), even with manual focus.
+    pub metering_window: Option<Rect>,
 }
 
 /// What the user set: everything Auto by default.
@@ -286,6 +318,12 @@ pub struct ExposureSettings {
     pub white_balance: Setting<Awb>,
     /// LensPosition (Auto: the autofocus decides).
     pub lens: Setting<f32>,
+    /// AE lock through AeEnable=false (the camera holds what it has).
+    pub ae_hold: bool,
+    /// AF lock through AfPause (continuous focus holds where it is).
+    pub af_hold: bool,
+    /// Meter the focus window (AeMeteringMode Spot) instead of the frame.
+    pub spot: bool,
 }
 
 /// A one-shot focus scan.
@@ -305,6 +343,15 @@ pub struct FrameMeta {
     pub colour_gains: Option<[f32; 2]>,
     pub af_state: Option<AfState>,
     pub lens_position: Option<f32>,
+    pub ae_state: Option<AeState>,
+}
+
+/// Auto-exposure states, as libcamera reports them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AeState {
+    Idle,
+    Searching,
+    Converged,
 }
 
 /// Returns a borrowed buffer to its camera when dropped.

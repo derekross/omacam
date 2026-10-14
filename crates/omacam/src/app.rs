@@ -1845,12 +1845,14 @@ impl App {
                 .gain
                 .manual()
                 .map(|g| omacam_core::exposure_control::iso(g as f64, view.base_iso)),
-            white_balance: view.pro.white_balance.manual().map(|w| match w {
-                Awb::Preset(AwbPreset::Daylight) => SavedWb::Daylight,
-                Awb::Preset(AwbPreset::Cloudy) => SavedWb::Cloudy,
-                Awb::Preset(AwbPreset::Incandescent) => SavedWb::Incandescent,
-                Awb::Preset(AwbPreset::Fluorescent) => SavedWb::Fluorescent,
-                Awb::Kelvin(k) => SavedWb::Kelvin(k),
+            white_balance: view.pro.white_balance.manual().and_then(|w| match w {
+                Awb::Preset(AwbPreset::Daylight) => Some(SavedWb::Daylight),
+                Awb::Preset(AwbPreset::Cloudy) => Some(SavedWb::Cloudy),
+                Awb::Preset(AwbPreset::Incandescent) => Some(SavedWb::Incandescent),
+                Awb::Preset(AwbPreset::Fluorescent) => Some(SavedWb::Fluorescent),
+                Awb::Kelvin(k) => Some(SavedWb::Kelvin(k)),
+                // The panel sets presets; gains are only what they become.
+                Awb::Gains(_) => None,
             }),
             focus: view.pro.lens.manual(),
         };

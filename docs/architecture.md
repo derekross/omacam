@@ -199,36 +199,45 @@ there; Pixel's single DCIM folder is an Android convention.
 
 Automatic by default, with manual control where the camera allows it:
 
-- **Tap** focuses (AfWindows where the camera takes them, else its own
-  window) and **meters** the tapped area. libcamera has no standard
-  control for an exposure region, so metering is done by brightness: the
-  mean luma of the area around the tap is brought to mid-grey (118 of
-  255) through `ExposureValue`, at most ±2 EV.
+- **Tap** focuses and **meters** the tapped area. Where the camera takes
+  them (libcamera 4.10's soft ISP), the tap sends AfMode Auto, AfMetering
+  Windows with one AfWindows rectangle (at least 10 % of the picture per
+  side, in sensor active-area coordinates), AeMeteringMode Spot (which
+  meters the same rectangle) and AfTrigger Start. Without AeMeteringMode
+  the area is metered by brightness: its mean luma is brought to mid-grey
+  (118 of 255) through `ExposureValue`, at most ±2 EV.
 - **The EV slider** appears beside the focus ring for a few seconds after
   a tap, -2..+2 EV on top of the metering; the next tap or a lens switch
   resets it.
-- **Long press: AE/AF lock.** The exposure time, gain and lens position
-  the last frame reported are held as manual values (ExposureTimeMode and
-  AnalogueGainMode Manual, AfMode Manual); an "AE/AF lock" chip shows; a
-  tap releases it.
-- **Pro panel** (the Pro toggle beside Photo/Video): shutter, ISO, white
-  balance (Day, Cloudy, Tungsten, Fluorescent presets through AwbMode, or
-  their colour temperature through ColourTemperature where only that
-  exists) and manual focus (LensPosition), each with an "A" (auto) state.
-  Their chips show auto's live choice from the frame metadata when on
-  auto. ISO is analogue gain × the sensor's base ISO (`base_iso` in the
-  lens table: 50, an estimate). A histogram of the picture's luma can be
-  shown over the picture. Pro values hold across lens switches, apply to
-  stills and video alike, and reset at each launch unless "Keep Pro
-  settings" is on.
+- **Long press: AE/AF lock.** Exposure is held with AeEnable false where
+  the camera offers it (AE keeps its last values), else the exposure time
+  and gain the last frame reported become manual values. Focus is held
+  with AfPause Immediate where offered, else at the reported lens
+  position (AfMode Manual). An "AE/AF lock" chip shows; a tap releases it.
+- **Pro panel** (the Pro toggle beside Photo/Video): shutter
+  (ExposureTimeMode + ExposureTime, within the current mode's frame time),
+  ISO (AnalogueGainMode + AnalogueGain; either can be manual while AE
+  drives the other), white balance and manual focus (AfMode Manual +
+  LensPosition, 0-1), each with an "A" (auto) state. White balance has
+  four presets, Sun, Cloud, Bulb and Tube: on a camera that advertises
+  ColourTemperature (only the ultrawide, 2890-7900 K) they are colour
+  temperatures, elsewhere fixed ColourGains [r, b] with AwbEnable false.
+  Chips show auto's live choice from the frame metadata when on auto. ISO
+  is analogue gain × the sensor's base ISO (`base_iso` in the lens table:
+  50, an estimate). A histogram of the picture's luma can be shown over
+  the picture. Pro values hold across lens switches, apply to stills and
+  video alike, and reset at each launch unless "Keep Pro settings" is on.
+- **Stills wait for the exposure to settle.** After the switch to the
+  still mode, the capture waits for AeState Converged (and the colour to
+  settle), at most 10 frames; a camera without AeState gets 8 frames.
 - **What the camera offers decides what's enabled.** Every control is
   looked up in the camera's ControlInfoMap at startup (logged as "camera
   controls"); a chip whose control is missing is greyed with a tooltip.
   On the phone's libcamera 0.7.2-4.8 the main camera offers AfMode,
   AfTrigger and LensPosition (0-1) and none of the exposure or white
-  balance controls, so today manual focus works and the rest wait for
-  libcamera; the code paths are tested with a fake camera that offers
-  everything.
+  balance controls, so manual focus works there and the rest waits for
+  libcamera 4.10; the 4.10 code paths are tested with a fake camera that
+  offers its controls.
 - EXIF records what was used: exposure time, ISO, ExposureMode (manual
   when shutter or ISO was set by hand), WhiteBalance, and the exposure
   bias.

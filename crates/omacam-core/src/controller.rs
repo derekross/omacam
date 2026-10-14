@@ -630,6 +630,15 @@ impl Controller {
         };
         self.exposure.tap(luma, &lens.caps);
         let settings = self.exposure.effective(&lens.caps);
+        // Spot metering meters the AfWindows rectangle: send it even when
+        // focus is manual.
+        let metering_window = match (settings.spot, lens.crop_maximum) {
+            (true, Some(area)) => {
+                let (x, y) = focus::picture_to_frame(u, v, &t);
+                Some(focus::window(x, y, area))
+            }
+            _ => None,
+        };
         let request = if settings.lens.is_auto() {
             self.focus.tap(
                 u,
@@ -650,6 +659,7 @@ impl Controller {
             controls: crate::backend::Controls {
                 focus: request,
                 settings: Some(settings),
+                metering_window,
                 ..Default::default()
             },
         }));
@@ -1373,6 +1383,7 @@ mirror = true
             awb_modes: true,
             colour_temperature: Some((2500, 7500)),
             lens_position: Some((0.0, 1.0)),
+            ..Default::default()
         }
     }
 
@@ -1523,8 +1534,8 @@ mirror = true
         }
         assert!(c.view().capturing);
         c.on_event(started(gs, "main"), now);
-        // Two discarded, then the third matches the lock.
-        for _ in 0..2 {
+        // No AeState in these frames: a fixed wait, then one is kept.
+        for _ in 0..capture::FIXED_DISCARD {
             assert!(c.on_event(frame(gs, "main", 10_000), now).is_empty());
         }
         let out = c.on_event(frame(gs, "main", 10_000), now);

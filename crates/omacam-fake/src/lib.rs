@@ -23,7 +23,11 @@ pub fn full_caps(movable_lens: bool) -> omacam_core::backend::Caps {
         manual_exposure: true,
         awb_modes: true,
         colour_temperature: Some((2500, 8000)),
-        lens_position: movable_lens.then_some((0.0, 10.0)),
+        lens_position: movable_lens.then_some((0.0, 1.0)),
+        ae_enable: true,
+        ae_metering: true,
+        af_pause: true,
+        colour_gains: Some((0.25, 4.0)),
     }
 }
 
@@ -232,6 +236,7 @@ fn render(stream: &Stream) -> Vec<u8> {
         Setting::Manual(Awb::Preset(AwbPreset::Incandescent)) => (0.75, 1.3),
         Setting::Manual(Awb::Preset(AwbPreset::Fluorescent)) => (0.9, 1.1),
         Setting::Manual(Awb::Kelvin(k)) => (k as f32 / 5500.0, 5500.0 / k as f32),
+        Setting::Manual(Awb::Gains([r, b])) => (r / 1.9, b / 1.6),
         _ => (1.0, 1.0),
     };
     let tone = |v: f32, w: f32| (v * light * w).clamp(0.0, 255.0) as u8;
@@ -396,7 +401,7 @@ fn step(s: &mut Stream, sink: &EventSink, opts: &Options, epoch: Instant) {
             timestamp_ns: now.duration_since(epoch).as_nanos() as u64,
             exposure_us: Some(s.settings.shutter.manual().unwrap_or(exposure)),
             analogue_gain: Some(s.settings.gain.manual().unwrap_or(1.0)),
-            lens_position: Some(s.settings.lens.manual().unwrap_or(1.5)),
+            lens_position: Some(s.settings.lens.manual().unwrap_or(0.5)),
             ..FrameMeta::default()
         },
     }));

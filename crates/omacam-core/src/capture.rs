@@ -6,9 +6,11 @@
 //! 1. Shutter: if autofocus is still scanning, wait for it (at most
 //!    [`FOCUS_WAIT`]); then read the last exposure, gain and colour gains.
 //! 2. Reconfigure to the still mode, with those values as start hints.
-//! 3. Drop frames until the exposure and the white balance are back near
-//!    the locked values (at least [`MIN_DISCARD`], at most
-//!    [`MAX_DISCARD`]), then keep one. A freshly started mode begins with
+//! 3. Drop frames until the auto-exposure says Converged (libcamera
+//!    4.10's AeState) and the white balance is back near the preview's,
+//!    or, on a libcamera without AeState, a fixed [`FIXED_DISCARD`]
+//!    frames; at least [`MIN_DISCARD`], at most [`MAX_DISCARD`]. Then keep
+//!    one. A freshly started mode begins with
 //!    the AWB's default gains; a still kept on its first frames came out
 //!    yellow on the telephoto (blue gain 1.56 needed).
 //! 4. Reconfigure back to the preview mode with the same hints.
@@ -20,7 +22,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::backend::{AfState, Controls, FrameMeta};
+use crate::backend::{AeState, AfState, Controls, FrameMeta};
 
 /// Longest wait for autofocus to finish before taking the picture anyway.
 pub const FOCUS_WAIT: Duration = Duration::from_millis(500);
@@ -28,11 +30,12 @@ pub const FOCUS_WAIT: Duration = Duration::from_millis(500);
 /// controls two frames late).
 pub const MIN_DISCARD: u32 = 2;
 /// Frames to drop at most while waiting for the exposure to settle.
-pub const MAX_DISCARD: u32 = 12;
+pub const MAX_DISCARD: u32 = 10;
+/// On a libcamera that reports no AeState: the frames to drop before
+/// keeping one, a fixed wait for exposure and white balance to settle.
+pub const FIXED_DISCARD: u32 = 8;
 /// Longest wait for the still frame before giving up.
 pub const STILL_TIMEOUT: Duration = Duration::from_secs(6);
-/// How close (relative) exposure × gain must be to the locked value.
-pub const SETTLED_WITHIN: f64 = 0.15;
 /// How close each colour gain must be to the preview's.
 pub const GAINS_WITHIN: f64 = 0.10;
 /// Without the preview's gains to compare: how little they may change
@@ -103,11 +106,8 @@ pub fn lock_from(meta: Option<&FrameMeta>) -> Controls {
         af_continuous: false,
         focus: None,
         settings: None,
+        metering_window: None,
     }
-}
-
-fn product(c: &Controls) -> Option<f64> {
-    Some(c.exposure_us? as f64 * c.analogue_gain.unwrap_or(1.0) as f64)
 }
 
 impl CaptureController {
@@ -209,11 +209,6 @@ impl CaptureController {
         if seen <= MIN_DISCARD {
             return Step::Discard;
         }
-        let exposure = match (product(&self.locked), product(&lock_from(Some(meta)))) {
-            (Some(want), Some(got)) if want > 0.0 => ((got - want) / want).abs() <= SETTLED_WITHIN,
-            // Nothing to compare: the minimum wait has to do.
-            _ => true,
-        };
         let close = |a: [f32; 2], b: [f32; 2], within: f64| {
             a.iter()
                 .zip(b)
@@ -226,7 +221,14 @@ impl CaptureController {
             // The camera reports no gains: nothing to wait for.
             (None, _, _) => true,
         };
-        if (exposure && colour) || seen > MAX_DISCARD {
+        let ready = match meta.ae_state {
+            // libcamera 4.10 says when its AE has converged (also when it
+            // sits at a limit).
+            Some(state) => state == AeState::Converged && colour,
+            // Older: a fixed wait.
+            None => seen > FIXED_DISCARD,
+        };
+        if ready || seen > MAX_DISCARD {
             self.state = State::Restoring;
             Step::KeepAndRestore(self.locked.clone())
         } else {
@@ -275,25 +277,40 @@ mod tests {
         assert!(!c.is_busy());
     }
 
+    fn converged(exposure: i32, gains: Option<[f32; 2]>, state: AeState) -> FrameMeta {
+        FrameMeta {
+            colour_gains: gains,
+            ae_state: Some(state),
+            ..meta(exposure, 1.0, None)
+        }
+    }
+
     #[test]
-    fn full_mode_locks_exposure_discards_then_keeps_and_restores() {
+    fn full_mode_waits_for_ae_converged_then_keeps_and_restores() {
         let now = Instant::now();
         let mut c = CaptureController::new();
         let last = meta(10_000, 2.0, Some(AfState::Focused));
-        let step = c.begin(Mode::Full, true, Some(&last), now);
-        let locked = match step {
+        let locked = match c.begin(Mode::Full, true, Some(&last), now) {
             Step::StartStill(ctl) => ctl,
             other => panic!("{other:?}"),
         };
         assert_eq!(locked.exposure_us, Some(10_000));
-        assert_eq!(locked.analogue_gain, Some(2.0));
         assert!(c.wants_still_stream());
-        // Two frames always go, then a wrong exposure goes, then a match.
-        assert_eq!(c.on_still_frame(&meta(10_000, 2.0, None)), Step::Discard);
-        assert_eq!(c.on_still_frame(&meta(10_000, 2.0, None)), Step::Discard);
-        assert_eq!(c.on_still_frame(&meta(30_000, 4.0, None)), Step::Discard);
+        // Converged in the first two frames still waits the minimum.
         assert_eq!(
-            c.on_still_frame(&meta(11_000, 2.0, None)),
+            c.on_still_frame(&converged(9_000, None, AeState::Converged)),
+            Step::Discard
+        );
+        assert_eq!(
+            c.on_still_frame(&converged(9_000, None, AeState::Converged)),
+            Step::Discard
+        );
+        assert_eq!(
+            c.on_still_frame(&converged(9_000, None, AeState::Searching)),
+            Step::Discard
+        );
+        assert_eq!(
+            c.on_still_frame(&converged(9_000, None, AeState::Converged)),
             Step::KeepAndRestore(locked)
         );
         assert!(c.is_busy(), "until the preview is back");
@@ -304,25 +321,35 @@ mod tests {
         assert!(!c.is_busy());
     }
 
-    fn with_gains(exposure: i32, gains: [f32; 2]) -> FrameMeta {
-        FrameMeta {
-            colour_gains: Some(gains),
-            ..meta(exposure, 1.0, None)
-        }
+    #[test]
+    fn without_ae_state_it_waits_a_fixed_number_of_frames() {
+        let now = Instant::now();
+        let mut c = CaptureController::new();
+        c.begin(Mode::Full, false, Some(&meta(10_000, 1.0, None)), now);
+        let steps: Vec<Step> = (0..FIXED_DISCARD + 1)
+            .map(|_| c.on_still_frame(&meta(10_000, 1.0, None)))
+            .collect();
+        assert!(steps[..FIXED_DISCARD as usize]
+            .iter()
+            .all(|s| *s == Step::Discard));
+        assert!(matches!(
+            steps[FIXED_DISCARD as usize],
+            Step::KeepAndRestore(_)
+        ));
     }
 
     #[test]
     fn the_still_waits_for_white_balance_to_return() {
         // The telephoto's preview had R 1.09 / B 1.56; the fresh still mode
-        // starts at the AWB's defaults and walks back.
+        // starts at the AWB's defaults and walks back, while AE already
+        // says Converged.
         let now = Instant::now();
         let mut c = CaptureController::new();
-        c.begin(
-            Mode::Full,
-            false,
-            Some(&with_gains(20_000, [1.09, 1.56])),
-            now,
-        );
+        let last = FrameMeta {
+            colour_gains: Some([1.09, 1.56]),
+            ..meta(20_000, 1.0, None)
+        };
+        c.begin(Mode::Full, false, Some(&last), now);
         assert_eq!(c.locked().colour_gains, Some([1.09, 1.56]));
         let frames = [
             [1.0, 1.0],
@@ -333,35 +360,20 @@ mod tests {
         ];
         let steps: Vec<Step> = frames
             .iter()
-            .map(|g| c.on_still_frame(&with_gains(20_000, *g)))
+            .map(|g| c.on_still_frame(&converged(20_000, Some(*g), AeState::Converged)))
             .collect();
         assert!(steps[..4].iter().all(|s| *s == Step::Discard), "{steps:?}");
         assert!(matches!(steps[4], Step::KeepAndRestore(_)));
     }
 
     #[test]
-    fn without_preview_gains_it_waits_for_them_to_stop_moving() {
-        let now = Instant::now();
-        let mut c = CaptureController::new();
-        c.begin(Mode::Full, false, Some(&meta(20_000, 1.0, None)), now);
-        let frames = [[1.0, 1.0], [1.0, 1.0], [1.2, 1.3], [1.3, 1.5], [1.31, 1.51]];
-        let steps: Vec<Step> = frames
-            .iter()
-            .map(|g| c.on_still_frame(&with_gains(20_000, *g)))
-            .collect();
-        assert!(steps[..4].iter().all(|s| *s == Step::Discard), "{steps:?}");
-        assert!(matches!(steps[4], Step::KeepAndRestore(_)));
-    }
-
-    #[test]
-    fn exposure_that_never_settles_is_kept_after_the_maximum() {
+    fn exposure_that_never_converges_is_kept_after_the_maximum() {
         let now = Instant::now();
         let mut c = CaptureController::new();
         c.begin(Mode::Full, false, Some(&meta(10_000, 1.0, None)), now);
-        let mut steps = Vec::new();
-        for _ in 0..MAX_DISCARD + 1 {
-            steps.push(c.on_still_frame(&meta(90_000, 8.0, None)));
-        }
+        let steps: Vec<Step> = (0..MAX_DISCARD + 1)
+            .map(|_| c.on_still_frame(&converged(90_000, None, AeState::Searching)))
+            .collect();
         assert!(steps[..MAX_DISCARD as usize]
             .iter()
             .all(|s| *s == Step::Discard));
@@ -427,7 +439,7 @@ mod tests {
     }
 
     #[test]
-    fn no_metadata_means_no_lock_and_the_minimum_wait() {
+    fn no_metadata_means_no_lock_and_the_fixed_wait() {
         let now = Instant::now();
         let mut c = CaptureController::new();
         assert_eq!(
@@ -435,8 +447,9 @@ mod tests {
             Step::StartStill(Controls::default())
         );
         let none = FrameMeta::default();
-        assert_eq!(c.on_still_frame(&none), Step::Discard);
-        assert_eq!(c.on_still_frame(&none), Step::Discard);
+        for _ in 0..FIXED_DISCARD {
+            assert_eq!(c.on_still_frame(&none), Step::Discard);
+        }
         assert!(matches!(c.on_still_frame(&none), Step::KeepAndRestore(_)));
     }
 }
