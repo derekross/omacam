@@ -112,6 +112,10 @@ pub struct StreamRequest {
     /// Set explicitly: libcamera's default of four full-size buffers once
     /// failed to allocate from CMA.
     pub buffers: u32,
+    /// Smaller sizes to settle for, in order, when `size` can't start (for
+    /// a still, usually lack of camera memory). The backend says so with an
+    /// [`Event::Notice`].
+    pub fallbacks: Vec<Size>,
 }
 
 /// Autofocus states, as libcamera reports them.
@@ -227,6 +231,11 @@ pub enum Event {
         layout: PixelLayout,
     },
     Frame(Frame),
+    /// Something the user should know that isn't a failure (a still taken
+    /// at a smaller size than asked).
+    Notice {
+        message: String,
+    },
     Stopped {
         generation: u64,
     },

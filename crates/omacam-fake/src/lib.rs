@@ -80,6 +80,9 @@ impl Default for Options {
 pub struct Faults {
     /// Cameras whose start fails with "busy".
     pub busy: HashSet<String>,
+    /// Streams bigger than this many pixels fail for lack of memory, as
+    /// the CMA pool does on the phone; the request's fallbacks are tried.
+    pub memory_limit_pixels: Option<u64>,
 }
 
 enum Msg {
@@ -131,6 +134,7 @@ struct Stream {
     size: Size,
     started_at: Instant,
     started: bool,
+    notice: Option<String>,
     sequence: u32,
     next_frame: Instant,
     controls: Controls,
@@ -222,10 +226,28 @@ fn handle(
             controls,
         } => {
             stop(stream, sink);
+            let limit = faults.lock().unwrap().memory_limit_pixels;
+            let fits = |s: &Size| limit.is_none_or(|l| fit(*s, opts.max_size).pixels() <= l);
+            let wanted = req.size.unwrap_or(opts.default_size);
+            let (size, notice) = if fits(&wanted) {
+                (Some(wanted), None)
+            } else {
+                match req.fallbacks.iter().find(|s| fits(s)) {
+                    Some(s) => (
+                        Some(*s),
+                        Some(format!(
+                            "Not enough camera memory for the full mode: used {s} instead"
+                        )),
+                    ),
+                    None => (None, None),
+                }
+            };
             let failure = if !opts.cameras.iter().any(|c| c.id == camera) {
                 Some(format!("no camera {camera}"))
             } else if faults.lock().unwrap().busy.contains(&camera) {
                 Some(format!("{camera} is busy"))
+            } else if size.is_none() {
+                Some("Cannot allocate memory (os error 12)".into())
             } else {
                 None
             };
@@ -241,9 +263,10 @@ fn handle(
                 generation,
                 tint: tint(&camera),
                 camera,
-                size: fit(req.size.unwrap_or(opts.default_size), opts.max_size),
+                size: fit(size.expect("checked"), opts.max_size),
                 started_at: now + opts.start_delay,
                 started: false,
+                notice,
                 sequence: 0,
                 next_frame: now,
                 controls,
@@ -279,6 +302,9 @@ fn step(s: &mut Stream, sink: &EventSink, opts: &Options, epoch: Instant) {
                 stride: s.size.width * 4,
                 layout: PixelLayout::Xrgb8888,
             });
+            if let Some(message) = s.notice.take() {
+                sink(Event::Notice { message });
+            }
         }
         return;
     }
@@ -353,6 +379,7 @@ mod tests {
             size: Size::new(64, 32),
             started_at: Instant::now(),
             started: true,
+            notice: None,
             sequence: 0,
             next_frame: Instant::now(),
             controls: Controls::default(),

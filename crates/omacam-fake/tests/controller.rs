@@ -147,6 +147,32 @@ fn full_still_comes_from_the_still_mode_and_the_preview_returns() {
 }
 
 #[test]
+fn a_still_without_memory_for_the_full_mode_falls_back_and_says_so() {
+    let mut rig = Rig::new(fast());
+    // Room for the preview (scaled to 160x120 here), not for the still.
+    rig.backend.faults.lock().unwrap().memory_limit_pixels = Some(160 * 100);
+    let out = rig.controller.resume(Instant::now());
+    rig.apply(out);
+    assert!(rig.run_until(Duration::from_secs(2), |r| r.showing(MAIN)));
+    let out = rig.controller.shutter(Instant::now());
+    rig.apply(out);
+    assert!(rig.run_until(Duration::from_secs(3), |r| !r.pictures.is_empty()));
+    let (_, _, size) = rig.pictures[0].clone();
+    let aspect = size.width as f64 / size.height as f64;
+    assert!(
+        (aspect - 16.0 / 9.0).abs() < 0.05,
+        "the preview mode: {size}"
+    );
+    assert!(
+        rig.errors
+            .iter()
+            .any(|e| e.contains("Not enough camera memory")),
+        "{:?}",
+        rig.errors
+    );
+}
+
+#[test]
 fn flip_to_the_front_camera() {
     let mut rig = Rig::new(fast());
     let out = rig.controller.resume(Instant::now());

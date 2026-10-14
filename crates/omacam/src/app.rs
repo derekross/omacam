@@ -472,7 +472,10 @@ fn format_zoom(z: f64) -> String {
 
 fn preset_label(p: f64) -> String {
     if p < 1.0 {
-        format!("{p}").trim_start_matches('0').to_string()
+        // One decimal: the full ultrawide (0.45x) reads ".5", as on stock.
+        format!("{:.1}", (p * 10.0).round() / 10.0)
+            .trim_start_matches('0')
+            .to_string()
     } else {
         format!("{}", p.round() as i64)
     }
@@ -674,7 +677,12 @@ impl App {
             .as_ref()
             .is_some_and(|(m, t)| m == msg && t.elapsed() < Duration::from_secs(10));
         if !repeat {
-            self.toasts.add_toast(adw::Toast::new(msg));
+            // Errors stay 10 s (or until dismissed): they often come while
+            // the user looks at the picture, not at the toast.
+            let toast = adw::Toast::new(msg);
+            toast.set_timeout(10);
+            toast.set_priority(adw::ToastPriority::High);
+            self.toasts.add_toast(toast);
             *last = Some((msg.to_string(), Instant::now()));
         }
     }

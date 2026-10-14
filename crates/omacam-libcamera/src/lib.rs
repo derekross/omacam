@@ -20,7 +20,7 @@ use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use libcamera::camera::{ActiveCamera, CameraConfigurationStatus};
+use libcamera::camera::ActiveCamera;
 use libcamera::camera_manager::CameraManager;
 use libcamera::control::ControlList;
 use libcamera::framebuffer::{AsFrameBuffer, FrameMetadataStatus};
@@ -57,6 +57,22 @@ pub struct Options {
 /// XRGB8888, the format asked of the software ISP: 32-bit linear, the
 /// safe EGL import target on panfrost.
 const XRGB8888: PixelFormat = PixelFormat::new(u32::from_le_bytes(*b"XR24"), 0);
+const EINVAL: i32 = 22;
+const ENOMEM: i32 = 12;
+
+/// A failed start, and the step that failed.
+#[derive(Debug)]
+struct StartError {
+    step: &'static str,
+    error: io::Error,
+}
+
+impl StartError {
+    fn is_out_of_memory(&self) -> bool {
+        self.error.raw_os_error() == Some(ENOMEM)
+    }
+}
+
 /// How long a stop waits for the UI to give back lent buffers.
 const LENT_WAIT: Duration = Duration::from_millis(300);
 
@@ -229,8 +245,8 @@ impl Worker {
             } => {
                 self.stop(rx);
                 let began = Instant::now();
-                match self.start(generation, &camera, &stream, &controls) {
-                    Ok(()) => {
+                match self.start_with_fallbacks(generation, &camera, &stream, &controls) {
+                    Ok(note) => {
                         let a = self.active.as_ref().expect("started");
                         tracing::info!(
                             generation,
@@ -247,12 +263,15 @@ impl Worker {
                             stride: a.stride,
                             layout: a.layout,
                         });
+                        if let Some(message) = note {
+                            (self.sink)(Event::Notice { message });
+                        }
                     }
                     Err(e) => {
-                        tracing::warn!(generation, camera, error = %e, "start failed");
+                        tracing::error!(generation, camera, step = e.step, error = %e.error, "camera didn't start");
                         (self.sink)(Event::Error {
                             generation: Some(generation),
-                            message: format!("Camera didn't start: {e}"),
+                            message: format!("Camera didn't start ({}): {}", e.step, e.error),
                         });
                     }
                 }
@@ -283,68 +302,163 @@ impl Worker {
         }
     }
 
-    fn start(
+    /// Start `req`, trying again when memory runs short: once more after
+    /// releasing the camera manager, then with one buffer, then at each
+    /// fallback size. A still stream also falls back on other start
+    /// errors. Returns a note for the user when it had to settle for less.
+    fn start_with_fallbacks(
         &mut self,
         generation: u64,
         camera: &str,
         req: &StreamRequest,
         controls: &Controls,
-    ) -> io::Result<()> {
-        self.open_manager()?;
+    ) -> Result<Option<String>, StartError> {
+        let mut attempts: Vec<(Option<Size>, u32)> = vec![(req.size, req.buffers)];
+        attempts.push((req.size, req.buffers));
+        if req.buffers > 1 {
+            attempts.push((req.size, 1));
+        }
+        for &f in &req.fallbacks {
+            attempts.push((Some(f), req.buffers.min(2)));
+        }
+        let mut last = None;
+        for (i, &(size, buffers)) in attempts.iter().enumerate() {
+            let fallback = i > 0;
+            if fallback {
+                tracing::warn!(
+                    generation,
+                    camera,
+                    size = %size.map(|s| s.to_string()).unwrap_or_else(|| "default".into()),
+                    buffers,
+                    "retrying the start"
+                );
+            }
+            match self.start(generation, camera, size, buffers, req, controls) {
+                Ok(()) => {
+                    let got = self.active.as_ref().map(|a| a.size);
+                    let note = match (size == req.size, got) {
+                        (false, Some(g)) => Some(format!(
+                            "Not enough camera memory for the full mode: used {g} instead"
+                        )),
+                        _ => None,
+                    };
+                    return Ok(note);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        generation,
+                        camera,
+                        step = e.step,
+                        error = %e.error,
+                        errno = e.error.raw_os_error(),
+                        attempt = i + 1,
+                        "start failed"
+                    );
+                    let retry = e.is_out_of_memory() || req.purpose == Purpose::Still;
+                    if i == 0 && e.is_out_of_memory() {
+                        // Let go of everything libcamera holds, then retry.
+                        self.manager = None;
+                    }
+                    last = Some(e);
+                    if !retry {
+                        break;
+                    }
+                }
+            }
+        }
+        Err(last.expect("at least one attempt"))
+    }
+
+    fn start(
+        &mut self,
+        generation: u64,
+        camera: &str,
+        size_wanted: Option<Size>,
+        buffers: u32,
+        req: &StreamRequest,
+        controls: &Controls,
+    ) -> Result<(), StartError> {
+        let at = |step: &'static str| move |error: io::Error| StartError { step, error };
+        self.open_manager().map_err(at("camera manager"))?;
         let mgr = self.manager.as_ref().expect("opened");
-        let cam = mgr
-            .get(camera)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such camera"))?;
-        let mut cam: ActiveCamera<'static> = cam.acquire()?;
+        let cam = mgr.get(camera).ok_or_else(|| {
+            at("find camera")(io::Error::new(io::ErrorKind::NotFound, "no such camera"))
+        })?;
+        let mut cam: ActiveCamera<'static> = cam.acquire().map_err(at("acquire"))?;
 
         let mut cfgs = cam
             .generate_configuration(&[StreamRole::ViewFinder])
-            .ok_or_else(|| io::Error::other("no configuration for the viewfinder role"))?;
+            .ok_or_else(|| at("generate configuration")(io::Error::other("no configuration")))?;
         {
             let mut sc = cfgs.get_mut(0).expect("one stream");
             sc.set_pixel_format(XRGB8888);
-            if let Some(s) = req.size {
+            if let Some(s) = size_wanted {
                 sc.set_size(LcSize::new(s.width, s.height));
             }
-            sc.set_buffer_count(req.buffers.max(1));
+            sc.set_buffer_count(buffers.max(1));
         }
-        match cfgs.validate() {
-            CameraConfigurationStatus::Invalid => {
-                return Err(io::Error::other("configuration invalid"))
-            }
-            CameraConfigurationStatus::Adjusted => {
-                tracing::info!(config = %cfgs.to_string_repr(), "configuration adjusted")
-            }
-            CameraConfigurationStatus::Valid => {}
+        let status = cfgs.validate();
+        tracing::info!(
+            generation,
+            camera,
+            purpose = ?req.purpose,
+            asked = %size_wanted.map(|s| s.to_string()).unwrap_or_else(|| "default".into()),
+            buffers,
+            status = ?status,
+            config = %cfgs.to_string_repr(),
+            "configuration validated"
+        );
+        if status.is_invalid() {
+            return Err(at("validate")(io::Error::from_raw_os_error(EINVAL)));
         }
-        let (layout, size, stride) = {
+        let (layout, size, stride, frame_size, count) = {
             let sc = cfgs.get(0).expect("one stream");
             let fmt = sc.get_pixel_format();
             let layout = PixelLayout::from_fourcc(fmt.fourcc())
                 .filter(|_| fmt.modifier() == 0)
                 .ok_or_else(|| {
-                    io::Error::other(format!("unsupported pixel format {:#x}", fmt.fourcc()))
+                    at("format")(io::Error::other(format!(
+                        "unsupported pixel format {:#x}",
+                        fmt.fourcc()
+                    )))
                 })?;
             let s = sc.get_size();
-            (layout, Size::new(s.width, s.height), sc.get_stride())
+            (
+                layout,
+                Size::new(s.width, s.height),
+                sc.get_stride(),
+                sc.get_frame_size(),
+                sc.get_buffer_count(),
+            )
         };
-        cam.configure(&mut cfgs)?;
+        cam.configure(&mut cfgs).map_err(at("configure"))?;
         let stream = cfgs
             .get(0)
             .and_then(|sc| sc.stream())
-            .ok_or_else(|| io::Error::other("no stream after configure"))?;
+            .ok_or_else(|| at("stream")(io::Error::other("no stream after configure")))?;
 
         let mut alloc = FrameBufferAllocator::new(&cam);
-        let fbs = alloc.alloc(&stream)?;
-        tracing::debug!(asked = req.buffers, got = fbs.len(), "buffers allocated");
+        let fbs = alloc.alloc(&stream).map_err(at("allocate buffers"))?;
+        tracing::info!(
+            generation,
+            count = fbs.len(),
+            asked = count,
+            frame_bytes = frame_size,
+            total_mib = format!(
+                "{:.1}",
+                fbs.len() as f64 * frame_size as f64 / (1024.0 * 1024.0)
+            ),
+            "buffers allocated"
+        );
         let mut requests = Vec::with_capacity(fbs.len());
         for (i, fb) in fbs.into_iter().enumerate() {
-            let mapped = MappedBuffer::new(fb)
-                .map_err(|e| io::Error::other(format!("mapping a buffer: {e:?}")))?;
+            let mapped = MappedBuffer::new(fb).map_err(|e| {
+                at("map buffer")(io::Error::other(format!("mapping a buffer: {e:?}")))
+            })?;
             let mut r = cam
                 .create_request(Some(i as u64))
-                .ok_or_else(|| io::Error::other("create_request failed"))?;
-            r.add_buffer(&stream, mapped)?;
+                .ok_or_else(|| at("create request")(io::Error::other("create_request failed")))?;
+            r.add_buffer(&stream, mapped).map_err(at("add buffer"))?;
             requests.push(r);
         }
 
@@ -355,7 +469,7 @@ impl Worker {
 
         let mut start_controls = ControlList::from_info_map(cam.controls()).unwrap_or_default();
         set_controls(&mut start_controls, controls, self.opts.exposure_hints);
-        cam.start(Some(&start_controls))?;
+        cam.start(Some(&start_controls)).map_err(at("start"))?;
 
         let mut active = Active {
             cam,
@@ -373,9 +487,14 @@ impl Worker {
         };
         for r in requests {
             if let Err((r, e)) = active.cam.queue_request(r) {
-                tracing::warn!(error = %e, "queueing a request failed");
+                tracing::warn!(generation, error = %e, "queueing a request failed");
                 active.idle.push(r);
             }
+        }
+        if !active.idle.is_empty() && active.idle.len() == count as usize {
+            return Err(at("queue requests")(io::Error::other(
+                "no request could be queued",
+            )));
         }
         self.active = Some(active);
         Ok(())

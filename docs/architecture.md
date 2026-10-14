@@ -59,7 +59,15 @@ skips frames instead of queueing 9 MB copies.
   mode (§3.3): wait for autofocus (at most 500 ms), note exposure and gains,
   start the still mode, drop at least two frames and at most six until the
   exposure is back, keep one, and start the preview again. The main camera's
-  still mode is 4072x3072 at about 9 fps.
+  still mode is 4072x3072 at about 9 fps. A still whose mode is the
+  preview's (the ultrawide's, until its full 4032x3016 mode works in the
+  kernel) is the next preview frame, with no stop and start.
+- **Camera memory.** Every start frees the previous stream's buffers
+  first, and a still asks for two buffers. A start that fails for lack of
+  memory is retried once after releasing the camera manager, then with one
+  buffer, then at the preview size; the user is told when a photo came out
+  smaller. Each failure is logged with the step that failed (acquire,
+  configure, allocate buffers, start, ...).
 - **Formats.** omacam asks for XRGB8888 (32-bit linear, the safe GPU import
   format); libcamera adjusts the sizes slightly (2016x1136 becomes
   2008x1136).

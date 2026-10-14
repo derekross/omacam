@@ -72,6 +72,16 @@ ssh phone 'cat > /usr/local/bin/omacam && chmod 755 /usr/local/bin/omacam' \
   frames at 480x1040 in a headless Weston inside a container (never on
   your own desktop), into `target/ui-shots/`.
 
+### Logs
+
+From a terminal omacam logs to stderr. Started from the app launcher,
+where stderr goes nowhere, it logs to the journal: `journalctl -t omacam`
+for its own lines (stream starts, validated configurations, buffer
+allocations with their size, start failures with the failing step), and
+libcamera's warnings and errors go to syslog too (`LIBCAMERA_LOG_FILE=syslog`,
+`LIBCAMERA_LOG_LEVELS=*:WARN` unless set). `RUST_LOG=omacam=debug` adds
+more.
+
 ### On a phone someone is using
 
 The phone is someone's phone. Keep runs short, and leave the cameras

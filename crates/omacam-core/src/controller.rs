@@ -14,7 +14,8 @@ use crate::zoom::{Ladder, ZoomPlanner, ZoomSource};
 /// (another app may hold it).
 pub const RETRY_AFTER: Duration = Duration::from_secs(2);
 
-/// Preset zoom buttons, as CAMERA-APP-PLAN §3.4 has them.
+/// Preset zoom buttons, as CAMERA-APP-PLAN §3.4 has them. A preset just
+/// above the widest lens (0.5 over 0.45) snaps to that lens's full view.
 pub const BACK_PRESETS: [f64; 4] = [0.5, 1.0, 2.0, 5.0];
 pub const FRONT_PRESETS: [f64; 2] = [1.0, 2.0];
 
@@ -197,6 +198,15 @@ impl Controller {
                 .iter()
                 .copied()
                 .filter(|&p| p >= min_zoom - 0.06 && p <= max_zoom)
+                // The ".5" button is the widest lens's whole view (0.45x on
+                // the Pixel 7 Pro), as stock's is, not a crop of it.
+                .map(|p| {
+                    if p < 1.0 && p - min_zoom < 0.1 {
+                        min_zoom
+                    } else {
+                        p
+                    }
+                })
                 .collect(),
             lens_role: lens.map(|l| l.role),
             lens_name: lens.map(|l| l.name.clone()).unwrap_or_default(),
@@ -295,12 +305,22 @@ impl Controller {
                         purpose: Purpose::Preview,
                         size: lens.preview,
                         buffers: self.opts.preview_buffers,
+                        fallbacks: Vec::new(),
                     },
-                    Purpose::Still => StreamRequest {
-                        purpose: Purpose::Still,
-                        size: lens.still.or(lens.preview),
-                        buffers: self.opts.still_buffers,
-                    },
+                    Purpose::Still => {
+                        let size = lens.still.or(lens.preview);
+                        StreamRequest {
+                            purpose: Purpose::Still,
+                            size,
+                            buffers: self.opts.still_buffers,
+                            // The preview mode always fits: it just ran.
+                            fallbacks: lens
+                                .preview
+                                .filter(|p| Some(*p) != size)
+                                .into_iter()
+                                .collect(),
+                        }
+                    }
                 };
                 Command::Start {
                     generation,
@@ -413,11 +433,18 @@ impl Controller {
         let Some(lens) = self.side().map(|s| s.lens()) else {
             return out;
         };
-        let autofocus = self.table.get(lens).autofocus;
+        let l = self.table.get(lens);
+        let autofocus = l.autofocus;
+        // A still mode no bigger than the preview's gains nothing from a
+        // stop and a start: take the next preview frame.
+        let same_mode = l.still.is_none() || l.still == l.preview;
+        let mode = if same_mode {
+            capture::Mode::Quick
+        } else {
+            self.opts.capture_mode
+        };
         let meta = self.last_meta.as_ref().map(|(_, m)| m);
-        let step = self
-            .capture
-            .begin(self.opts.capture_mode, autofocus, meta, now);
+        let step = self.capture.begin(mode, autofocus, meta, now);
         self.capture_step(step, now, &mut out);
         out
     }
@@ -480,6 +507,7 @@ impl Controller {
         let mut out = Vec::new();
         match event {
             Event::Cameras(_) => {}
+            Event::Notice { message } => out.push(Output::Error(message)),
             Event::Started { generation, .. } => {
                 let actions = self.switch.on_started(generation);
                 self.run(actions, &mut out);
@@ -668,7 +696,11 @@ mirror = true
         }
         let v = c.view();
         assert_eq!(v.zoom, 1.0);
-        assert_eq!(v.presets, vec![0.5, 1.0, 2.0, 5.0]);
+        assert_eq!(
+            v.presets,
+            vec![0.45, 1.0, 2.0, 5.0],
+            "the .5 button is the full ultrawide"
+        );
         assert!(v.can_flip);
     }
 
@@ -754,6 +786,35 @@ mirror = true
     }
 
     #[test]
+    fn a_still_in_the_preview_mode_reuses_the_running_stream() {
+        // The ultrawide's still mode is its preview mode (the full one
+        // waits for the kernel): no stop, no start, the next frame.
+        let now = Instant::now();
+        let spec = TableSpec::parse(
+            "[[lens]]\nrole = \"main\"\nid = \"main\"\nzoom = 1.0\npreview = [2016, 1508]\nstill = [2016, 1508]\n",
+        )
+        .unwrap();
+        let mut c = Controller::new(&spec, &cameras(), Options::default());
+        let g = open(&mut c, now);
+        assert!(commands(&c.shutter(now)).is_empty(), "no restart");
+        match c.on_event(frame(g, "main", 10_000), now).as_slice() {
+            [Output::Picture(p)] => assert_eq!(p.crop, 1.0),
+            other => panic!("{other:?}"),
+        }
+        assert!(!c.view().capturing);
+    }
+
+    #[test]
+    fn the_half_button_shows_the_whole_ultrawide() {
+        let now = Instant::now();
+        let mut c = Controller::new(&spec(), &cameras(), Options::default());
+        open(&mut c, now);
+        let half = c.view().presets[0];
+        c.set_zoom(half, ZoomSource::Preset, now);
+        assert_eq!(c.transform("uw").unwrap().scale, 1.0);
+    }
+
+    #[test]
     fn flip_goes_to_the_front_camera_and_back() {
         let now = Instant::now();
         let mut c = Controller::new(&spec(), &cameras(), Options::default());
@@ -781,6 +842,7 @@ mirror = true
             Command::Start { stream, .. } => {
                 assert_eq!(stream.size, Some(Size::new(4080, 3072)));
                 assert_eq!(stream.buffers, 2);
+                assert_eq!(stream.fallbacks, vec![Size::new(2016, 1136)]);
             }
             _ => unreachable!(),
         }
