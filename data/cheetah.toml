@@ -1,0 +1,62 @@
+# Lens table for the Google Pixel 7 Pro (cheetah, gs201) running Omarchy
+# Mobile. Cameras are matched by their libcamera id, the sensor's device
+# tree path that `cam -l` prints.
+#
+# zoom: field of view relative to the main camera, z = tan(FOV_main/2) /
+#   tan(FOV/2) from Google's published diagonal fields of view (main 82°,
+#   ultrawide 125.8°, telephoto 20.6°). Derived, not yet calibrated on our
+#   own frames.
+# preview/still: the processed stream sizes asked of libcamera's software
+#   ISP. libcamera may adjust them; the app uses what it gets.
+# rotation: leave out to use libcamera's Rotation property.
+
+device = "cheetah"
+max_zoom = 15.0
+
+[[lens]]
+role = "main"
+name = "Main"
+id = "/base/soc@0/usi@109000c0/i2c@10900000/camera-sensor@3d" # Samsung S5KGN1
+zoom = 1.0
+f_number = 1.85
+focal_length_35mm = 25
+preview = [2016, 1136]
+still = [4080, 3072]
+autofocus = true
+
+[[lens]]
+role = "ultrawide"
+name = "Ultrawide"
+id = "/base/soc@0/usi@109200c0/i2c@10920000/camera-sensor@1a" # Sony IMX386
+zoom = 0.45
+f_number = 2.2
+focal_length_35mm = 11
+preview = [2016, 1508]
+# The full 4032x3016 mode overruns the CSIS write DMA until the sensor
+# lengthens its lines (CAMERA-APP-PLAN K1): use the binned mode.
+still = [2016, 1508]
+autofocus = true
+
+[[lens]]
+role = "tele"
+name = "Telephoto"
+id = "/base/soc@0/usi@109300c0/i2c@10930000/camera-sensor@2d" # Samsung S5KGM5
+zoom = 4.78
+f_number = 3.5
+focal_length_35mm = 119
+preview = [2016, 1512]
+still = [4032, 3024]
+# The SEM1215SA lens doesn't answer yet (CAMERA-PLAN CAM-T T.3).
+autofocus = false
+
+[[lens]]
+role = "front"
+name = "Front"
+id = "/base/soc@0/usi@109100c0/i2c@10910000/camera-sensor@10" # Samsung S5K3J1
+zoom = 1.0
+f_number = 2.2
+focal_length_35mm = 21
+preview = [1912, 1368]
+still = [3840, 2736]
+autofocus = false
+mirror = true

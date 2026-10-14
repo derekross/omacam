@@ -1,0 +1,14 @@
+[package]
+name = "omacam-fake"
+description = "A fake camera backend for omacam's tests and for running the UI without cameras"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+omacam-core.workspace = true
+tracing.workspace = true
