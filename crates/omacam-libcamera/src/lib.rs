@@ -73,13 +73,22 @@ impl StartError {
     }
 }
 
+/// How often to look for cameras while there are none.
+const POLL_CAMERAS: Duration = Duration::from_secs(2);
 /// How long a stop waits for the UI to give back lent buffers.
 const LENT_WAIT: Duration = Duration::from_millis(300);
 
 enum Msg {
     Cmd(Command),
+    /// libcamera added or removed a camera (`removed`: its id).
+    CamerasChanged {
+        removed: Option<String>,
+    },
     Completed(Request),
-    Release { generation: u64, cookie: u64 },
+    Release {
+        generation: u64,
+        cookie: u64,
+    },
     Quit,
 }
 
@@ -149,6 +158,9 @@ struct Worker {
     manager: Option<CameraManager>,
     /// Messages that arrived while a stop drained the channel.
     deferred: VecDeque<Msg>,
+    /// The camera ids last announced, and whether any list went out.
+    known: Vec<String>,
+    announced: bool,
 }
 
 impl Worker {
@@ -160,27 +172,33 @@ impl Worker {
             active: None,
             manager: None,
             deferred: VecDeque::new(),
+            known: Vec::new(),
+            announced: false,
         }
     }
 
     fn run(mut self, rx: mpsc::Receiver<Msg>) {
-        match self.open_manager() {
-            Ok(()) => {
-                let cameras = self.list_cameras();
-                tracing::info!(count = cameras.len(), "cameras found");
-                (self.sink)(Event::Cameras(cameras));
-            }
-            Err(e) => {
-                (self.sink)(Event::Error {
-                    generation: None,
-                    message: format!("libcamera didn't start: {e}"),
-                });
-                (self.sink)(Event::Cameras(Vec::new()));
-            }
+        if let Err(e) = self.open_manager() {
+            tracing::warn!(error = %e, "libcamera didn't start; waiting for cameras");
         }
+        self.announce_cameras();
         loop {
             let msg = match self.deferred.pop_front() {
                 Some(m) => m,
+                // No cameras yet (the drivers load late in boot): look
+                // again every couple of seconds.
+                None if self.known.is_empty() && self.active.is_none() => {
+                    match rx.recv_timeout(POLL_CAMERAS) {
+                        Ok(m) => m,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            self.manager = None;
+                            let _ = self.open_manager();
+                            self.announce_cameras();
+                            continue;
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
                 None => match rx.recv() {
                     Ok(m) => m,
                     Err(_) => break,
@@ -188,6 +206,15 @@ impl Worker {
             };
             match msg {
                 Msg::Quit => break,
+                Msg::CamerasChanged { removed } => {
+                    if let Some(id) = removed {
+                        tracing::warn!(camera = id, "camera removed");
+                        if self.active.as_ref().is_some_and(|a| a.camera_id == id) {
+                            self.stop(&rx);
+                        }
+                    }
+                    self.announce_cameras();
+                }
                 Msg::Cmd(cmd) => self.command(cmd, &rx),
                 Msg::Completed(req) => self.completed(req),
                 Msg::Release { generation, cookie } => self.release(generation, cookie),
@@ -199,9 +226,33 @@ impl Worker {
 
     fn open_manager(&mut self) -> io::Result<()> {
         if self.manager.is_none() {
-            self.manager = Some(CameraManager::new()?);
+            let mut mgr = CameraManager::new()?;
+            let me = self.me.clone();
+            mgr.on_camera_added(move |_| {
+                let _ = me.send(Msg::CamerasChanged { removed: None });
+            });
+            let me = self.me.clone();
+            mgr.on_camera_removed(move |cam| {
+                let _ = me.send(Msg::CamerasChanged {
+                    removed: Some(cam.id().to_string()),
+                });
+            });
+            self.manager = Some(mgr);
         }
         Ok(())
+    }
+
+    /// Send the camera list when it differs from the last one sent.
+    fn announce_cameras(&mut self) {
+        let cameras = self.list_cameras();
+        let ids: Vec<String> = cameras.iter().map(|c| c.id.clone()).collect();
+        if ids == self.known && self.announced {
+            return;
+        }
+        tracing::info!(count = cameras.len(), "cameras found");
+        self.known = ids;
+        self.announced = true;
+        (self.sink)(Event::Cameras(cameras));
     }
 
     fn list_cameras(&self) -> Vec<CameraInfo> {
@@ -298,6 +349,10 @@ impl Worker {
                     .is_some_and(|a| a.generation == generation)
                 {
                     self.stop(rx);
+                } else {
+                    // Already gone (a camera that went away): say so, so
+                    // the app doesn't wait for it.
+                    (self.sink)(Event::Stopped { generation });
                 }
             }
             Command::SetControls {

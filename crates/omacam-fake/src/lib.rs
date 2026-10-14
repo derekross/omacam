@@ -100,6 +100,8 @@ pub struct Faults {
 
 enum Msg {
     Cmd(Command),
+    /// The cameras change, as when drivers load late or one goes away.
+    SetCameras(Vec<CameraInfo>),
     Quit,
 }
 
@@ -123,6 +125,14 @@ impl FakeBackend {
             thread: Some(thread),
             faults,
         }
+    }
+}
+
+impl FakeBackend {
+    /// Replace the cameras present: a stream on a camera that's gone stops,
+    /// and the new list goes out as an [`Event::Cameras`].
+    pub fn set_cameras(&self, cameras: Vec<CameraInfo>) {
+        let _ = self.tx.send(Msg::SetCameras(cameras));
     }
 }
 
@@ -229,6 +239,7 @@ fn handle(
     stream: &mut Option<Stream>,
     sink: &EventSink,
     opts: &Options,
+    cameras: &[CameraInfo],
     faults: &Mutex<Faults>,
 ) {
     match cmd {
@@ -255,7 +266,7 @@ fn handle(
                     None => (None, None),
                 }
             };
-            let failure = if !opts.cameras.iter().any(|c| c.id == camera) {
+            let failure = if !cameras.iter().any(|c| c.id == camera) {
                 Some(format!("no camera {camera}"))
             } else if faults.lock().unwrap().busy.contains(&camera) {
                 Some(format!("{camera} is busy"))
@@ -288,6 +299,9 @@ fn handle(
         Command::Stop { generation } => {
             if stream.as_ref().is_some_and(|s| s.generation == generation) {
                 stop(stream, sink);
+            } else {
+                // Already gone: say so, so nobody waits for it.
+                sink(Event::Stopped { generation });
             }
         }
         Command::SetControls {
@@ -350,7 +364,8 @@ fn step(s: &mut Stream, sink: &EventSink, opts: &Options, epoch: Instant) {
 
 fn run(rx: mpsc::Receiver<Msg>, sink: EventSink, opts: Options, faults: Arc<Mutex<Faults>>) {
     let epoch = Instant::now();
-    sink(Event::Cameras(opts.cameras.clone()));
+    let mut cameras = opts.cameras.clone();
+    sink(Event::Cameras(cameras.clone()));
     let mut stream: Option<Stream> = None;
     loop {
         let now = Instant::now();
@@ -361,7 +376,17 @@ fn run(rx: mpsc::Receiver<Msg>, sink: EventSink, opts: Options, faults: Arc<Mute
         };
         match rx.recv_timeout(wake.saturating_duration_since(now)) {
             Ok(Msg::Quit) | Err(RecvTimeoutError::Disconnected) => return,
-            Ok(Msg::Cmd(cmd)) => handle(cmd, &mut stream, &sink, &opts, &faults),
+            Ok(Msg::Cmd(cmd)) => handle(cmd, &mut stream, &sink, &opts, &cameras, &faults),
+            Ok(Msg::SetCameras(list)) => {
+                if stream
+                    .as_ref()
+                    .is_some_and(|s| !list.iter().any(|c| c.id == s.camera))
+                {
+                    stop(&mut stream, &sink);
+                }
+                cameras = list;
+                sink(Event::Cameras(cameras.clone()));
+            }
             Err(RecvTimeoutError::Timeout) => {
                 if let Some(s) = stream.as_mut() {
                     step(s, &sink, &opts, epoch);

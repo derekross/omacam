@@ -20,6 +20,9 @@ use crate::backend::{Controls, Purpose};
 pub struct Target {
     /// Index into the lens table.
     pub lens: usize,
+    /// The camera's id: what makes two targets the same stream, since the
+    /// lens table's indices change when cameras come and go.
+    pub camera: String,
     pub purpose: Purpose,
     /// Start values (exposure hints, autofocus mode). Not part of identity.
     pub controls: Controls,
@@ -29,13 +32,14 @@ impl Target {
     pub fn new(lens: usize, purpose: Purpose) -> Target {
         Target {
             lens,
+            camera: format!("lens{lens}"),
             purpose,
             controls: Controls::default(),
         }
     }
 
     fn same_stream(&self, other: &Target) -> bool {
-        self.lens == other.lens && self.purpose == other.purpose
+        self.camera == other.camera && self.purpose == other.purpose
     }
 }
 
@@ -140,6 +144,20 @@ impl SwitchController {
         self.last_switch
     }
 
+    /// The lens table was rebuilt: point the targets at their cameras' new
+    /// indices. A target whose camera is gone keeps `usize::MAX`, which
+    /// nothing indexes (its stream is ending).
+    pub fn remap(&mut self, index_of: impl Fn(&str) -> Option<usize>) {
+        let fix = |t: &mut Target| t.lens = index_of(&t.camera).unwrap_or(usize::MAX);
+        match &mut self.state {
+            State::Starting { target, .. } | State::Streaming { target, .. } => fix(target),
+            _ => {}
+        }
+        if let Some(w) = self.wanted.as_mut() {
+            fix(w);
+        }
+    }
+
     /// Ask for `target` (None: stop streaming).
     pub fn request(&mut self, target: Option<Target>, now: Instant) -> Vec<Action> {
         let changes = match (&self.wanted, &target) {
@@ -199,7 +217,15 @@ impl SwitchController {
     }
 
     pub fn on_stopped(&mut self, generation: u64) -> Vec<Action> {
-        if self.state == (State::Stopping { generation }) {
+        let ours = match &self.state {
+            State::Stopping { generation: g } => *g == generation,
+            // The backend stopped it on its own (the camera went away).
+            State::Streaming { generation: g, .. } | State::Starting { generation: g, .. } => {
+                *g == generation
+            }
+            State::Idle => false,
+        };
+        if ours {
             self.state = State::Idle;
         }
         self.drive()
@@ -215,7 +241,21 @@ impl SwitchController {
             State::Idle => None,
         };
         if generation.is_none() || generation == current {
+            let failed = match &self.state {
+                State::Starting { target, .. } | State::Streaming { target, .. } => {
+                    Some(target.clone())
+                }
+                _ => None,
+            };
             self.state = State::Idle;
+            // A newer wish than the failed stream still stands: start it.
+            let newer = match (&self.wanted, &failed) {
+                (Some(w), Some(f)) => !w.same_stream(f),
+                _ => false,
+            };
+            if generation.is_some() && newer {
+                return self.drive();
+            }
             self.wanted = None;
             self.switch_began = None;
         }
@@ -339,6 +379,32 @@ mod tests {
         assert!(s.request(t(1), now).is_empty());
         let g2 = started(&s.on_stopped(g));
         assert!(g2 > g);
+    }
+
+    #[test]
+    fn a_failed_start_keeps_a_newer_wish() {
+        let now = Instant::now();
+        let mut s = SwitchController::new();
+        let g = started(&s.request(t(1), now));
+        assert!(s.request(t(2), now).is_empty(), "waits for the start");
+        let next = s.on_error(Some(g));
+        let g2 = started(&next);
+        assert!(g2 > g);
+        assert_eq!(s.wanted().unwrap().lens, 2);
+    }
+
+    #[test]
+    fn a_stream_the_backend_stops_on_its_own_starts_again() {
+        let now = Instant::now();
+        let mut s = SwitchController::new();
+        let g = started(&s.request(t(1), now));
+        s.on_started(g);
+        // The camera went away and the backend stopped the stream: the
+        // wish still stands, so a new start goes out.
+        let g2 = started(&s.on_stopped(g));
+        assert!(g2 > g);
+        // An old generation's stop changes nothing.
+        assert!(s.on_stopped(g).is_empty());
     }
 
     #[test]

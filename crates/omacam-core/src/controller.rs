@@ -142,7 +142,8 @@ impl Controller {
         let table = spec.resolve(cameras);
         let back = Side::new(&table, Facing::Back);
         let front = Side::new(&table, Facing::Front);
-        let facing = if back.is_some() {
+        // The back camera, unless there's only a front one.
+        let facing = if back.is_some() || front.is_none() {
             Facing::Back
         } else {
             Facing::Front
@@ -168,6 +169,53 @@ impl Controller {
 
     pub fn has_cameras(&self) -> bool {
         self.back.is_some() || self.front.is_some()
+    }
+
+    /// True between [`Controller::resume`] and [`Controller::suspend`].
+    pub fn is_running(&self) -> bool {
+        !self.suspended
+    }
+
+    /// The cameras changed (drivers loaded late, or one went away): stop
+    /// what streams, take the new list, and, if running, start the
+    /// default camera of the side in use (or of the other side when this
+    /// one has none left). Stream generations carry on, so frames of the
+    /// old stream can't pass for the new one's.
+    pub fn set_cameras(
+        &mut self,
+        spec: &TableSpec,
+        cameras: &[CameraInfo],
+        now: Instant,
+    ) -> Vec<Output> {
+        let mut out = Vec::new();
+        self.capture.abort();
+        self.focus.reset();
+        self.retry_at = None;
+        self.last_meta = None;
+        let table = spec.resolve(cameras);
+        self.back = Side::new(&table, Facing::Back);
+        self.front = Side::new(&table, Facing::Front);
+        self.table = table;
+        let table = &self.table;
+        self.switch.remap(|id| table.index_of(id));
+        if self.side().is_none() {
+            self.facing = match self.facing {
+                Facing::Back if self.front.is_some() => Facing::Front,
+                Facing::Front if self.back.is_some() => Facing::Back,
+                f => f,
+            };
+        }
+        // A camera still present keeps streaming (targets are the same
+        // stream by camera id); a gone one is replaced or stopped.
+        if self.suspended {
+            self.request(None, now, &mut out);
+        } else {
+            self.request_preview(now, &mut out);
+            if self.side().is_none() {
+                self.request(None, now, &mut out);
+            }
+        }
+        out
     }
 
     fn side(&self) -> Option<&Side> {
@@ -285,6 +333,7 @@ impl Controller {
         let lens_idx = side.lens();
         let lens = self.table.get(lens_idx);
         let mut target = Target::new(lens_idx, purpose);
+        target.camera = lens.id.clone();
         target.controls.af_continuous = lens.autofocus;
         if self.opts.transfer_exposure {
             if let Some((from, meta)) = &self.last_meta {
@@ -434,7 +483,9 @@ impl Controller {
         if target.purpose != Purpose::Preview {
             return out;
         }
-        let lens = self.table.get(target.lens).clone();
+        let Some(lens) = self.table.lenses().get(target.lens).cloned() else {
+            return out;
+        };
         let Some(t) = self.transform(&lens.id) else {
             return out;
         };
@@ -549,7 +600,12 @@ impl Controller {
         }
         if self.focus.tick(now) == focus::Action::ResumeContinuous {
             if let Some((generation, target)) = self.switch.streaming() {
-                if self.table.get(target.lens).autofocus && target.purpose == Purpose::Preview {
+                let af = self
+                    .table
+                    .lenses()
+                    .get(target.lens)
+                    .is_some_and(|l| l.autofocus);
+                if af && target.purpose == Purpose::Preview {
                     out.push(Output::Backend(Command::SetControls {
                         generation,
                         controls: crate::backend::Controls {
@@ -618,6 +674,9 @@ impl Controller {
             return;
         };
         let (lens_idx, purpose) = (target.lens, target.purpose);
+        if lens_idx >= self.table.lenses().len() {
+            return; // its camera is gone
+        }
         match purpose {
             Purpose::Preview => {
                 self.focus.on_meta(&frame.meta, now);
@@ -943,6 +1002,68 @@ mirror = true
         c.set_tap_to_focus(false);
         c.set_zoom(1.0, ZoomSource::Preset, now);
         assert!(c.tap(0.5, 0.5, now).is_empty());
+    }
+
+    #[test]
+    fn cameras_that_appear_late_start_and_a_removed_one_stops() {
+        let now = Instant::now();
+        let mut c = Controller::new(&spec(), &[], Options::default());
+        assert!(!c.has_cameras());
+        assert!(commands(&c.resume(now)).is_empty(), "nothing to start yet");
+        assert!(c.is_running());
+        // The drivers load: the main camera starts.
+        let (g, cam, _) = start_of(&c.set_cameras(&spec(), &cameras(), now));
+        assert_eq!(cam, "main");
+        c.on_event(started(g, "main"), now);
+        c.on_event(frame(g, "main", 10_000), now);
+        // The main camera goes away: its stream stops; the ultrawide is
+        // what's left at 1x on the back.
+        let mut left = cameras();
+        left.retain(|c| c.id != "main");
+        // A start replaces the old stream; generations carry on.
+        let (g2, cam, _) = start_of(&c.set_cameras(&spec(), &left, now));
+        assert!(g2 > g, "generations carry on");
+        assert_eq!(cam, "uw");
+        // The backend reports the main stream stopped (its camera went):
+        // nothing more to do.
+        assert!(c.on_event(Event::Stopped { generation: g }, now).is_empty());
+        // All gone: stopped, nothing to start, still running (waiting).
+        c.on_event(started(g2, "uw"), now);
+        let out = c.set_cameras(&spec(), &[], now);
+        assert_eq!(commands(&out), vec![&Command::Stop { generation: g2 }]);
+        assert!(!c.has_cameras());
+        assert!(c
+            .on_event(Event::Stopped { generation: g2 }, now)
+            .is_empty());
+    }
+
+    #[test]
+    fn a_new_camera_leaves_the_streaming_one_alone() {
+        let now = Instant::now();
+        let mut cams = cameras();
+        let tele = cams.pop().unwrap(); // front
+        let front = tele;
+        let mut c = Controller::new(&spec(), &cams, Options::default());
+        let g = open(&mut c, now);
+        cams.push(front);
+        assert!(
+            commands(&c.set_cameras(&spec(), &cams, now)).is_empty(),
+            "main keeps streaming"
+        );
+        assert_eq!(
+            c.on_event(frame(g, "main", 10_000), now).len(),
+            1,
+            "its frames still show"
+        );
+    }
+
+    #[test]
+    fn late_cameras_while_suspended_wait_for_resume() {
+        let now = Instant::now();
+        let mut c = Controller::new(&spec(), &[], Options::default());
+        assert!(commands(&c.set_cameras(&spec(), &cameras(), now)).is_empty());
+        let (_, cam, _) = start_of(&c.resume(now));
+        assert_eq!(cam, "main");
     }
 
     #[test]

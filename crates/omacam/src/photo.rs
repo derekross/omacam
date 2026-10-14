@@ -331,6 +331,42 @@ mod tests {
         assert_eq!(m, img);
     }
 
+    /// An XRGB8888 frame (B, G, R, X in memory) through crop, rotation and
+    /// the JPEG encoder keeps red red and blue blue.
+    #[test]
+    fn channel_order_survives_to_the_jpeg() {
+        let (w, h) = (32u32, 16u32);
+        let mut d = Vec::new();
+        for _y in 0..h {
+            for x in 0..w {
+                // Left half blue, right half red.
+                if x < w / 2 {
+                    d.extend_from_slice(&[220, 0, 0, 255]);
+                } else {
+                    d.extend_from_slice(&[0, 0, 220, 255]);
+                }
+            }
+        }
+        let raw = Raw {
+            data: &d,
+            width: w,
+            height: h,
+            stride: w * 4,
+            layout: PixelLayout::Xrgb8888,
+        };
+        let img = crop_and_rotate(&raw, 1.0, 0).unwrap();
+        let jpeg = encode_jpeg(&img, 95).unwrap();
+        let rgb = turbojpeg::decompress(&jpeg, turbojpeg::PixelFormat::RGB).unwrap();
+        let px = |x: usize, y: usize| {
+            let i = y * rgb.pitch + x * 3;
+            (rgb.pixels[i], rgb.pixels[i + 1], rgb.pixels[i + 2])
+        };
+        let (r, _, b) = px(4, 8);
+        assert!(b > 180 && r < 40, "left is blue: {:?}", px(4, 8));
+        let (r, _, b) = px(28, 8);
+        assert!(r > 180 && b < 40, "right is red: {:?}", px(28, 8));
+    }
+
     #[test]
     fn names_count_up_when_taken() {
         let dir = std::env::temp_dir().join(format!("omacam-test-{}", std::process::id()));

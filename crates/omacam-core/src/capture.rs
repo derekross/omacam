@@ -6,8 +6,11 @@
 //! 1. Shutter: if autofocus is still scanning, wait for it (at most
 //!    [`FOCUS_WAIT`]); then read the last exposure, gain and colour gains.
 //! 2. Reconfigure to the still mode, with those values as start hints.
-//! 3. Drop frames until the exposure is back near the locked values (at
-//!    least [`MIN_DISCARD`], at most [`MAX_DISCARD`]), then keep one.
+//! 3. Drop frames until the exposure and the white balance are back near
+//!    the locked values (at least [`MIN_DISCARD`], at most
+//!    [`MAX_DISCARD`]), then keep one. A freshly started mode begins with
+//!    the AWB's default gains; a still kept on its first frames came out
+//!    yellow on the telephoto (blue gain 1.56 needed).
 //! 4. Reconfigure back to the preview mode with the same hints.
 //!
 //! Quick mode keeps the next preview frame instead, with no reconfiguring.
@@ -25,11 +28,16 @@ pub const FOCUS_WAIT: Duration = Duration::from_millis(500);
 /// controls two frames late).
 pub const MIN_DISCARD: u32 = 2;
 /// Frames to drop at most while waiting for the exposure to settle.
-pub const MAX_DISCARD: u32 = 6;
+pub const MAX_DISCARD: u32 = 12;
 /// Longest wait for the still frame before giving up.
 pub const STILL_TIMEOUT: Duration = Duration::from_secs(6);
 /// How close (relative) exposure × gain must be to the locked value.
 pub const SETTLED_WITHIN: f64 = 0.15;
+/// How close each colour gain must be to the preview's.
+pub const GAINS_WITHIN: f64 = 0.10;
+/// Without the preview's gains to compare: how little they may change
+/// from one frame to the next to count as settled.
+pub const GAINS_STEADY: f64 = 0.03;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -59,8 +67,14 @@ pub enum Step {
 enum State {
     Idle,
     QuickWait,
-    WaitFocus { deadline: Instant },
-    Still { seen: u32, deadline: Instant },
+    WaitFocus {
+        deadline: Instant,
+    },
+    Still {
+        seen: u32,
+        deadline: Instant,
+        last_gains: Option<[f32; 2]>,
+    },
     Restoring,
 }
 
@@ -152,6 +166,7 @@ impl CaptureController {
         self.state = State::Still {
             seen: 0,
             deadline: now + STILL_TIMEOUT,
+            last_gains: None,
         };
         Step::StartStill(self.locked.clone())
     }
@@ -181,20 +196,36 @@ impl CaptureController {
 
     /// A frame from the still stream.
     pub fn on_still_frame(&mut self, meta: &FrameMeta) -> Step {
-        let State::Still { seen, .. } = &mut self.state else {
+        let State::Still {
+            seen, last_gains, ..
+        } = &mut self.state
+        else {
             return Step::Discard;
         };
         *seen += 1;
         let seen = *seen;
+        let previous = std::mem::replace(last_gains, meta.colour_gains);
         if seen <= MIN_DISCARD {
             return Step::Discard;
         }
-        let settled = match (product(&self.locked), product(&lock_from(Some(meta)))) {
+        let exposure = match (product(&self.locked), product(&lock_from(Some(meta)))) {
             (Some(want), Some(got)) if want > 0.0 => ((got - want) / want).abs() <= SETTLED_WITHIN,
             // Nothing to compare: the minimum wait has to do.
             _ => true,
         };
-        if settled || seen > MAX_DISCARD {
+        let close = |a: [f32; 2], b: [f32; 2], within: f64| {
+            a.iter()
+                .zip(b)
+                .all(|(x, y)| y > 0.0 && ((x - y) / y).abs() as f64 <= within)
+        };
+        let colour = match (meta.colour_gains, self.locked.colour_gains, previous) {
+            (Some(got), Some(want), _) => close(got, want, GAINS_WITHIN),
+            (Some(got), None, Some(prev)) => close(got, prev, GAINS_STEADY),
+            (Some(_), None, None) => false,
+            // The camera reports no gains: nothing to wait for.
+            (None, _, _) => true,
+        };
+        if (exposure && colour) || seen > MAX_DISCARD {
             self.state = State::Restoring;
             Step::KeepAndRestore(self.locked.clone())
         } else {
@@ -270,6 +301,55 @@ mod tests {
             Step::Nothing
         );
         assert!(!c.is_busy());
+    }
+
+    fn with_gains(exposure: i32, gains: [f32; 2]) -> FrameMeta {
+        FrameMeta {
+            colour_gains: Some(gains),
+            ..meta(exposure, 1.0, None)
+        }
+    }
+
+    #[test]
+    fn the_still_waits_for_white_balance_to_return() {
+        // The telephoto's preview had R 1.09 / B 1.56; the fresh still mode
+        // starts at the AWB's defaults and walks back.
+        let now = Instant::now();
+        let mut c = CaptureController::new();
+        c.begin(
+            Mode::Full,
+            false,
+            Some(&with_gains(20_000, [1.09, 1.56])),
+            now,
+        );
+        assert_eq!(c.locked().colour_gains, Some([1.09, 1.56]));
+        let frames = [
+            [1.0, 1.0],
+            [1.0, 1.0],
+            [1.05, 1.2],
+            [1.08, 1.38],
+            [1.09, 1.55],
+        ];
+        let steps: Vec<Step> = frames
+            .iter()
+            .map(|g| c.on_still_frame(&with_gains(20_000, *g)))
+            .collect();
+        assert!(steps[..4].iter().all(|s| *s == Step::Discard), "{steps:?}");
+        assert!(matches!(steps[4], Step::KeepAndRestore(_)));
+    }
+
+    #[test]
+    fn without_preview_gains_it_waits_for_them_to_stop_moving() {
+        let now = Instant::now();
+        let mut c = CaptureController::new();
+        c.begin(Mode::Full, false, Some(&meta(20_000, 1.0, None)), now);
+        let frames = [[1.0, 1.0], [1.0, 1.0], [1.2, 1.3], [1.3, 1.5], [1.31, 1.51]];
+        let steps: Vec<Step> = frames
+            .iter()
+            .map(|g| c.on_still_frame(&with_gains(20_000, *g)))
+            .collect();
+        assert!(steps[..4].iter().all(|s| *s == Step::Discard), "{steps:?}");
+        assert!(matches!(steps[4], Step::KeepAndRestore(_)));
     }
 
     #[test]

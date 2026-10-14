@@ -66,9 +66,19 @@ impl Rig {
             if done(self) {
                 return true;
             }
-            if let Ok(e) = self.events.recv_timeout(Duration::from_millis(10)) {
-                let out = self.controller.on_event(e, Instant::now());
-                self.apply(out);
+            match self.events.recv_timeout(Duration::from_millis(10)) {
+                // As the app does: take the new list and keep running.
+                Ok(Event::Cameras(cams)) => {
+                    let out =
+                        self.controller
+                            .set_cameras(&TableSpec::cheetah(), &cams, Instant::now());
+                    self.apply(out);
+                }
+                Ok(e) => {
+                    let out = self.controller.on_event(e, Instant::now());
+                    self.apply(out);
+                }
+                Err(_) => {}
             }
             let out = self.controller.tick(Instant::now());
             self.apply(out);
@@ -170,6 +180,39 @@ fn a_still_without_memory_for_the_full_mode_falls_back_and_says_so() {
         "{:?}",
         rig.errors
     );
+}
+
+#[test]
+fn cameras_that_load_late_start_and_a_removed_one_hands_over() {
+    // Opened before the camera drivers load (40 s into boot on the phone).
+    let mut rig = Rig::new(FakeOptions {
+        cameras: Vec::new(),
+        ..fast()
+    });
+    assert!(!rig.controller.has_cameras());
+    let out = rig.controller.resume(Instant::now());
+    rig.apply(out);
+    assert!(!rig.run_until(Duration::from_millis(300), |r| !r.shown.is_empty()));
+    assert!(
+        rig.errors.is_empty(),
+        "waiting is not an error: {:?}",
+        rig.errors
+    );
+    // The drivers load.
+    rig.backend.set_cameras(omacam_fake::cheetah_cameras());
+    assert!(rig.run_until(Duration::from_secs(2), |r| r.showing(MAIN)));
+    // The main camera goes away (a driver reload): the stream stops and
+    // the ultrawide, the widest left on the back, takes over.
+    let mut left = omacam_fake::cheetah_cameras();
+    left.retain(|c| !c.id.ends_with(MAIN));
+    rig.backend.set_cameras(left);
+    assert!(rig.run_until(Duration::from_secs(2), |r| r.showing(UW)));
+    // All gone, then back: the main camera starts again.
+    rig.backend.set_cameras(Vec::new());
+    rig.run_until(Duration::from_millis(200), |_| false);
+    assert!(!rig.controller.has_cameras());
+    rig.backend.set_cameras(omacam_fake::cheetah_cameras());
+    assert!(rig.run_until(Duration::from_secs(2), |r| r.showing(MAIN)));
 }
 
 #[test]

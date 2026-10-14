@@ -108,6 +108,7 @@ struct App {
     zoom_indicator: gtk::Label,
     lens_label: gtk::Label,
     status: gtk::Label,
+    status_box: gtk::Box,
     shutter: gtk::Button,
     flip: gtk::Button,
     thumb: gtk::Button,
@@ -222,11 +223,16 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
     zoom_indicator.set_can_target(false);
     overlay.add_overlay(&zoom_indicator);
     let status = gtk::Label::new(Some("Starting the camera…"));
-    status.add_css_class("status");
-    status.set_halign(gtk::Align::Center);
-    status.set_valign(gtk::Align::Center);
-    status.set_can_target(false);
-    overlay.add_overlay(&status);
+    let spinner = gtk::Spinner::new();
+    spinner.set_spinning(true);
+    let status_box = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    status_box.add_css_class("status");
+    status_box.append(&spinner);
+    status_box.append(&status);
+    status_box.set_halign(gtk::Align::Center);
+    status_box.set_valign(gtk::Align::Center);
+    status_box.set_can_target(false);
+    overlay.add_overlay(&status_box);
 
     // Bottom: slider, zoom pills, then thumbnail / shutter / flip.
     let slider = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 1.0, 0.001);
@@ -310,6 +316,7 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
         zoom_indicator,
         lens_label,
         status,
+        status_box,
         shutter,
         flip,
         thumb,
@@ -607,18 +614,44 @@ impl App {
                     tap_to_focus: self.settings.borrow().tap_to_focus,
                     ..Options::default()
                 };
-                let mut c = Controller::new(&self.cli.lens_table(), &cameras, opts);
-                if !c.has_cameras() {
-                    self.status.set_label("No cameras found");
+                // The list comes at startup and again whenever cameras come
+                // or go (drivers load ~40 s into boot, or reload).
+                let first = self.controller.borrow().is_none();
+                let out = if first {
+                    let mut c = Controller::new(&self.cli.lens_table(), &cameras, opts);
+                    c.set_facing(self.cli.start_facing());
+                    if let Some(z) = self.cli.zoom {
+                        c.set_zoom(z, ZoomSource::Preset, now);
+                    }
+                    let out = if self.suspended.get() {
+                        Vec::new()
+                    } else {
+                        c.resume(now)
+                    };
                     *self.controller.borrow_mut() = Some(c);
-                    return;
+                    out
+                } else {
+                    let spec = self.cli.lens_table();
+                    self.with_controller(|c| c.set_cameras(&spec, &cameras, now))
+                        .unwrap_or_default()
+                };
+                let has = self
+                    .controller
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|c| c.has_cameras());
+                if has {
+                    tracing::info!(count = cameras.len(), "cameras");
+                    self.status.set_label("Starting the camera…");
+                } else {
+                    tracing::info!("no cameras yet; waiting");
+                    self.status.set_label("Waiting for cameras…");
+                    self.viewfinder.clear();
+                    self.shown_camera.borrow_mut().take();
                 }
-                c.set_facing(self.cli.start_facing());
-                if let Some(z) = self.cli.zoom {
-                    c.set_zoom(z, ZoomSource::Preset, now);
+                if !has || self.shown_camera.borrow().is_none() {
+                    self.status_box.set_visible(true);
                 }
-                let out = c.resume(now);
-                *self.controller.borrow_mut() = Some(c);
                 self.apply(out);
             }
             Msg::Event(e) => {
@@ -669,7 +702,7 @@ impl App {
         }
         if let Some(tex) = texture(&WidgetExt::display(&self.window), frame) {
             self.viewfinder.set_frame(tex, placement);
-            self.status.set_visible(false);
+            self.status_box.set_visible(false);
             *self.shown_camera.borrow_mut() = Some(camera);
             self.shown_size.set(size);
             self.fps.borrow_mut().tick();
@@ -1409,6 +1442,9 @@ fn encode_and_write(
         size = %format!("{}x{}", img.width, img.height),
         bytes = jpeg.len(),
         ms = started.elapsed().as_millis() as u64,
+        colour_gains = ?p.frame.meta.colour_gains,
+        exposure_us = ?p.frame.meta.exposure_us,
+        gain = ?p.frame.meta.analogue_gain,
         "photo encoded"
     );
     Ok((path, photo::thumbnail(&img)))
