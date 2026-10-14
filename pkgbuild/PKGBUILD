@@ -1,0 +1,45 @@
+# Maintainer: Derek Ross <derekross@gmail.com>
+pkgname=omacam
+pkgver=$(sed -n 's/^version = "\(.*\)"/\1/p' "$startdir/../Cargo.toml" | head -1)
+pkgrel=1
+pkgdesc="Camera: a phone camera with lens switching by zoom, on libcamera"
+arch=('aarch64' 'x86_64')
+url="https://github.com/derekross/omacam"
+license=('GPL-3.0-or-later' 'MIT')
+install='omacam.install'
+options=('!debug' '!lto' '!strip')
+depends=(
+  'gcc-libs'
+  'glib2'
+  'glibc'
+  'gtk4>=4.14'
+  'hicolor-icon-theme'
+  'libadwaita>=1.5'
+  'libcamera>=0.7'
+  'libcamera<0.8'
+  'libcamera-ipa'
+  'libjpeg-turbo'
+)
+makedepends=('cargo' 'clang' 'pkgconf')
+optdepends=('loupe: open the last photo from the gallery button')
+source=()
+sha256sums=()
+
+# bin/cross package sets OMACAM_PREBUILT to a binary it cross-compiled for
+# aarch64 on an x86_64 machine; otherwise this builds natively.
+build() {
+  [[ -n ${OMACAM_PREBUILT:-} ]] && return 0
+  cd "$startdir/.."
+  ./bin/build
+}
+
+package() {
+  cd "$startdir/.."
+  local bin=${OMACAM_PREBUILT:-target/release/omacam}
+  install -Dm755 "$bin" "$pkgdir/usr/bin/omacam"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 NOTICE "$pkgdir/usr/share/licenses/$pkgname/NOTICE"
+  install -Dm644 pkgbuild/omacam.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/omacam.svg"
+  install -Dm644 pkgbuild/omacam.desktop "$pkgdir/usr/share/applications/omacam.desktop"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

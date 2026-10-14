@@ -1,0 +1,6 @@
+#!/bin/sh
+# Build and install the package on this machine (Arch, Arch Linux ARM).
+set -eu
+ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+cd "$ROOT/pkgbuild"
+makepkg -fsi "$@"

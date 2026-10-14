@@ -1,0 +1,6 @@
+#!/bin/sh
+# Build omacam for this machine, with the real cameras (needs libcamera).
+set -eu
+ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+cd "$ROOT"
+cargo build --release --locked -p omacam --features libcamera "$@"

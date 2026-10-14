@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# Cross-compile omacam for aarch64 phones on an x86_64 machine, without
+# qemu: an x86_64 Rust with the aarch64 target, clang and lld in a Docker
+# container (Arch Linux), linking against an aarch64 sysroot taken from an
+# Arch Linux ARM container with the phone's libraries.
+#
+#   bin/cross sysroot     build the sysroot (once, and after library updates)
+#   bin/cross build       build target/aarch64-unknown-linux-gnu/release/omacam
+#   bin/cross package     build the pacman package (pkgbuild/omacam-*-aarch64.pkg.tar.zst)
+#   bin/cross check       clippy for the libcamera backend (it needs libcamera)
+#
+# Environment:
+#   OMACAM_SYSROOT   sysroot directory (default ~/.cache/omacam/sysroot-aarch64)
+#   OMACAM_EXTRA_PKGS  local aarch64 packages (*.pkg.tar.*) to install into the
+#                      sysroot over Arch Linux ARM's, e.g. a patched libcamera
+#   ALARM_IMAGE      an Arch Linux ARM Docker image to start from
+#                    (default: imports the official root tarball)
+set -euo pipefail
+ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+SYSROOT=${OMACAM_SYSROOT:-$HOME/.cache/omacam/sysroot-aarch64}
+TOOLS_IMAGE=omacam-cross:1
+TARGET=aarch64-unknown-linux-gnu
+
+say() { printf '\e[1m==> %s\e[0m\n' "$*"; }
+
+tools_image() {
+  if ! docker image inspect "$TOOLS_IMAGE" >/dev/null 2>&1; then
+    say "Building $TOOLS_IMAGE (rust, the aarch64 std, clang, lld)"
+    docker build -t "$TOOLS_IMAGE" - <<'DOCKERFILE'
+FROM archlinux:latest
+RUN pacman -Syu --noconfirm --needed rust rust-aarch64-gnu clang lld pkgconf gcc git && pacman -Scc --noconfirm
+DOCKERFILE
+  fi
+}
+
+sysroot() {
+  local image=${ALARM_IMAGE:-}
+  if [[ -z $image ]]; then
+    image=omacam-alarm-base
+    if ! docker image inspect "$image" >/dev/null 2>&1; then
+      local cache=$HOME/.cache/omacam
+      mkdir -p "$cache"
+      say "Downloading the Arch Linux ARM aarch64 root tarball"
+      curl -fL -o "$cache/alarm.tar.gz" http://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz
+      docker import --platform linux/arm64 "$cache/alarm.tar.gz" "$image" >/dev/null
+    fi
+  fi
+  [[ -e /proc/sys/fs/binfmt_misc/qemu-aarch64 ]] || { echo "needs a qemu-aarch64 binfmt handler (qemu-user-static-binfmt)" >&2; exit 1; }
+  local extra=${OMACAM_EXTRA_PKGS:-}
+  rm -rf "$SYSROOT"; mkdir -p "$SYSROOT"
+  say "Filling $SYSROOT"
+  docker run --rm --platform linux/arm64 \
+    -v "$SYSROOT:/out" ${extra:+-v "$extra:/extra:ro"} \
+    -e HUID="$(id -u)" -e HGID="$(id -g)" "$image" bash -euo pipefail -c '
+      grep -q "^DisableSandbox" /etc/pacman.conf || sed -i "s/^\[options\]/[options]\nDisableSandbox/" /etc/pacman.conf
+      pacman-key --init >/dev/null 2>&1; pacman-key --populate archlinuxarm >/dev/null 2>&1 || true
+      pacman -Syu --noconfirm --needed gtk4 libadwaita libcamera libcamera-ipa libjpeg-turbo gcc pkgconf >/dev/null
+      if [[ -d /extra ]]; then
+        shopt -s nullglob
+        pkgs=(/extra/*.pkg.tar.zst /extra/*.pkg.tar.xz)
+        (( ${#pkgs[@]} )) && pacman -U --noconfirm "${pkgs[@]}" >/dev/null
+      fi
+      pacman -Q libcamera gtk4 libadwaita glibc
+      tar -C / -cf - usr/include usr/lib usr/share/pkgconfig | tar -C /out -xf -
+      ln -sfn usr/lib /out/lib
+      chown -R "$HUID:$HGID" /out'
+}
+
+in_tools() {
+  tools_image
+  [[ -d $SYSROOT/usr/lib ]] || { echo "no sysroot: run bin/cross sysroot first" >&2; exit 1; }
+  local flags="--target=$TARGET --sysroot=/sysroot"
+  mkdir -p "$HOME/.cargo/registry" "$HOME/.cargo/git"
+  docker run --rm -i --user "$(id -u):$(id -g)" \
+    -v "$ROOT:/src" -v "$SYSROOT:/sysroot:ro" \
+    -v "$HOME/.cargo/registry:/cargo/registry" -v "$HOME/.cargo/git:/cargo/git" \
+    -e CARGO_HOME=/cargo -e HOME=/tmp -w /src \
+    -e PKG_CONFIG_SYSROOT_DIR=/sysroot \
+    -e PKG_CONFIG_LIBDIR=/sysroot/usr/lib/pkgconfig:/sysroot/usr/share/pkgconfig \
+    -e PKG_CONFIG_ALLOW_CROSS=1 \
+    -e CC_aarch64_unknown_linux_gnu=clang -e CXX_aarch64_unknown_linux_gnu=clang++ \
+    -e CFLAGS_aarch64_unknown_linux_gnu="$flags" -e CXXFLAGS_aarch64_unknown_linux_gnu="$flags" \
+    -e BINDGEN_EXTRA_CLANG_ARGS="$flags" \
+    -e CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=clang \
+    -e CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=$TARGET_FLAG_T -C link-arg=--sysroot=/sysroot -C link-arg=-fuse-ld=lld" \
+    "$TOOLS_IMAGE" "$@"
+}
+TARGET_FLAG_T=--target=$TARGET
+
+case ${1:-build} in
+  sysroot) sysroot ;;
+  build)
+    in_tools cargo build --release --locked --target "$TARGET" -p omacam --features libcamera
+    ls -l "$ROOT/target/$TARGET/release/omacam" ;;
+  check)
+    in_tools cargo clippy --locked --target "$TARGET" -p omacam-libcamera -p omacam --features omacam/libcamera --all-targets -- -D warnings ;;
+  package)
+    "$0" build
+    conf=$(mktemp); cat /etc/makepkg.conf >"$conf"; echo 'CARCH="aarch64"' >>"$conf"
+    (cd "$ROOT/pkgbuild" && OMACAM_PREBUILT="$ROOT/target/$TARGET/release/omacam" makepkg -f --nodeps --config "$conf"); rm -f "$conf"
+    ls -l "$ROOT"/pkgbuild/omacam-*-aarch64.pkg.tar.* ;;
+  *) sed -n '2,20p' "$0"; exit 2 ;;
+esac
