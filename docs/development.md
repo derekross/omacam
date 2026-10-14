@@ -68,6 +68,10 @@ ssh phone 'cat > /usr/local/bin/omacam && chmod 755 /usr/local/bin/omacam' \
   the fake backend in real time: zooming across all lenses, a full still,
   flipping, and a busy camera that frees up.
 
+- **`scripts/ui-shots.sh`** takes screenshots of the UI on synthetic
+  frames at 480x1040 in a headless Weston inside a container (never on
+  your own desktop), into `target/ui-shots/`.
+
 ### On a phone someone is using
 
 The phone is someone's phone. Keep runs short, and leave the cameras

@@ -9,8 +9,8 @@ use omacam_core::backend::PixelLayout;
 
 /// JPEG quality: stock-like files without the size of 95+.
 pub const QUALITY: i32 = 92;
-/// Longest side of the thumbnail.
-pub const THUMB: u32 = 160;
+/// Side of the square thumbnail (twice the button, for scale 2).
+pub const THUMB: u32 = 112;
 
 /// A frame's pixels, as the backend gave them.
 pub struct Raw<'a> {
@@ -100,27 +100,25 @@ pub fn encode_jpeg(img: &Bgrx) -> Result<Vec<u8>> {
     Ok(jpeg.to_vec())
 }
 
-/// A small copy for the gallery button (nearest neighbour; it's tiny).
+/// A small square copy for the round gallery button: the centre square,
+/// scaled to [`THUMB`] pixels (nearest neighbour; it's tiny).
 pub fn thumbnail(img: &Bgrx) -> Bgrx {
-    let longest = img.width.max(img.height).max(1);
-    let s = (THUMB as f64 / longest as f64).min(1.0);
-    let (w, h) = (
-        ((img.width as f64 * s) as u32).max(1),
-        ((img.height as f64 * s) as u32).max(1),
-    );
-    let mut data = vec![0u8; (w * h * 4) as usize];
-    for y in 0..h {
-        for x in 0..w {
-            let sx = (x as u64 * img.width as u64 / w as u64) as usize;
-            let sy = (y as u64 * img.height as u64 / h as u64) as usize;
+    let side = img.width.min(img.height).max(1);
+    let (x0, y0) = ((img.width - side) / 2, (img.height - side) / 2);
+    let n = THUMB.min(side);
+    let mut data = vec![0u8; (n * n * 4) as usize];
+    for y in 0..n {
+        for x in 0..n {
+            let sx = x0 as usize + (x as u64 * side as u64 / n as u64) as usize;
+            let sy = y0 as usize + (y as u64 * side as u64 / n as u64) as usize;
             let si = (sy * img.width as usize + sx) * 4;
-            let di = ((y * w + x) * 4) as usize;
+            let di = ((y * n + x) * 4) as usize;
             data[di..di + 4].copy_from_slice(&img.data[si..si + 4]);
         }
     }
     Bgrx {
-        width: w,
-        height: h,
+        width: n,
+        height: n,
         data,
     }
 }
@@ -240,7 +238,7 @@ mod tests {
         let jpeg = encode_jpeg(&img).unwrap();
         assert_eq!(&jpeg[..2], &[0xff, 0xd8]);
         let t = thumbnail(&img);
-        assert_eq!((t.width, t.height), (160, 120));
+        assert_eq!((t.width, t.height), (112, 112));
     }
 
     #[test]

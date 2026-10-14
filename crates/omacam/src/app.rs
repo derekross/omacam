@@ -48,7 +48,7 @@ window.omacam, window.omacam viewfinder { background: black; }
   min-width: 56px; min-height: 56px; padding: 0; border-radius: 999px;
   background: rgba(255,255,255,0.16); color: white;
 }
-.thumb picture { border-radius: 999px; }
+
 .zoom-indicator, .status {
   color: white; font-weight: bold; background: rgba(0,0,0,0.5);
   border-radius: 999px; padding: 6px 14px;
@@ -109,7 +109,7 @@ struct App {
     shutter: gtk::Button,
     flip: gtk::Button,
     thumb: gtk::Button,
-    thumb_picture: gtk::Picture,
+    thumb_picture: gtk::Image,
     debug: gtk::Label,
 
     backend: RefCell<Option<Box<dyn Backend>>>,
@@ -220,13 +220,13 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
     pills.add_css_class("zoom-pills");
     pills.set_halign(gtk::Align::Center);
 
-    let thumb_picture = gtk::Picture::new();
-    thumb_picture.set_content_fit(gtk::ContentFit::Cover);
-    thumb_picture.set_size_request(56, 56);
+    let thumb_picture = gtk::Image::from_icon_name("image-x-generic-symbolic");
+    thumb_picture.set_pixel_size(22);
     let thumb = gtk::Button::new();
     thumb.set_child(Some(&thumb_picture));
     thumb.add_css_class("round-button");
     thumb.add_css_class("thumb");
+    thumb.set_overflow(gtk::Overflow::Hidden);
     thumb.set_valign(gtk::Align::Center);
     thumb.set_tooltip_text(Some("Last photo"));
     thumb.set_sensitive(false);
@@ -341,7 +341,7 @@ async fn run_script(app: Rc<App>, steps: Vec<crate::script::Step>) {
             }
             Step::Flip => app.flip.emit_clicked(),
             Step::Shutter => app.shutter.emit_clicked(),
-            Step::Shot(path) => match app.render_png(&path) {
+            Step::Shot(path) => match app.shot_after_paint(path.clone()).await {
                 Ok(()) => tracing::info!(path = %path.display(), "window saved"),
                 Err(e) => tracing::warn!(error = %e, "window not saved"),
             },
@@ -539,6 +539,7 @@ impl App {
                     thumb.width as usize * 4,
                 );
                 self.thumb_picture.set_paintable(Some(&tex));
+                self.thumb_picture.set_pixel_size(56);
                 self.thumb.set_sensitive(true);
                 tracing::info!(path = %path.display(), "photo saved");
                 *self.last_photo.borrow_mut() = Some(path);
@@ -950,6 +951,42 @@ impl App {
                 self.refresh();
             }
         }
+    }
+
+    /// Wait until the window has painted a frame (at most 500 ms), so its
+    /// render nodes are fresh for a snapshot.
+    async fn shot_after_paint(self: &Rc<Self>, path: PathBuf) -> anyhow::Result<()> {
+        let Some(clock) = self.window.frame_clock() else {
+            return self.render_png(&path);
+        };
+        let (tx, rx) = async_channel::bounded::<anyhow::Result<()>>(2);
+        let done = Rc::new(Cell::new(false));
+        let (app, p, t, d) = (Rc::downgrade(self), path.clone(), tx.clone(), done.clone());
+        // Snapshot inside the paint, while the render nodes are fresh.
+        let id = clock.connect_after_paint(move |_| {
+            if d.replace(true) {
+                return;
+            }
+            if let Some(a) = app.upgrade() {
+                let _ = t.try_send(a.render_png(&p));
+            }
+        });
+        // No paint (the panel is off): render what there is.
+        let app = Rc::downgrade(self);
+        glib::timeout_add_local_once(Duration::from_millis(500), move || {
+            if done.replace(true) {
+                return;
+            }
+            if let Some(a) = app.upgrade() {
+                let _ = tx.try_send(a.render_png(&path));
+            }
+        });
+        let result = rx
+            .recv()
+            .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("no result")));
+        clock.disconnect(id);
+        result
     }
 
     /// Render the window's content to a PNG, the way it is drawn on screen.
