@@ -65,6 +65,7 @@ fn chip(name: &str) -> (gtk::Button, gtk::Label, gtk::Label) {
     let button = gtk::Button::new();
     button.set_child(Some(&b));
     button.add_css_class("pro-chip");
+    button.add_css_class("turnable");
     (button, title, value)
 }
 
@@ -92,6 +93,7 @@ impl ProPanel {
         let histogram = gtk::ToggleButton::with_label("Hist");
         histogram.set_tooltip_text(Some("Histogram"));
         histogram.add_css_class("pro-chip");
+        histogram.add_css_class("turnable");
         row.append(&histogram);
         root.append(&editor);
         root.append(&row);

@@ -103,10 +103,7 @@ pub fn lock_from(meta: Option<&FrameMeta>) -> Controls {
         analog_gain: m.analog_gain,
         color_gains: m.color_gains,
         lens_position: m.lens_position,
-        af_continuous: false,
-        focus: None,
-        settings: None,
-        metering_window: None,
+        ..Controls::default()
     }
 }
 

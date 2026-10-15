@@ -149,6 +149,8 @@ struct Active {
     idle: Vec<Request>,
     /// Controls to put on the next queued request.
     pending_controls: Option<Controls>,
+    /// The configured mode's highest frame rate (FrameDurationLimits).
+    max_fps: Option<f64>,
     _alloc: FrameBufferAllocator,
 }
 
@@ -345,6 +347,7 @@ impl Worker {
                             size: a.size,
                             stride: a.stride,
                             layout: a.layout,
+                            max_fps: a.max_fps,
                         });
                         if let Some(message) = note {
                             (self.sink)(Event::Notice { message });
@@ -377,7 +380,11 @@ impl Worker {
                 controls,
             } => {
                 if let Some(a) = self.active.as_mut().filter(|a| a.generation == generation) {
-                    a.pending_controls = Some(controls);
+                    // Two changes before the next request both apply.
+                    a.pending_controls = Some(match a.pending_controls.take() {
+                        Some(older) => older.merged(controls),
+                        None => controls,
+                    });
                 }
             }
             Command::Release => {
@@ -519,6 +526,16 @@ impl Worker {
             )
         };
         cam.configure(&mut cfgs).map_err(at("configure"))?;
+        // The configured mode's frame durations, where the pipeline
+        // reports them: its shortest says how fast it can run.
+        let max_fps = range(
+            cam.controls(),
+            <controls::FrameDurationLimits as ControlEntry>::ID,
+        )
+        .map(|(min_us, _)| min_us)
+        .filter(|&us| us > 0.0)
+        .map(|us| 1e6 / us);
+        tracing::info!(generation, camera, ?max_fps, "frame rate");
         let stream = cfgs
             .get(0)
             .and_then(|sc| sc.stream())
@@ -570,6 +587,7 @@ impl Worker {
             lent: HashMap::new(),
             idle: Vec::new(),
             pending_controls: None,
+            max_fps,
             _alloc: alloc,
         };
         for r in requests {
@@ -874,6 +892,14 @@ fn set_controls(list: &mut ControlList, c: &Controls, exposure_hints: bool) {
     }
     if let Some(w) = &c.metering_window {
         set_window(list, w);
+    }
+    if let Some(w) = &c.af_window {
+        // Continuous AF follows this window from now on.
+        let _ = list.set(controls::AfMode::Continuous);
+        set_window(list, w);
+    }
+    if let Some(d) = c.frame_duration_us {
+        let _ = list.set(controls::FrameDurationLimits([d, d]));
     }
     if let Some(focus) = c.focus {
         // One scan: auto mode, the tapped window when the camera takes

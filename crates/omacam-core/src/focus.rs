@@ -21,7 +21,7 @@
 use std::time::{Duration, Instant};
 
 use crate::backend::{AfState, FocusRequest, FrameMeta, Rect};
-use crate::controller::Transform;
+use crate::framing::Transform;
 
 /// Side of the focus window, as a fraction of the shorter frame side.
 pub const WINDOW_FRACTION: f64 = 0.15;
@@ -33,11 +33,10 @@ pub const HOLD: Duration = Duration::from_secs(5);
 pub const NOTICE: Duration = Duration::from_millis(1500);
 
 /// A tap on the drawn picture back to a point on the frame, both
-/// normalized to 0..1.
+/// normalized to 0..1 (clamped to the frame where the tap falls on part
+/// of the picture the frame's mode doesn't cover).
 pub fn picture_to_frame(u: f64, v: f64, t: &Transform) -> (f64, f64) {
-    let scale = t.scale.max(1.0);
-    let u = 0.5 + (u - 0.5) / scale;
-    let v = 0.5 + (v - 0.5) / scale;
+    let (u, v) = crate::framing::view_to_upright(u, v, t);
     let u = if t.mirror { 1.0 - u } else { u };
     // The picture is the frame turned clockwise by `rotation`.
     let (x, y) = match t.rotation % 360 {
@@ -58,8 +57,7 @@ pub fn frame_to_picture(x: f64, y: f64, t: &Transform) -> (f64, f64) {
         _ => (x, y),
     };
     let u = if t.mirror { 1.0 - u } else { u };
-    let scale = t.scale.max(1.0);
-    (0.5 + (u - 0.5) * scale, 0.5 + (v - 0.5) * scale)
+    crate::framing::upright_to_view(u, v, t)
 }
 
 /// A focus window centered on a frame point, inside `area`.
@@ -91,6 +89,8 @@ pub enum Status {
     FixedFocus,
     /// The scan reported nothing (the lens didn't answer).
     Unavailable,
+    /// Continuous autofocus follows the tapped window (video).
+    Following,
 }
 
 /// The ring: where on the picture (0..1) and how it went.
@@ -203,6 +203,19 @@ impl FocusController {
         Some(request)
     }
 
+    /// A tap that moves continuous autofocus's window there (video): the
+    /// ring shows a moment, and continuous AF never stops.
+    pub fn follow(&mut self, u: f64, v: f64, now: Instant) {
+        self.state = State::Notice {
+            until: now + NOTICE,
+        };
+        self.indicator = Some(Indicator {
+            u,
+            v,
+            status: Status::Following,
+        });
+    }
+
     /// Metadata of a frame from the current stream.
     pub fn on_meta(&mut self, meta: &FrameMeta, now: Instant) {
         let State::Scanning { since, saw_state } = &mut self.state else {
@@ -277,6 +290,7 @@ mod tests {
             scale,
             rotation,
             mirror,
+            ..Transform::default()
         }
     }
 

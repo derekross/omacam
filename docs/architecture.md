@@ -16,10 +16,18 @@ omacam-core        no UI, no camera library; unit-tested
   switch           the stream state machine (stop one camera, start the next)
   capture          the still sequence (lock, reconfigure, discard, keep, restore)
   exposure         carrying exposure across a lens switch by aperture
+  exposure_control the Pro panel's settings, metering, AE/AF lock
+  focus            tap to focus: picture point to sensor window, the scan
+  framing          which part of each lens's frame a zoom shows
+  lowlight         the telephoto's low-light fallback to the main camera
+  stabilize        video stabilization from the gyroscope
+  orientation      how the phone is held
   controller       ties them together: input and events in, commands out
 omacam-libcamera   the backend on libcamera-rs, on its own thread
+omacam-record      the video recorder (GStreamer): frames and sound into MP4
 omacam-fake        a backend with synthetic frames, for tests and the laptop
-omacam             the GTK app: viewfinder, controls, JPEG writing, theme
+omacam             the GTK app: viewfinder, controls, JPEG writing, theme,
+                   sensors (accelerometer, gyroscope), GeoClue
 ```
 
 ## Data flow
@@ -88,22 +96,95 @@ only after the zoom has rested for 150 ms; a preset button switches at once
 and without hysteresis, so the 5 button lands on the telephoto.
 
 While a new lens starts, the last frame stays on screen and the zoom keeps
-applying to it, so the picture follows the fingers.
+applying to it, so the picture follows the fingers; when the new lens's
+first frame arrives, the old frame fades out over it in 180 ms instead of
+the picture cutting over.
 
 Zoom within a lens is a crop in the render transform (the software ISP
 doesn't apply `ScalerCrop`); the photo applies the same crop to the
-full-resolution frame.
+full-resolution frame, and the recorder to the video.
+
+### Framing every lens alike (`framing.rs`)
+
+A switch jumps when the two lenses frame the scene differently. Three
+things decide the framing, all in the lens table:
+
+- **The zoom factor** (`zoom`): the lens's field of view against the main
+  camera's, from Google's published fields of view.
+- **What the preview mode covers** (`coverage`): the main camera's
+  2016x1136 preview is the 2x2-binned middle of its 4080x3072 sensor: 99 %
+  of its width but only 74 % of its height. Up to 0.2.0 the viewfinder
+  fitted each lens's frame to the screen, so the main camera's 16:9 frame
+  showed the scene a third larger than the ultrawide's and telephoto's 4:3
+  frames at the same zoom, and the main camera's 4:3 photo held more than
+  its preview showed. Now the picture is each lens's whole field of view
+  (the still mode's, 4:3 on all three back cameras) and a preview frame is
+  drawn at its true size inside it: every lens fills the same rectangle at
+  the same scale. Near 1x on the main camera, the 16:9 preview leaves dark
+  bands at the sides of a 4:3 picture; the photo has picture there. (A 4:3
+  preview mode on the main camera, 2032x1536, waits on the camera
+  receiver: CAMERA-PLAN CAM-M.5b.) Derived from the preview and still
+  sizes unless the table says otherwise.
+- **Where each lens points** (`axis`): the lenses sit a centimeter or two
+  apart, so their pictures' centers differ. The view's center slides from
+  one lens's axis to the next one's as the zoom goes from the one's factor
+  to the other's (on the logarithm of the zoom), so at a switch the new
+  lens is centered where the old one's crop was. The axes are the center
+  until measured on our own frames (P4); the machinery and its tests are in
+  place.
+
+The viewfinder, tap to focus, photos (`framing::frame_window`) and the
+recorder all use the same transform, so what the screen shows is what the
+file gets.
+
+### Low light (`lowlight.rs`)
+
+The telephoto (f/3.5) gets about 3.6 times less light than the main camera
+(f/1.85). Stock falls back to a crop of the main camera when the light is
+too low for it, and so does omacam: exposure time times gain (analog and
+digital) from each preview frame, scaled by the square of the f-number
+ratio, says what the telephoto would need. Past 1/30 s at gain 8 (ISO 400)
+the scene is dim, and the main camera shows the telephoto's zoom with a
+"Low light: main camera" note; below half of that (a stop of hysteresis)
+it is bright again. Each must last (1.5 s to fall back, 3 s to come back)
+before anything switches, so the exposure settling after a switch doesn't
+flap the lenses. Any back lens judges the light, so 5x in the dark goes
+straight to the main camera.
+
+- **Never in the Pro panel:** there the lens is the one the zoom picks,
+  since the user is choosing the camera's settings by hand. Closing the
+  panel restores the fallback. The setting "Low-light lens" turns it off.
+- **Not for the ultrawide:** the main camera can't show a wider view than
+  its own, so falling back would change the framing, and f/2.2 is close
+  to the main camera's f/1.85 anyway.
+- **Not while recording or taking a photo:** the light isn't judged then,
+  so a video doesn't change lens on its own.
 
 ## Display (§3.2)
 
 Each frame becomes a texture drawn by the `Viewfinder` widget: turned
 upright, mirrored for the front camera, scaled by the zoom crop, and fitted
-whole into the area above the control bar. libcamera's `Rotation` property
+whole into the area above the control bar (the picture being the lens's
+whole field of view; see Framing above). libcamera's `Rotation` property
 is the correction to apply *counter-clockwise* (`property_ids_core.yaml`,
 "Example two - Phone camera"), so a frame is turned 360 - Rotation degrees
 clockwise: on today's device tree the main and front cameras (Rotation 90)
 turn 270° clockwise, the ultrawide and telephoto (270) turn 90°. Photos are
 turned the same way before encoding.
+
+### Turning the controls
+
+Held sideways, the layout stays portrait and the controls turn in place,
+as Android cameras do: the zoom buttons, the gallery, flip and settings
+buttons, the Pro chips, the zoom readout and the toasts turn a quarter
+(CSS `transform` with a 250 ms transition, from the accelerometer's
+orientation). The banners over the top of the picture (recording time,
+AE/AF lock, low light) move to the edge that is up and run along it. The
+words of the Photo/Video/Pro switch and the lens name stay level: turned,
+they would run into the rows above and below. The settings sheet stays
+portrait.
+
+### Display paths
 
 Two paths, `--display`:
 
@@ -151,6 +232,17 @@ Two paths, `--display`:
   they arrive (`appsrc do-timestamp`, a live `pipewiresrc`), so they stay
   together to within a frame plus the camera's own latency (about one
   frame). The sensor timestamps would tighten that later.
+- **60 fps** (2026-10-14, from the libcamera work): none of the cameras
+  offers it yet. libcamera's simple pipeline reports no
+  `FrameDurationLimits` and the sensor drivers default to 30 fps. A
+  libcamera patch is to report the limits per configured mode; then the
+  ultrawide and front cameras can run at 60 with no kernel change, and the
+  main and telephoto cameras later need a driver change. omacam reads the
+  configured mode's `FrameDurationLimits` at each start and offers 60
+  only where its minimum is 16.7 ms or less: then video mode asks for
+  `FrameDurationLimits` [16667, 16667] (photo mode for 30), a "60 FPS"
+  toggle shows beside the gear, and recording runs at 60 only if the
+  camera really delivers 50 fps or more, else at 30 with a note.
 - **Orientation.** The encoded frames are landscape; the camera's upright
   rotation goes into the file as its `image-orientation` tag, which mp4mux
   writes as the track's display matrix, so players show it upright.
@@ -187,10 +279,53 @@ or 1280x720 with square pixels (a fixed pixel aspect ratio: a zoom that
 changed it renegotiated the encoder, which mp4mux refused), and x264
 encodes it. The viewfinder shows the 9:16 frame the video records.
 
-While recording the lens doesn't change: the zoom crops the current lens
-(and stops at its own view, with a hint), and flip and photos wait.
-Switching lenses needs a stop and a start of the camera, about 300-600 ms
-of no frames, which a video can't hide. Videos go to
+**Switching lenses while recording.** The zoom picks lenses as it does for
+photos (back cameras only; flip and photos wait). The recorder keeps
+running: when the new camera starts, the camera thread hands the recorder
+its frame layout before its first frame (`Tap::set_input`), and the
+recorder sets the new caps on `appsrc`. The crop is set per frame where it
+meets `videocrop` (a pad probe: on the caps change, then per buffer by its
+timestamp), so frames still in flight from the old camera keep the old
+camera's crop, and the scale to the file's fixed size takes any frame size.
+A camera mounted the other way up (the main camera's frames turn 270°,
+the ultrawide's and telephoto's 90°) is turned half a turn by `videoflip`
+after scaling, where the frame is smallest, so the file's one orientation
+tag fits both. The stop and start of the camera, about 300-600 ms, shows as
+the last frame held: timestamps are the clock's, so the gap is real time,
+not a jump.
+
+**Stabilization** (`stabilize.rs`), with omamobile-sensors' gyroscope
+stream (`org.omamobile.SensorProxy.Gyro1`, claimed at 240 Hz while
+recording; SOCK_SEQPACKET records of time, rates, sequence). The video
+crops 10 % more than the view (`MARGIN`; the viewfinder in video mode
+shows that framing) and the crop moves with the shake: the gyroscope's
+rates, integrated, give the phone's turn; the turn smoothed over 0.5 s is
+the intended path; the difference, times the focal length (from the 35 mm
+equivalent and the picture's shape), is how far the scene moved, and the
+crop follows it, up to the margin (when it runs out, the path is pulled
+along, so a pan goes through with a short lag). Frames are matched to the
+gyroscope on CLOCK_MONOTONIC: gs201's receiver stamps SensorTimestamp at
+the end of the frame's DMA, so the exposure's middle is that less half the
+readout (an estimated 20 ms until measured per mode) and half the
+exposure. The gyroscope's small bias is a slow turn the path follows.
+Roll isn't corrected (it needs a rotation), nor is the rolling shutter.
+Without the stream (no proxy, an older one, or the front camera), videos
+aren't stabilized and the view isn't tightened. Axes: Android's device
+frame (x right, y up, z out of the screen); a turn about y moves the scene
+sideways, about x up and down; the signs want a check on the phone.
+
+**Location.** With location tags on, the newest GeoClue fix (at most 10
+minutes old) goes into photos (EXIF GPS: position, altitude, accuracy, the
+fix's UTC time) and videos. mp4mux writes no location from tags, so the
+recorder adds a `©xyz` box (ISO 6709, `+51.4779-000.0015/`, as Android and
+iOS write it) to the finished file's `moov`, which mp4mux writes last, so
+no media moves. Off by default (Q5). GeoClue answers a user's apps only
+while an authorization agent runs (omamobile-gnss's Location switch starts
+one); the package lists `omacam` in `/etc/geoclue/conf.d/91-omacam.conf` so
+the agent isn't asked about it. Tests use only neutral coordinates
+(Greenwich, 0/0).
+
+Videos go to
 `$XDG_VIDEOS_DIR/Camera` (`~/Videos/Camera`): desktop Linux keeps photos
 and videos in their own folders, and the file manager and players look
 there; Pixel's single DCIM folder is an Android convention.
@@ -206,6 +341,17 @@ Automatic by default, with manual control where the camera allows it:
   meters the same rectangle) and AfTrigger Start. Without AeMeteringMode
   the area is metered by brightness: its mean luma is brought to mid-gray
   (118 of 255) through `ExposureValue`, at most ±2 EV.
+- **Autofocus is continuous** by default, in photos and video (AfMode
+  Continuous where the camera has autofocus and focus is on auto). The
+  software ISP's contrast autofocus (Omarchy Mobile's libcamera patches
+  0005-0007) supports it and smooths its sharpness over about eight
+  frames, so it holds steady rather than hunting. In photos a tap runs one
+  scan on the tapped window (AfMode Auto, AfTrigger Start), holds it for 5
+  s, then continuous AF takes over again. In video a tap on a camera whose
+  AF takes windows moves continuous AF's window there instead (AfMode
+  Continuous, AfMetering Windows, AfWindows), so it keeps following that
+  spot without a visible scan; elsewhere it scans once, as in photos.
+  Recording starts with one scan. AE/AF lock holds focus with AfPause.
 - **The EV slider** appears beside the focus ring for a few seconds after
   a tap, -2..+2 EV on top of the metering; the next tap or a lens switch
   resets it.
@@ -260,15 +406,11 @@ active zoom button and the busy shutter take the theme's accent.
 
 ## Not built yet
 
-- Tap to focus and exposure compensation (need the libcamera patches L1,
-  L2 in Omarchy Mobile's `packages/libcamera`).
-- Location tags, the in-app viewer of recent shots.
-- Video: other frame rates, stabilization, lens switching while recording.
-- The on-screen controls don't turn with the phone yet.
-- Location tags: the EXIF GPS writer is done and tested (`exif::Gps`);
-  the setting stays off until omacam gets fixes from GeoClue.
+- The in-app viewer of recent shots, RAW, a level, HDR and night modes.
+- A stabilized preview (the file is stabilized; the viewfinder shows its
+  framing, not its steadiness), roll correction.
 - Exposure carried across a lens switch: computed (`exposure.rs`), passed to
   libcamera only with `--exposure-hints` until it's checked whether the
   simple IPA takes `ExposureTime` as a starting point or as manual exposure.
-- Calibration of the zoom factors and lens center offsets (P4); the
-  cross-fade at a switch.
+- Calibration of the zoom factors, lens axes and the sensors' readout
+  times (P4); the code takes them from the lens table.

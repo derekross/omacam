@@ -2,6 +2,7 @@
 
 mod app;
 mod exif;
+mod location;
 mod photo;
 mod prefs;
 mod pro;
@@ -77,6 +78,14 @@ pub struct Cli {
     /// Start at this zoom.
     #[arg(long)]
     zoom: Option<f64>,
+    /// With --fake: how bright the scene is (1 daylight indoors; 0.05 a
+    /// dim room, where the telephoto gives way to the main camera).
+    #[arg(long, default_value_t = 1.0)]
+    fake_light: f64,
+    /// With --fake: the frame rate every camera's mode reports (60 offers
+    /// 60 fps video).
+    #[arg(long)]
+    fake_fps: Option<f64>,
 }
 
 impl Cli {
@@ -115,7 +124,11 @@ pub fn spawn_backend(cli: &Cli, sink: EventSink) -> anyhow::Result<Box<dyn Backe
     if cli.fake {
         return Ok(Box::new(omacam_fake::FakeBackend::spawn(
             sink,
-            omacam_fake::Options::default(),
+            omacam_fake::Options {
+                scene_light: cli.fake_light,
+                max_fps: cli.fake_fps,
+                ..omacam_fake::Options::default()
+            },
         )));
     }
     #[cfg(feature = "libcamera")]

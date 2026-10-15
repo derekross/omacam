@@ -2,25 +2,40 @@
 //! the front camera, and cropped for the zoom, all in the render
 //! transform (no pixel copies).
 //!
-//! The frame is fitted inside the widget (the whole frame shows, as the
-//! picture will) and centered in the part above the controls when it fits
-//! there.
+//! The picture is the lens's whole field of view (its still mode's); a
+//! preview mode that covers less of it (the main camera's 16:9) is drawn
+//! at its true size inside it, so every lens frames the scene alike and a
+//! lens switch doesn't jump. The picture is fitted inside the widget (the
+//! whole of it shows, as the photo will) and centered in the part above
+//! the controls when it fits there.
+//!
+//! When the frames start coming from another camera (a lens switch, a
+//! flip), the last frame of the old one fades out over the new one
+//! ([`FADE`]), instead of the picture cutting from one to the other.
 
 use std::cell::{Cell, RefCell};
+use std::time::{Duration, Instant};
 
 use gtk::prelude::*;
 use gtk::subclass::prelude::*;
 use gtk::{gdk, glib, graphene, gsk};
 use gtk4 as gtk;
 
+/// How long the old camera's last frame takes to fade out at a switch.
+pub const FADE: Duration = Duration::from_millis(180);
+
 /// How to draw the current texture.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Placement {
-    /// Magnification about the center (the zoom crop).
+    /// Magnification about `center` (the zoom crop).
     pub scale: f64,
     /// Clockwise degrees to turn the frame upright.
     pub rotation: u32,
     pub mirror: bool,
+    /// The view's center on the picture (upright, 0..1).
+    pub center: (f64, f64),
+    /// The share of the picture the frame covers, upright.
+    pub coverage: (f64, f64),
 }
 
 impl Default for Placement {
@@ -29,7 +44,33 @@ impl Default for Placement {
             scale: 1.0,
             rotation: 0,
             mirror: false,
+            center: (0.5, 0.5),
+            coverage: (1.0, 1.0),
         }
+    }
+}
+
+impl Placement {
+    /// The upright size of a frame of `tex` size, and of the picture it
+    /// covers part of.
+    fn sizes(&self, tex: (f32, f32)) -> ((f32, f32), (f32, f32)) {
+        let upright = if self.rotation % 180 == 90 {
+            (tex.1, tex.0)
+        } else {
+            tex
+        };
+        let cov = |c: f64| {
+            if c.is_finite() && c > 0.0 {
+                c.min(1.0) as f32
+            } else {
+                1.0
+            }
+        };
+        let picture = (
+            upright.0 / cov(self.coverage.0),
+            upright.1 / cov(self.coverage.1),
+        );
+        (upright, picture)
     }
 }
 
@@ -61,6 +102,14 @@ fn visible_source(frame: (f32, f32), scale: f64) -> (f32, f32, f32, f32) {
     ((frame.0 - w) / 2.0, (frame.1 - h) / 2.0, w, h)
 }
 
+/// The old camera's last frame, fading out over the new one's.
+#[derive(Clone)]
+pub struct Fading {
+    pub texture: gdk::Texture,
+    pub placement: Placement,
+    pub since: Instant,
+}
+
 mod imp {
     use super::*;
 
@@ -69,6 +118,8 @@ mod imp {
         pub texture: RefCell<Option<gdk::Texture>>,
         pub placement: Cell<Placement>,
         pub decor: RefCell<Decor>,
+        pub fading: RefCell<Option<Fading>>,
+        pub fade_tick: RefCell<Option<gtk::TickCallbackId>>,
     }
 
     #[glib::object_subclass]
@@ -87,57 +138,54 @@ mod imp {
     impl WidgetImpl for Viewfinder {
         fn snapshot(&self, snapshot: &gtk::Snapshot) {
             let widget = self.obj();
+            let fading = self.fading.borrow().clone().and_then(|f| {
+                let t = f.since.elapsed().as_secs_f32() / FADE.as_secs_f32();
+                (t < 1.0).then_some((f, 1.0 - t))
+            });
             draw(
                 snapshot,
                 (widget.width() as f32, widget.height() as f32),
                 self.texture.borrow().as_ref(),
                 self.placement.get(),
                 &self.decor.borrow(),
+                fading.as_ref().map(|(f, a)| (&f.texture, f.placement, *a)),
             );
         }
     }
 }
 
-/// Draw `texture` placed as `p` in a `size` area with `inset` pixels of
-/// controls at the bottom.
+/// Draw `texture` placed as `p` in a `size` area, with the old camera's
+/// last frame (`fading`: texture, placement, opacity) over it.
 pub fn draw(
     snapshot: &gtk::Snapshot,
     size: (f32, f32),
     texture: Option<&gdk::Texture>,
     p: Placement,
     decor: &Decor,
+    fading: Option<(&gdk::Texture, Placement, f32)>,
 ) {
     let (w, h) = size;
     snapshot.append_color(&gdk::RGBA::BLACK, &graphene::Rect::new(0.0, 0.0, w, h));
     let Some(tex) = texture else {
         return;
     };
-    let (tw, th) = (tex.width() as f32, tex.height() as f32);
-    let quarter = p.rotation % 180 == 90;
-    let upright = if quarter { (th, tw) } else { (tw, th) };
-    let shown = crop_to_aspect(upright, decor.aspect);
+    let (_, picture) = p.sizes((tex.width() as f32, tex.height() as f32));
+    let shown = crop_to_aspect(picture, decor.aspect);
     let rect = fit(shown, (w, h), 0.0);
-    // Pixels of screen per pixel of frame.
-    let s = rect.width() / shown.0;
     snapshot.push_clip(&rect);
-    snapshot.save();
-    snapshot.translate(&graphene::Point::new(
-        rect.x() + rect.width() / 2.0,
-        rect.y() + rect.height() / 2.0,
-    ));
-    let zoom = p.scale as f32;
-    snapshot.scale(zoom, zoom);
-    if p.mirror {
-        snapshot.scale(-1.0, 1.0);
+    // The picture's area, a shade off black: where the frame's mode
+    // doesn't reach (the main camera's 16:9 near 1x), the photo still
+    // has picture.
+    snapshot.append_color(&gdk::RGBA::new(0.07, 0.07, 0.07, 1.0), &rect);
+    draw_frame(snapshot, &rect, shown, tex, p);
+    if let Some((old, op, alpha)) = fading {
+        // The old frame in its own picture, fitted to the same rectangle.
+        let (_, old_picture) = op.sizes((old.width() as f32, old.height() as f32));
+        let old_shown = crop_to_aspect(old_picture, decor.aspect);
+        snapshot.push_opacity(alpha.clamp(0.0, 1.0) as f64);
+        draw_frame(snapshot, &rect, old_shown, old, op);
+        snapshot.pop();
     }
-    snapshot.rotate(p.rotation as f32);
-    let (dw, dh) = (tw * s, th * s);
-    snapshot.append_scaled_texture(
-        tex,
-        gsk::ScalingFilter::Linear,
-        &graphene::Rect::new(-dw / 2.0, -dh / 2.0, dw, dh),
-    );
-    snapshot.restore();
     if decor.grid > 1 {
         let line = gdk::RGBA::new(1.0, 1.0, 1.0, 0.35);
         for i in 1..decor.grid {
@@ -171,7 +219,7 @@ pub fn draw(
         }
     }
     if let Some(ring) = decor.ring {
-        let (ur, vr) = picture_to_shown(ring.u, ring.v, upright, shown);
+        let (ur, vr) = picture_to_shown(ring.u, ring.v, picture, shown);
         let (cx, cy) = (
             rect.x() + rect.width() * ur as f32,
             rect.y() + rect.height() * vr as f32,
@@ -181,6 +229,45 @@ pub fn draw(
         let rounded = gsk::RoundedRect::from_rect(bounds, r);
         snapshot.append_border(&rounded, &[2.5; 4], &[ring.color; 4]);
     }
+}
+
+/// Draw one frame into `rect`, the fitted `shown` part of its picture:
+/// zoomed about the view's center, mirrored, turned upright, at the size
+/// its coverage of the picture gives it.
+fn draw_frame(
+    snapshot: &gtk::Snapshot,
+    rect: &graphene::Rect,
+    shown: (f32, f32),
+    tex: &gdk::Texture,
+    p: Placement,
+) {
+    let (tw, th) = (tex.width() as f32, tex.height() as f32);
+    let (_, picture) = p.sizes((tw, th));
+    // Pixels of screen per pixel of frame.
+    let s = rect.width() / shown.0;
+    snapshot.save();
+    snapshot.translate(&graphene::Point::new(
+        rect.x() + rect.width() / 2.0,
+        rect.y() + rect.height() / 2.0,
+    ));
+    let zoom = p.scale.max(1.0) as f32;
+    snapshot.scale(zoom, zoom);
+    // The view's center to the middle.
+    snapshot.translate(&graphene::Point::new(
+        -((p.center.0 - 0.5) as f32) * picture.0 * s,
+        -((p.center.1 - 0.5) as f32) * picture.1 * s,
+    ));
+    if p.mirror {
+        snapshot.scale(-1.0, 1.0);
+    }
+    snapshot.rotate(p.rotation as f32);
+    let (dw, dh) = (tw * s, th * s);
+    snapshot.append_scaled_texture(
+        tex,
+        gsk::ScalingFilter::Linear,
+        &graphene::Rect::new(-dw / 2.0, -dh / 2.0, dw, dh),
+    );
+    snapshot.restore();
 }
 
 /// What the viewfinder draws over the picture.
@@ -282,6 +369,40 @@ impl Viewfinder {
         self.queue_draw();
     }
 
+    /// Show the first frame of another camera: the current frame fades
+    /// out over it.
+    pub fn switch_to(&self, texture: gdk::Texture, placement: Placement) {
+        let old = self.imp().texture.replace(Some(texture));
+        let old_placement = self.imp().placement.replace(placement);
+        if let Some(old) = old {
+            self.imp().fading.replace(Some(Fading {
+                texture: old,
+                placement: old_placement,
+                since: Instant::now(),
+            }));
+            if self.imp().fade_tick.borrow().is_none() {
+                let id = self.add_tick_callback(|vf, _| {
+                    let done = vf
+                        .imp()
+                        .fading
+                        .borrow()
+                        .as_ref()
+                        .is_none_or(|f| f.since.elapsed() >= FADE);
+                    vf.queue_draw();
+                    if done {
+                        vf.imp().fading.replace(None);
+                        vf.imp().fade_tick.replace(None);
+                        glib::ControlFlow::Break
+                    } else {
+                        glib::ControlFlow::Continue
+                    }
+                });
+                self.imp().fade_tick.replace(Some(id));
+            }
+        }
+        self.queue_draw();
+    }
+
     /// Change how the current frame is drawn (zoom on a frozen frame).
     pub fn set_placement(&self, placement: Placement) {
         if self.imp().placement.replace(placement) != placement {
@@ -313,15 +434,10 @@ impl Viewfinder {
     pub fn widget_point(&self, u: f64, v: f64) -> Option<(f32, f32)> {
         let tex = self.texture()?;
         let p = self.placement();
-        let (tw, th) = (tex.width() as f32, tex.height() as f32);
-        let upright = if p.rotation % 180 == 90 {
-            (th, tw)
-        } else {
-            (tw, th)
-        };
-        let shown = crop_to_aspect(upright, self.decor().aspect);
+        let (_, picture) = p.sizes((tex.width() as f32, tex.height() as f32));
+        let shown = crop_to_aspect(picture, self.decor().aspect);
         let rect = fit(shown, (self.width() as f32, self.height() as f32), 0.0);
-        let (su, sv) = picture_to_shown(u, v, upright, shown);
+        let (su, sv) = picture_to_shown(u, v, picture, shown);
         Some((
             rect.x() + rect.width() * su as f32,
             rect.y() + rect.height() * sv as f32,
@@ -332,17 +448,12 @@ impl Viewfinder {
     pub fn picture_point(&self, x: f64, y: f64) -> Option<(f64, f64)> {
         let tex = self.texture()?;
         let p = self.placement();
-        let (tw, th) = (tex.width() as f32, tex.height() as f32);
-        let upright = if p.rotation % 180 == 90 {
-            (th, tw)
-        } else {
-            (tw, th)
-        };
+        let (_, picture) = p.sizes((tex.width() as f32, tex.height() as f32));
         widget_to_picture(
             x as f32,
             y as f32,
             (self.width() as f32, self.height() as f32),
-            upright,
+            picture,
             self.decor().aspect,
         )
     }
@@ -425,6 +536,59 @@ mod tests {
             }
             z += 0.05;
         }
+    }
+
+    /// The pictures of the Pixel 7 Pro's back lenses have one shape (their
+    /// 4:3 sensors' whole view), whatever their preview modes crop, so a
+    /// lens switch keeps the picture's size on screen; and at each switch
+    /// zoom the scene shows at the same scale (screen pixels per degree).
+    #[test]
+    fn back_lenses_share_the_picture_shape_and_scale_at_switches() {
+        use omacam_core::controller::Options;
+        use omacam_core::zoom::ZoomSource;
+        use omacam_core::Controller;
+        let cams = omacam_fake::cheetah_cameras();
+        let spec = omacam_core::lens::TableSpec::cheetah();
+        let table = spec.resolve(&cams);
+        let mut c = Controller::new(&spec, &cams, Options::default());
+        let now = std::time::Instant::now();
+        let widget = (456.0f32, 730.0f32);
+        // Screen pixels per unit of the main camera's field of view along
+        // the picture's height, for one lens at one zoom.
+        let mut per_view = |id: &str, zoom: f64| {
+            c.set_zoom(zoom, ZoomSource::Preset, now);
+            let lens = table.get(table.index_of(id).unwrap());
+            let t = c.transform(id).unwrap();
+            let p = Placement {
+                scale: t.scale,
+                rotation: t.rotation,
+                mirror: t.mirror,
+                center: t.center,
+                coverage: t.coverage,
+            };
+            let pv = lens.preview.unwrap();
+            let (_, picture) = p.sizes((pv.width as f32, pv.height as f32));
+            let r = fit(picture, widget, 0.0);
+            assert!(
+                (picture.0 / picture.1 - 0.75).abs() < 0.01,
+                "{id}: {picture:?}"
+            );
+            // The picture's height is 1 / lens.zoom of the main's view;
+            // zoomed by the scale.
+            r.height() as f64 * t.scale * lens.zoom
+        };
+        let id = |role| table.get(table.by_role(role).unwrap()).id.clone();
+        let (uw, main, tele) = (
+            id(omacam_core::Role::Ultrawide),
+            id(omacam_core::Role::Main),
+            id(omacam_core::Role::Tele),
+        );
+        let a = per_view(&uw, 0.9999);
+        let b = per_view(&main, 1.0);
+        assert!((a / b - 1.0).abs() < 0.01, "ultrawide {a} main {b}");
+        let a = per_view(&main, 4.78);
+        let b = per_view(&tele, 4.78);
+        assert!((a / b - 1.0).abs() < 0.01, "main {a} tele {b}");
     }
 
     #[test]

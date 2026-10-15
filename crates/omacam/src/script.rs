@@ -5,7 +5,8 @@
 //! pinch that ends at Z), `flip`, `shutter`, `tap U V` (a tap on the
 //! picture), `settings PAGE` and `close-settings`, `shot PATH` (the window
 //! as a PNG, rendered by the app itself, so it works with the panel off),
-//! and `quit`.
+//! `hold normal|left|right|upside-down` (as if the accelerometer said the
+//! phone is held so), and `quit`.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -35,6 +36,8 @@ pub enum Step {
     Lock,
     /// The EV slider.
     Ev(f64),
+    /// How the phone is held, as the accelerometer would say.
+    Hold(String),
     Quit,
 }
 
@@ -92,6 +95,9 @@ pub fn parse(text: &str) -> Result<Vec<Step>, String> {
                     _ => return Err(format!("tap: needs two numbers in 0..1, got {arg:?}")),
                 }
             }
+            "hold" if matches!(arg, "normal" | "left" | "right" | "upside-down") => {
+                Step::Hold(arg.into())
+            }
             "quit" => Step::Quit,
             other => return Err(format!("unknown step {other:?}")),
         });
@@ -143,6 +149,8 @@ mod tests {
             ]
         );
         assert_eq!(parse("tap 0.25 0.75").unwrap(), vec![Step::Tap(0.25, 0.75)]);
+        assert_eq!(parse("hold left").unwrap(), vec![Step::Hold("left".into())]);
+        assert!(parse("hold sideways").is_err());
         assert_eq!(
             parse("settings video; close-settings").unwrap(),
             vec![Step::Settings("video".into()), Step::CloseSettings]

@@ -94,6 +94,13 @@ pub struct Options {
     /// Largest frame the fake renders; bigger requests are scaled down so
     /// tests stay fast. The reported size is the rendered one.
     pub max_size: Size,
+    /// How bright the scene is: 1 needs 10 ms at gain 1 on the main
+    /// camera's aperture; 0.05 is a dim room, where the tele runs out of
+    /// exposure and gain.
+    pub scene_light: f64,
+    /// The highest frame rate every camera's modes report (as libcamera's
+    /// FrameDurationLimits would); None reports none.
+    pub max_fps: Option<f64>,
 }
 
 impl Default for Options {
@@ -104,6 +111,8 @@ impl Default for Options {
             frame_interval: Duration::from_millis(33),
             default_size: Size::new(640, 480),
             max_size: Size::new(1008, 760),
+            scene_light: 1.0,
+            max_fps: None,
         }
     }
 }
@@ -119,7 +128,7 @@ pub struct Faults {
 }
 
 enum Msg {
-    Cmd(Command),
+    Cmd(Box<Command>),
     /// The cameras change, as when drivers load late or one goes away.
     SetCameras(Vec<CameraInfo>),
     Quit,
@@ -158,7 +167,7 @@ impl FakeBackend {
 
 impl Backend for FakeBackend {
     fn send(&self, command: Command) {
-        let _ = self.tx.send(Msg::Cmd(command));
+        let _ = self.tx.send(Msg::Cmd(Box::new(command)));
     }
 }
 
@@ -184,6 +193,30 @@ struct Stream {
     /// The exposure settings in force (kept across partial updates).
     settings: omacam_core::backend::ExposureSettings,
     tint: [u8; 3],
+    /// Light lost to the lens's aperture against the main camera's:
+    /// (f / 1.85)².
+    aperture: f64,
+}
+
+/// The aperture of the Pixel 7 Pro's cameras by sensor model, against the
+/// main camera's f/1.85: how much more exposure they need.
+fn aperture_factor(model: &str) -> f64 {
+    let f = match model {
+        "s5kgm5" => 3.5,
+        "imx386" | "s5k3j1" => 2.2,
+        _ => 1.85,
+    };
+    (f / 1.85f64).powi(2)
+}
+
+/// What a simple AE settles on for `demand` (microseconds at gain 1):
+/// exposure up to a frame's time, then analog gain up to 16, then digital
+/// gain.
+fn auto_exposure(demand: f64) -> (i32, f32, f32) {
+    let t = demand.clamp(100.0, 33_333.0);
+    let g = (demand / t).max(1.0);
+    let analog = g.min(16.0);
+    (t as i32, analog as f32, (g / analog) as f32)
 }
 
 fn tint(id: &str) -> [u8; 3] {
@@ -328,6 +361,11 @@ fn handle(
             *stream = Some(Stream {
                 generation,
                 tint: tint(&camera),
+                aperture: cameras
+                    .iter()
+                    .find(|c| c.id == camera)
+                    .map(|c| aperture_factor(&c.model))
+                    .unwrap_or(1.0),
                 camera,
                 size: fit(size.expect("checked"), opts.max_size),
                 started_at: now + opts.start_delay,
@@ -374,6 +412,7 @@ fn step(s: &mut Stream, sink: &EventSink, opts: &Options, epoch: Instant) {
                 size: s.size,
                 stride: s.size.width * 4,
                 layout: PixelLayout::Xrgb8888,
+                max_fps: opts.max_fps,
             });
             if let Some(message) = s.notice.take() {
                 sink(Event::Notice { message });
@@ -384,11 +423,13 @@ fn step(s: &mut Stream, sink: &EventSink, opts: &Options, epoch: Instant) {
     if now < s.next_frame {
         return;
     }
-    // An auto-exposure that walks from the start hint towards 10 ms over a
-    // few frames, like the soft ISP's AGC.
-    let start = s.controls.exposure_us.unwrap_or(10_000) as f64;
+    // An auto-exposure that walks from the start hint towards what the
+    // scene needs over a few frames, like the soft ISP's AGC.
+    let demand = 10_000.0 * s.aperture / opts.scene_light.max(1e-4);
+    let (settle_t, settle_gain, digital) = auto_exposure(demand);
+    let start = s.controls.exposure_us.unwrap_or(settle_t) as f64;
     let k = 0.5f64.powi(s.sequence.min(30) as i32);
-    let exposure = (10_000.0 + (start - 10_000.0) * k) as i32;
+    let exposure = (settle_t as f64 + (start - settle_t as f64) * k) as i32;
     sink(Event::Frame(Frame {
         generation: s.generation,
         camera: s.camera.clone(),
@@ -400,7 +441,8 @@ fn step(s: &mut Stream, sink: &EventSink, opts: &Options, epoch: Instant) {
             sequence: s.sequence,
             timestamp_ns: now.duration_since(epoch).as_nanos() as u64,
             exposure_us: Some(s.settings.shutter.manual().unwrap_or(exposure)),
-            analog_gain: Some(s.settings.gain.manual().unwrap_or(1.0)),
+            analog_gain: Some(s.settings.gain.manual().unwrap_or(settle_gain)),
+            digital_gain: Some(digital),
             lens_position: Some(s.settings.lens.manual().unwrap_or(0.5)),
             ..FrameMeta::default()
         },
@@ -423,7 +465,7 @@ fn run(rx: mpsc::Receiver<Msg>, sink: EventSink, opts: Options, faults: Arc<Mute
         };
         match rx.recv_timeout(wake.saturating_duration_since(now)) {
             Ok(Msg::Quit) | Err(RecvTimeoutError::Disconnected) => return,
-            Ok(Msg::Cmd(cmd)) => handle(cmd, &mut stream, &sink, &opts, &cameras, &faults),
+            Ok(Msg::Cmd(cmd)) => handle(*cmd, &mut stream, &sink, &opts, &cameras, &faults),
             Ok(Msg::SetCameras(list)) => {
                 if stream
                     .as_ref()
@@ -470,6 +512,7 @@ mod tests {
             controls: Controls::default(),
             settings: Default::default(),
             tint: [100, 100, 100],
+            aperture: 1.0,
         };
         let px = render(&s);
         let at = |x: usize, y: usize| px[(y * 64 + x) * 4..(y * 64 + x) * 4 + 3].to_vec();

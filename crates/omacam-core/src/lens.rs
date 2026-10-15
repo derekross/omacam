@@ -56,6 +56,34 @@ pub struct Lens {
     /// counter-clockwise). Filled from the camera's own Rotation property
     /// unless the table overrides it. See [`Lens::upright_clockwise`].
     pub rotation: u32,
+    /// How much of the lens's whole field of view (its still mode's) the
+    /// preview mode shows, along the frame's width and height: a 16:9
+    /// mode of a 4:3 sensor keeps the width and crops the height. From the
+    /// table, else derived from the preview and still sizes.
+    pub coverage: (f64, f64),
+    /// Where this lens's optical axis lands on the main camera's upright
+    /// picture (0..1; the main camera's own is the center). The lenses sit
+    /// a centimeter or two apart, so a lens switch shifts the crop by the
+    /// difference to keep the subject still. From the table; the center
+    /// until calibrated.
+    pub axis: (f64, f64),
+}
+
+/// The share of a still mode's field of view that a preview mode shows,
+/// along the frame's width and height. Sensors bin by a whole factor and
+/// crop about the center, so the binning factor is the still width over
+/// the preview width, rounded, and each side covers its binned size over
+/// the still's.
+pub fn derived_coverage(preview: Option<Size>, still: Option<Size>) -> (f64, f64) {
+    let (Some(p), Some(s)) = (preview, still) else {
+        return (1.0, 1.0);
+    };
+    if p.width == 0 || p.height == 0 || s.width == 0 || s.height == 0 {
+        return (1.0, 1.0);
+    }
+    let bin = (s.width as f64 / p.width as f64).round().max(1.0);
+    let side = |pv: u32, st: u32| (pv as f64 * bin / st as f64).min(1.0);
+    (side(p.width, s.width), side(p.height, s.height))
 }
 
 /// Clockwise degrees that turn a frame upright, for a camera whose
@@ -103,6 +131,11 @@ struct LensEntry {
     #[serde(default)]
     mirror: bool,
     rotation: Option<u32>,
+    /// The preview mode's share of the field of view, [width, height] of
+    /// the frame (see [`Lens::coverage`]).
+    coverage: Option<[f64; 2]>,
+    /// Where the optical axis lands on the main camera's upright picture.
+    axis: Option<[f64; 2]>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -142,6 +175,23 @@ impl TableSpec {
         for e in &file.lenses {
             if !(e.zoom.is_finite() && e.zoom > 0.0) {
                 return Err(TableError::Invalid(format!("{}: zoom must be > 0", e.id)));
+            }
+            let unit = |v: Option<[f64; 2]>, lo: f64| {
+                v.is_none_or(|[a, b]| {
+                    a.is_finite() && b.is_finite() && a > lo && b > lo && a <= 1.0 && b <= 1.0
+                })
+            };
+            if !unit(e.coverage, 0.0) {
+                return Err(TableError::Invalid(format!(
+                    "{}: coverage must be in (0, 1]",
+                    e.id
+                )));
+            }
+            if !unit(e.axis, -1.0) || e.axis.is_some_and(|[a, b]| a < 0.0 || b < 0.0) {
+                return Err(TableError::Invalid(format!(
+                    "{}: axis must be in [0, 1]",
+                    e.id
+                )));
             }
             if let Some(r) = e.rotation {
                 if r % 90 != 0 || r >= 360 {
@@ -204,6 +254,13 @@ impl TableSpec {
                     base_iso: e.base_iso.unwrap_or(DEFAULT_BASE_ISO),
                     mirror: e.mirror,
                     rotation: e.rotation.unwrap_or(cam.rotation % 360),
+                    coverage: e.coverage.map(|[a, b]| (a, b)).unwrap_or_else(|| {
+                        derived_coverage(
+                            e.preview.map(|[w, h]| Size::new(w, h)),
+                            e.still.map(|[w, h]| Size::new(w, h)),
+                        )
+                    }),
+                    axis: e.axis.map(|[a, b]| (a, b)).unwrap_or((0.5, 0.5)),
                 });
             }
         }
@@ -236,6 +293,8 @@ impl TableSpec {
                 base_iso: DEFAULT_BASE_ISO,
                 mirror: role == Role::Front,
                 rotation: cam.rotation % 360,
+                coverage: (1.0, 1.0),
+                axis: (0.5, 0.5),
             });
         }
         LensTable {
@@ -377,6 +436,43 @@ mod tests {
         assert_eq!(upright_clockwise(180), 180);
         assert_eq!(upright_clockwise(270), 90);
         assert_eq!(upright_clockwise(360), 0);
+    }
+
+    #[test]
+    fn coverage_is_derived_from_the_modes() {
+        let t = TableSpec::cheetah().resolve(&cheetah_cameras());
+        let cov = |role| t.get(t.by_role(role).unwrap()).coverage;
+        // The main camera's 2016x1136 is the 2x2-binned center of its
+        // 4080x3072: nearly the whole width, 74 % of the height.
+        let (w, h) = cov(Role::Main);
+        assert!((w - 4032.0 / 4080.0).abs() < 1e-9, "{w}");
+        assert!((h - 2272.0 / 3072.0).abs() < 1e-9, "{h}");
+        assert_eq!(cov(Role::Ultrawide), (1.0, 1.0));
+        assert_eq!(cov(Role::Tele), (1.0, 1.0));
+        assert_eq!(derived_coverage(None, Some(Size::new(4, 3))), (1.0, 1.0));
+        assert_eq!(
+            derived_coverage(Some(Size::new(640, 480)), Some(Size::new(640, 480))),
+            (1.0, 1.0)
+        );
+    }
+
+    #[test]
+    fn coverage_and_axis_from_the_table_are_checked() {
+        let base = "[[lens]]\nrole = \"main\"\nid = \"a\"\nzoom = 1.0\n";
+        let cams = vec![CameraInfo {
+            id: "a".into(),
+            ..CameraInfo::default()
+        }];
+        let t = TableSpec::parse(&format!(
+            "{base}coverage = [1.0, 0.75]\naxis = [0.52, 0.49]\n"
+        ))
+        .unwrap()
+        .resolve(&cams);
+        assert_eq!(t.get(0).coverage, (1.0, 0.75));
+        assert_eq!(t.get(0).axis, (0.52, 0.49));
+        assert!(TableSpec::parse(&format!("{base}coverage = [0.0, 1.0]\n")).is_err());
+        assert!(TableSpec::parse(&format!("{base}coverage = [1.2, 1.0]\n")).is_err());
+        assert!(TableSpec::parse(&format!("{base}axis = [-0.1, 0.5]\n")).is_err());
     }
 
     #[test]

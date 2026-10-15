@@ -95,6 +95,23 @@ scale.zoom-slider { color: white; }
   border-radius: 999px; padding: 4px 12px;
 }
 scale.ev-slider { color: #ffd54f; }
+.note-chip {
+  background: rgba(0,0,0,0.6); color: #ffd54f; font-weight: bold; font-size: 12px;
+  border-radius: 999px; padding: 4px 12px;
+}
+.fps-toggle {
+  min-height: 32px; min-width: 52px; padding: 0 8px; border-radius: 999px;
+  background: rgba(0,0,0,0.45); color: white; font-weight: bold; font-size: 12px;
+  box-shadow: none;
+}
+.fps-toggle:checked { color: var(--accent-bg-color); }
+
+/* Held sideways, the controls turn in place (the layout stays portrait),
+   as phone cameras do. */
+.turnable { transition: transform 250ms ease-out; }
+window.turn-90 .turnable, window.turn-90 toast { transform: rotate(-90deg); }
+window.turn-270 .turnable, window.turn-270 toast { transform: rotate(90deg); }
+window.turn-180 .turnable, window.turn-180 toast { transform: rotate(180deg); }
 
 "#;
 
@@ -178,6 +195,9 @@ struct App {
     pro_panel: RefCell<Option<Rc<crate::pro::ProPanel>>>,
     picture_bottom: gtk::Box,
     lock_chip: gtk::Label,
+    low_light_chip: gtk::Box,
+    fps_toggle: gtk::ToggleButton,
+    setting_fps: Cell<bool>,
     ev_slider: gtk::Scale,
     setting_ev: Cell<bool>,
     /// The EV slider shows until then (after a tap or a drag).
@@ -199,19 +219,161 @@ struct App {
     gear: gtk::Button,
     rec_label: gtk::Label,
     recording: RefCell<Option<Recording>>,
-    /// The recording's camera and its frame tap, for the camera thread.
-    rec_tap: Arc<Mutex<Option<(String, omacam_record::Tap)>>>,
+    /// The recording's link to the camera thread.
+    rec_tap: Arc<Mutex<Option<RecLink>>>,
     /// How the phone is held (the accelerometer).
     held: Rc<Cell<DeviceOrientation>>,
-    _sensor: Option<crate::sensors::Accelerometer>,
+    sensor: RefCell<Option<crate::sensors::Accelerometer>>,
+    /// The controls turned for a phone held this way (degrees clockwise).
+    controls_turn: Cell<u32>,
+    /// The phone has a gyroscope stream (videos can be stabilized).
+    has_gyro: bool,
+    /// GeoClue, while location tags are on.
+    locator: RefCell<Option<crate::location::Locator>>,
 }
 
 /// A recording in progress.
 struct Recording {
     recorder: omacam_record::Recorder,
-    camera: String,
     since: Instant,
-    zoom: f64,
+    _gyro: Option<crate::sensors::gyro::Gyroscope>,
+}
+
+/// One back camera a recording can take its frames from: its frames'
+/// geometry and the view of it that matches the others'.
+#[derive(Debug, Clone, Copy)]
+struct RecLens {
+    /// Clockwise degrees that turn its frames upright.
+    rotation: u32,
+    mirror: bool,
+    /// The share of its picture the preview mode covers, frame axes.
+    coverage: (f64, f64),
+    /// The view, frame axes, margin for stabilization included.
+    view: omacam_record::View,
+    /// Focal length over the upright picture's sides.
+    focal: (f64, f64),
+    /// The zoom crop (for how far stabilization may move it).
+    scale: f64,
+}
+
+/// What the camera thread needs to feed a recording: the tap, the camera
+/// it takes frames from, the cameras it may switch to, the stabilizer.
+struct RecLink {
+    tap: omacam_record::Tap,
+    camera: String,
+    lenses: std::collections::HashMap<String, RecLens>,
+    /// The upright turn of the camera recording started on (the file's).
+    base_rotation: u32,
+    stabilizer: Option<Arc<Mutex<omacam_core::stabilize::Stabilizer>>>,
+}
+
+impl RecLink {
+    /// Another camera started: its frames feed the recording from now
+    /// on, when it's one the recording may switch to.
+    fn camera_started(
+        &mut self,
+        camera: &str,
+        size: omacam_core::Size,
+        stride: u32,
+        layout: PixelLayout,
+    ) {
+        if camera == self.camera {
+            return;
+        }
+        let Some(lens) = self.lenses.get(camera).copied() else {
+            return;
+        };
+        let input = omacam_record::Input {
+            format: input_format(layout),
+            width: size.width,
+            height: size.height,
+            stride,
+            coverage: lens.coverage,
+            flip: (lens.rotation + 360 - self.base_rotation) % 360 == 180,
+        };
+        match self.tap.set_input(input, lens.view) {
+            Ok(()) => {
+                tracing::info!(camera, "recording from another camera");
+                self.camera = camera.to_string();
+                if let Some(s) = &self.stabilizer {
+                    s.lock().unwrap().reset_path();
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "recording can't take this camera"),
+        }
+    }
+
+    /// A frame of the recorded camera, moved against the shake.
+    fn push(&self, frame: &Frame, pixels: omacam_core::backend::SharedPixels) {
+        let mut shift = (0.0, 0.0);
+        if let (Some(s), Some(lens)) = (&self.stabilizer, self.lenses.get(&self.camera)) {
+            let up = s.lock().unwrap().correction(
+                frame.meta.timestamp_ns as i64,
+                frame.meta.exposure_us,
+                lens.focal,
+                lens.scale,
+            );
+            shift = omacam_core::framing::upright_to_frame_vector(up, lens.rotation, lens.mirror);
+        }
+        if let Err(e) = self.tap.push_shifted(pixels, shift) {
+            tracing::warn!(error = %e, "frame not recorded");
+        }
+    }
+}
+
+/// Each camera's recorder view and crop scale now (margin included).
+fn camera_views(app: &App) -> Option<Vec<(String, (omacam_record::View, f64))>> {
+    let ids: Vec<String> = {
+        let c = app.controller.borrow();
+        c.as_ref()?
+            .table()
+            .lenses()
+            .iter()
+            .map(|l| l.id.clone())
+            .collect()
+    };
+    let mut out = Vec::new();
+    for id in ids {
+        let t = app.controller.borrow().as_ref()?.transform(&id)?;
+        let margin = app.video_margin(&id);
+        out.push((id, (rec_view(&t, margin), t.scale * margin)));
+    }
+    Some(out)
+}
+
+/// A GeoClue fix as EXIF GPS tags, stamped with the fix's UTC time.
+fn gps_of(f: crate::location::Fix) -> Option<exif::Gps> {
+    let age = f.at.elapsed();
+    let at = glib::DateTime::now_utc()
+        .ok()?
+        .add_seconds(-age.as_secs_f64())
+        .ok()?;
+    Some(exif::Gps {
+        latitude: f.latitude,
+        longitude: f.longitude,
+        altitude: f.altitude,
+        accuracy: f.accuracy.is_finite().then_some(f.accuracy),
+        date: at.format("%Y:%m:%d").ok()?.to_string(),
+        time: (at.hour() as u32, at.minute() as u32, at.seconds()),
+    })
+}
+
+/// A lens's view for the recorder: the transform's crop on the frame's
+/// own axes, tightened by `margin` (stabilization).
+fn rec_view(t: &omacam_core::framing::Transform, margin: f64) -> omacam_record::View {
+    omacam_record::View {
+        scale: t.scale * margin,
+        center: omacam_core::framing::upright_to_frame_point(t.center, t.rotation, t.mirror),
+    }
+}
+
+fn input_format(layout: PixelLayout) -> omacam_record::InputFormat {
+    match layout {
+        PixelLayout::Xrgb8888 => omacam_record::InputFormat::Bgrx,
+        PixelLayout::Xbgr8888 => omacam_record::InputFormat::Rgbx,
+        PixelLayout::Rgb888 => omacam_record::InputFormat::Bgr,
+        PixelLayout::Bgr888 => omacam_record::InputFormat::Rgb,
+    }
 }
 
 pub fn run(cli: Cli) -> glib::ExitCode {
@@ -375,6 +537,30 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
     lock_chip.set_visible(false);
     lock_chip.set_can_target(false);
     overlay.add_overlay(&lock_chip);
+    // Low light: the main camera stands in for the telephoto.
+    let low_light_chip = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    low_light_chip.add_css_class("note-chip");
+    low_light_chip.append(&gtk::Image::from_icon_name("weather-clear-night-symbolic"));
+    low_light_chip.append(&gtk::Label::new(Some("Low light: main camera")));
+    low_light_chip.set_tooltip_text(Some(
+        "Too dark for the telephoto: the main camera shows this zoom",
+    ));
+    low_light_chip.set_halign(gtk::Align::Center);
+    low_light_chip.set_valign(gtk::Align::Start);
+    low_light_chip.set_margin_top(86);
+    low_light_chip.set_visible(false);
+    low_light_chip.set_can_target(false);
+    overlay.add_overlay(&low_light_chip);
+    // Video: 30 or 60 fps, where the lens's mode allows 60.
+    let fps_toggle = gtk::ToggleButton::with_label("60 FPS");
+    fps_toggle.add_css_class("fps-toggle");
+    fps_toggle.set_tooltip_text(Some("Record at 60 frames per second"));
+    fps_toggle.set_halign(gtk::Align::End);
+    fps_toggle.set_valign(gtk::Align::Start);
+    fps_toggle.set_margin_top(16);
+    fps_toggle.set_margin_end(64);
+    fps_toggle.set_visible(false);
+    overlay.add_overlay(&fps_toggle);
     let ev_slider = gtk::Scale::with_range(gtk::Orientation::Vertical, -2.0, 2.0, 0.1);
     ev_slider.set_inverted(true);
     ev_slider.set_draw_value(false);
@@ -423,7 +609,8 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
 
     let (tx, rx) = async_channel::unbounded::<Msg>();
     let held = Rc::new(Cell::new(DeviceOrientation::Normal));
-    let sensor = crate::sensors::Accelerometer::claim(held.clone());
+    let has_gyro = crate::sensors::gyro::available();
+    tracing::info!(has_gyro, "gyroscope");
     let app = Rc::new(App {
         cli,
         window: window.clone(),
@@ -469,6 +656,9 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
         pro_panel: RefCell::new(None),
         picture_bottom: picture_bottom.clone(),
         lock_chip,
+        low_light_chip,
+        fps_toggle: fps_toggle.clone(),
+        setting_fps: Cell::new(false),
         ev_slider,
         setting_ev: Cell::new(false),
         ev_shown_until: Cell::new(None),
@@ -488,8 +678,55 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
         recording: RefCell::new(None),
         rec_tap: Arc::new(Mutex::new(None)),
         held: held.clone(),
-        _sensor: sensor,
+        sensor: RefCell::new(None),
+        controls_turn: Cell::new(0),
+        has_gyro,
+        locator: RefCell::new(None),
     });
+    {
+        let a = Rc::downgrade(&app);
+        let sensor = crate::sensors::Accelerometer::claim(held.clone(), move |_| {
+            if let Some(a) = a.upgrade() {
+                a.turn_controls();
+            }
+        });
+        *app.sensor.borrow_mut() = sensor;
+    }
+    {
+        let a = Rc::downgrade(&app);
+        fps_toggle.connect_toggled(move |b| {
+            let Some(a) = a.upgrade() else { return };
+            if a.setting_fps.get() {
+                return;
+            }
+            let fps = if b.is_active() { 60 } else { 30 };
+            let mut s = a.settings.borrow().clone();
+            s.video_fps = fps;
+            if let Err(e) = s.save(&a.settings_path) {
+                a.error(&format!("Settings not saved: {e}"));
+            }
+            *a.settings.borrow_mut() = s;
+            if let Some(out) = a.with_controller(|c| c.set_video_fps(fps)) {
+                a.apply(out);
+            }
+        });
+    }
+    // The controls that turn with the phone.
+    for w in [
+        app.thumb.upcast_ref::<gtk::Widget>(),
+        app.flip.upcast_ref(),
+        app.gear.upcast_ref(),
+        app.lock_chip.upcast_ref(),
+        app.low_light_chip.upcast_ref(),
+        app.fps_toggle.upcast_ref(),
+        app.zoom_indicator.upcast_ref(),
+        app.status_box.upcast_ref(),
+        app.rec_label.upcast_ref(),
+    ] {
+        w.add_css_class("turnable");
+    }
+    app.turn_controls();
+    app.location_setting_changed();
     {
         let a = Rc::downgrade(&app);
         gear.connect_clicked(move |_| {
@@ -598,6 +835,15 @@ async fn run_script(app: Rc<App>, steps: Vec<crate::script::Step>) {
                 if let Some(out) = app.with_controller(|c| c.set_ev(ev as f32)) {
                     app.apply(out);
                 }
+            }
+            Step::Hold(how) => {
+                app.held.set(match how.as_str() {
+                    "left" => DeviceOrientation::LeftUp,
+                    "right" => DeviceOrientation::RightUp,
+                    "upside-down" => DeviceOrientation::BottomUp,
+                    _ => DeviceOrientation::Normal,
+                });
+                app.turn_controls();
             }
             Step::Quit => {
                 app.window.close();
@@ -734,11 +980,9 @@ impl App {
                     std::mem::replace(&mut f.data, FrameData::Memory(Vec::new()))
                 {
                     let shared = omacam_core::backend::SharedPixels(Arc::new(v));
-                    if let Some((camera, tap)) = rec_tap.lock().unwrap().as_ref() {
-                        if *camera == f.camera {
-                            if let Err(e) = tap.push(shared.clone()) {
-                                tracing::warn!(error = %e, "frame not recorded");
-                            }
+                    if let Some(link) = rec_tap.lock().unwrap().as_ref() {
+                        if link.camera == f.camera {
+                            link.push(&f, shared.clone());
                         }
                     }
                     f.data = FrameData::Shared(shared);
@@ -756,6 +1000,21 @@ impl App {
                 }
             }
             other => {
+                // A lens switch while recording: the recording takes the
+                // new camera's frames from its first one, here on the
+                // camera's thread, before any of them arrives.
+                if let Event::Started {
+                    camera,
+                    size,
+                    stride,
+                    layout,
+                    ..
+                } = &other
+                {
+                    if let Some(link) = rec_tap.lock().unwrap().as_mut() {
+                        link.camera_started(camera, *size, *stride, *layout);
+                    }
+                }
                 let _ = tx.send_blocking(Msg::Event(other));
             }
         });
@@ -807,6 +1066,8 @@ impl App {
                     },
                     transfer_exposure: self.cli.exposure_hints,
                     tap_to_focus: self.settings.borrow().tap_to_focus,
+                    low_light: self.settings.borrow().low_light,
+                    video_fps: self.settings.borrow().video_fps,
                     ..Options::default()
                 };
                 // The list comes at startup and again whenever cameras come
@@ -920,7 +1181,17 @@ impl App {
         );
         if let Some((tex, _)) = texture(&WidgetExt::display(&self.window), frame) {
             self.shown_format.set(Some(format));
-            self.viewfinder.set_frame(tex, placement);
+            // Another camera's first frame: the old one fades out over it.
+            let switched = self
+                .shown_camera
+                .borrow()
+                .as_ref()
+                .is_some_and(|c| *c != camera);
+            if switched {
+                self.viewfinder.switch_to(tex, placement);
+            } else {
+                self.viewfinder.set_frame(tex, placement);
+            }
             self.status_box.set_visible(false);
             *self.shown_camera.borrow_mut() = Some(camera);
             self.shown_size.set(size);
@@ -957,9 +1228,11 @@ impl App {
             .as_ref()
             .and_then(|c| c.transform(camera))
             .map(|t| Placement {
-                scale: t.scale,
+                scale: t.scale * self.video_margin(camera),
                 rotation: t.rotation,
                 mirror: t.mirror,
+                center: t.center,
+                coverage: t.coverage,
             })
             .unwrap_or_default()
     }
@@ -1018,6 +1291,7 @@ impl App {
             turn,
             quality: settings.jpeg_quality as i32,
             aspect,
+            portrait_aspect: settings.aspect.portrait_ratio(),
             medium: settings.resolution == crate::settings::Resolution::Medium,
             mirror: settings.mirror_front && p.lens.role == Role::Front,
             exif: exif::Info {
@@ -1029,9 +1303,9 @@ impl App {
                 lens_make,
                 lens_model,
                 subsec,
-                // Location tags: off by default (Q5) and not wired to
-                // GeoClue yet, so no fix is passed; exif::Gps is ready.
-                gps: None,
+                // Location tags: off by default (Q5); the newest GeoClue
+                // fix when on.
+                gps: self.location_fix().and_then(gps_of),
                 ..exif::Info::default()
             },
         };
@@ -1123,18 +1397,27 @@ impl App {
         if view.recording {
             self.flip.set_sensitive(false);
         }
-        let mut rec = self.recording.borrow_mut();
-        if let Some(r) = rec.as_mut() {
-            let scale = self
-                .controller
-                .borrow()
+        if let Some(r) = self.recording.borrow().as_ref() {
+            // Every lens's view follows the zoom; the recorded camera's
+            // goes to the recorder, the others' wait for a switch.
+            let camera = self
+                .rec_tap
+                .lock()
+                .unwrap()
                 .as_ref()
-                .and_then(|c| c.transform(&r.camera))
-                .map(|t| t.scale)
-                .unwrap_or(1.0);
-            if (scale - r.zoom).abs() > 1e-6 {
-                r.recorder.set_zoom(scale);
-                r.zoom = scale;
+                .map(|l| l.camera.clone());
+            if let (Some(camera), Some(lenses)) = (camera, camera_views(self)) {
+                if let Some(link) = self.rec_tap.lock().unwrap().as_mut() {
+                    for (id, (view, scale)) in lenses {
+                        if let Some(l) = link.lenses.get_mut(&id) {
+                            l.view = view;
+                            l.scale = scale;
+                        }
+                    }
+                    if let Some(l) = link.lenses.get(&camera) {
+                        link.tap.set_view(l.view);
+                    }
+                }
             }
             self.rec_label.set_label(&format!(
                 "● {}",
@@ -1142,7 +1425,6 @@ impl App {
             ));
             self.rec_label.set_visible(true);
         }
-        drop(rec);
         if !self.setting_slider.get() {
             let pos = self
                 .controller
@@ -1169,6 +1451,7 @@ impl App {
                 FocusStatus::FixedFocus | FocusStatus::Unavailable => {
                     gdk::RGBA::new(1.0, 1.0, 1.0, 0.4)
                 }
+                FocusStatus::Following => gdk::RGBA::new(1.0, 0.84, 0.31, 0.8),
             },
         });
         // Video records 16:9, upright 9:16: show what goes in the file.
@@ -1206,6 +1489,18 @@ impl App {
         // panel.
         let ex = &view.exposure;
         self.lock_chip.set_visible(ex.locked);
+        self.low_light_chip.set_visible(view.low_light);
+        if self.controls_turn.get() != 0 {
+            self.place_banners();
+        }
+        let video_mode = view.mode == omacam_core::controller::Mode::Video;
+        self.fps_toggle
+            .set_visible(video_mode && view.can_60fps && !view.recording);
+        if self.fps_toggle.is_active() != (view.video_fps >= 60) {
+            self.setting_fps.set(true);
+            self.fps_toggle.set_active(view.video_fps >= 60);
+            self.setting_fps.set(false);
+        }
         let ev_on = ex.caps.ev.is_some()
             && self
                 .ev_shown_until
@@ -1258,6 +1553,7 @@ impl App {
         for &p in presets {
             let b = gtk::Button::with_label(&preset_label(p));
             b.add_css_class("zoom-pill");
+            b.add_css_class("turnable");
             b.set_tooltip_text(Some(&format_zoom(p)));
             let a = Rc::downgrade(self);
             b.connect_clicked(move |_| {
@@ -1432,7 +1728,9 @@ impl App {
             } else {
                 omacam_core::controller::Mode::Photo
             };
-            a.with_controller(|c| c.set_mode(mode));
+            if let Some(out) = a.with_controller(|c| c.set_mode(mode)) {
+                a.apply(out);
+            }
             a.refresh();
         });
 
@@ -1583,6 +1881,86 @@ impl App {
         }
     }
 
+    /// Turn the controls for how the phone is held (the layout stays
+    /// portrait; each control turns in place).
+    ///
+    /// Icons, zoom buttons, chips and toasts turn; the words of the mode
+    /// switch and the lens name stay level, since turned they'd run into
+    /// the rows above and below. The banners over the top of the picture
+    /// (recording time, AE/AF lock, low light) move to the edge that is
+    /// up, along it.
+    fn turn_controls(&self) {
+        let turn = self.held.get().degrees();
+        let old = self.controls_turn.replace(turn);
+        if old != 0 {
+            self.window.remove_css_class(&format!("turn-{old}"));
+        }
+        if turn != 0 {
+            self.window.add_css_class(&format!("turn-{turn}"));
+        }
+        self.place_banners();
+    }
+
+    /// The banners along the edge that is up (their sizes change with
+    /// their text, so this runs again as they change).
+    fn place_banners(&self) {
+        let turn = self.controls_turn.get();
+        let banners: [(&gtk::Widget, i32); 3] = [
+            (self.rec_label.upcast_ref(), 14),
+            (self.lock_chip.upcast_ref(), 50),
+            (self.low_light_chip.upcast_ref(), 86),
+        ];
+        for (w, inset) in banners {
+            let (_, width, _, _) = w.measure(gtk::Orientation::Horizontal, -1);
+            let (_, height, _, _) = w.measure(gtk::Orientation::Vertical, -1);
+            // Turned a quarter, the banner's middle sits `inset` plus half
+            // its height from the edge.
+            let side = (inset + height / 2 - width / 2).max(0);
+            w.set_margin_top(0);
+            w.set_margin_start(0);
+            w.set_margin_end(0);
+            match turn {
+                90 => {
+                    w.set_halign(gtk::Align::Start);
+                    w.set_valign(gtk::Align::Center);
+                    w.set_margin_start(side);
+                }
+                270 => {
+                    w.set_halign(gtk::Align::End);
+                    w.set_valign(gtk::Align::Center);
+                    w.set_margin_end(side);
+                }
+                _ => {
+                    w.set_halign(gtk::Align::Center);
+                    w.set_valign(gtk::Align::Start);
+                    w.set_margin_top(inset);
+                }
+            }
+        }
+    }
+
+    /// Start or stop GeoClue with the "Location tags" setting.
+    fn location_setting_changed(&self) {
+        let on = self.settings.borrow().location;
+        let running = self.locator.borrow().is_some();
+        if on && !running {
+            *self.locator.borrow_mut() = crate::location::Locator::start();
+            if self.locator.borrow().is_none() {
+                self.error("No location: turn on Location in the quick settings");
+            }
+        } else if !on && running {
+            self.locator.borrow_mut().take();
+        }
+    }
+
+    /// The location for a photo or video now, when tags are on.
+    fn location_fix(&self) -> Option<crate::location::Fix> {
+        if !self.settings.borrow().location {
+            return None;
+        }
+        self.locator.borrow().as_ref().and_then(|l| l.fix())
+    }
+
     fn debug_enabled(&self) -> bool {
         self.cli.debug || self.settings.borrow().debug_overlay
     }
@@ -1679,44 +2057,73 @@ impl App {
             .as_ref()
             .and_then(|d| d.format_iso8601().ok())
             .map(|s| s.to_string());
-        let front = self
-            .controller
-            .borrow()
-            .as_ref()
-            .and_then(|c| c.table().index_of(&camera).map(|i| c.table().get(i).role))
-            == Some(Role::Front);
+        let Some(lenses) = self.rec_lenses(&camera) else {
+            return;
+        };
+        let Some(lens) = lenses.get(&camera).copied() else {
+            return;
+        };
+        let front = lens.mirror;
         let held = self.held.get();
-        let t = self
-            .controller
-            .borrow()
+        let stabilizer = self
+            .stabilizing(&camera)
+            .then(|| Arc::new(Mutex::new(omacam_core::stabilize::Stabilizer::default())));
+        let gyro = stabilizer
             .as_ref()
-            .and_then(|c| c.transform(&camera));
+            .and_then(|s| crate::sensors::gyro::Gyroscope::claim(s.clone()));
+        let stabilizer = stabilizer.filter(|_| gyro.is_some());
+        // 60 fps when asked for, offered, and the camera really delivers
+        // it; else 30.
+        let view = self.controller.borrow().as_ref().map(|c| c.view());
+        let measured = self.fps.borrow().value;
+        let want60 = settings.video_fps >= 60 && view.as_ref().is_some_and(|v| v.can_60fps);
+        let fps = if want60 && measured >= 50.0 { 60 } else { 30 };
+        if want60 && fps == 30 {
+            self.error(&format!(
+                "60 fps not reached ({measured:.0} fps): recording at 30 fps"
+            ));
+        }
+        let location = settings
+            .location
+            .then(|| self.locator.borrow().as_ref().and_then(|l| l.fix()))
+            .flatten()
+            .map(|f| omacam_record::Location {
+                latitude: f.latitude,
+                longitude: f.longitude,
+                altitude: f.altitude,
+            });
         let (out_w, out_h) = settings.video_resolution.size();
         let config = omacam_record::Config {
             path: omacam_record::next_path(&dir, &stamp, codec.extension()),
             codec,
-            input: match layout {
-                PixelLayout::Xrgb8888 => omacam_record::InputFormat::Bgrx,
-                PixelLayout::Xbgr8888 => omacam_record::InputFormat::Rgbx,
-                PixelLayout::Rgb888 => omacam_record::InputFormat::Bgr,
-                PixelLayout::Bgr888 => omacam_record::InputFormat::Rgb,
+            input: omacam_record::Input {
+                format: input_format(layout),
+                width: w,
+                height: h,
+                stride,
+                coverage: lens.coverage,
+                flip: false,
             },
-            in_width: w,
-            in_height: h,
-            stride,
             out_width: out_w,
             out_height: out_h,
-            fps: 30,
+            fps,
             // Turned for how the phone is held when recording starts.
-            rotation: orientation::turn(t.map(|t| t.rotation).unwrap_or(0), held, front),
+            rotation: orientation::turn(lens.rotation, held, front),
             created,
+            location,
             audio: omacam_record::Audio::PipeWire,
         };
         match omacam_record::Recorder::start(config) {
             Ok(recorder) => {
-                let zoom = t.map(|t| t.scale).unwrap_or(1.0);
-                recorder.set_zoom(zoom);
-                *self.rec_tap.lock().unwrap() = Some((camera.clone(), recorder.tap()));
+                let tap = recorder.tap();
+                tap.set_view(lens.view);
+                *self.rec_tap.lock().unwrap() = Some(RecLink {
+                    tap,
+                    camera: camera.clone(),
+                    lenses,
+                    base_rotation: lens.rotation,
+                    stabilizer,
+                });
                 // Focus once as recording starts (continuous AF holds once
                 // it has found focus; a fresh scan catches a new subject).
                 let now = Instant::now();
@@ -1725,9 +2132,8 @@ impl App {
                 }
                 *self.recording.borrow_mut() = Some(Recording {
                     recorder,
-                    camera,
                     since: Instant::now(),
-                    zoom,
+                    _gyro: gyro,
                 });
                 self.with_controller(|c| c.set_recording(true));
                 if self.settings.borrow().shutter_sound {
@@ -1739,13 +2145,86 @@ impl App {
         self.refresh();
     }
 
+    /// Stabilization for video from `camera`: asked for, a gyroscope, and
+    /// a back camera (the selfie camera's frames are mirrored and it is
+    /// usually held still at arm's length).
+    fn stabilizing(&self, camera: &str) -> bool {
+        self.settings.borrow().stabilization
+            && self.has_gyro
+            && self
+                .controller
+                .borrow()
+                .as_ref()
+                .and_then(|c| c.table().index_of(camera).map(|i| c.table().get(i).role))
+                .is_some_and(|r| r != Role::Front)
+    }
+
+    /// How much tighter the video's view is than the picture's: the
+    /// stabilization margin, in video mode, so the viewfinder shows what
+    /// the file will.
+    fn video_margin(&self, camera: &str) -> f64 {
+        let video = self
+            .controller
+            .borrow()
+            .as_ref()
+            .is_some_and(|c| c.view().mode == omacam_core::controller::Mode::Video);
+        if video && self.stabilizing(camera) {
+            1.0 + omacam_core::stabilize::MARGIN
+        } else {
+            1.0
+        }
+    }
+
+    /// The cameras a recording from `camera` may take frames from (the
+    /// back ones, or the front one alone), with their views now.
+    fn rec_lenses(&self, camera: &str) -> Option<std::collections::HashMap<String, RecLens>> {
+        let c = self.controller.borrow();
+        let c = c.as_ref()?;
+        let table = c.table();
+        let first = table.get(table.index_of(camera)?);
+        let mut out = std::collections::HashMap::new();
+        for lens in table.lenses() {
+            if lens.role.faces_front() != first.role.faces_front() {
+                continue;
+            }
+            let Some(t) = c.transform(&lens.id) else {
+                continue;
+            };
+            let margin = self.video_margin(&lens.id);
+            // The picture's upright shape, for the focal length's share.
+            let shape = lens.still.or(lens.preview).map(|s| {
+                let (w, h) = omacam_core::framing::upright_pair(
+                    (s.width as f64, s.height as f64),
+                    t.rotation,
+                );
+                w / h.max(1.0)
+            });
+            let focal = omacam_core::stabilize::focal_over_sides(
+                lens.focal_length_35mm.unwrap_or(25) as f64,
+                shape.unwrap_or(0.75),
+            );
+            out.insert(
+                lens.id.clone(),
+                RecLens {
+                    rotation: t.rotation,
+                    mirror: t.mirror,
+                    coverage: lens.coverage,
+                    view: rec_view(&t, margin),
+                    focal,
+                    scale: t.scale * margin,
+                },
+            );
+        }
+        Some(out)
+    }
+
     /// Stop and finish the file off the UI thread. `wait` finishes it here
     /// (at shutdown).
     fn finish_recording(self: &Rc<Self>, wait: bool) {
         let Some(rec) = self.recording.borrow_mut().take() else {
             return;
         };
-        self.rec_tap.lock().unwrap().take();
+        let camera = self.rec_tap.lock().unwrap().take().map(|l| l.camera);
         self.with_controller(|c| c.set_recording(false));
         self.rec_label.set_visible(false);
         // The last frame becomes the gallery button's picture.
@@ -1763,7 +2242,8 @@ impl App {
                 height: h,
                 data,
             };
-            let rotation = self.placement_for(&rec.camera).rotation;
+            let rotation = self.viewfinder.placement().rotation;
+            let _ = &camera;
             let raw = photo::Raw {
                 data: &img.data,
                 width: w,
@@ -1913,6 +2393,9 @@ impl App {
         if let Some(p) = self.pro_panel.borrow().as_ref() {
             p.root.set_visible(on);
         }
+        if let Some(out) = self.with_controller(|c| c.set_pro(on, Instant::now())) {
+            self.apply(out);
+        }
         self.refresh();
     }
 
@@ -1925,6 +2408,16 @@ impl App {
                 a.error(&format!("Settings not saved: {e}"));
             }
             a.with_controller(|c| c.set_tap_to_focus(s.tap_to_focus));
+            let now = Instant::now();
+            let out = a.with_controller(|c| {
+                let mut out = c.set_low_light(s.low_light, now);
+                out.extend(c.set_video_fps(s.video_fps));
+                out
+            });
+            if let Some(out) = out {
+                a.apply(out);
+            }
+            a.location_setting_changed();
             a.refresh();
         });
         // A phone-width window gets the sheet from the bottom, in reach of
@@ -2003,6 +2496,7 @@ impl App {
                 self.viewfinder.texture().as_ref(),
                 self.viewfinder.placement(),
                 &self.viewfinder.decor(),
+                None,
             );
             node = snapshot.to_node();
         }
@@ -2069,6 +2563,8 @@ struct PhotoOptions {
     quality: i32,
     /// Width over height, upright; None keeps the frame's shape.
     aspect: Option<f64>,
+    /// The same shape, upright for a phone held in portrait.
+    portrait_aspect: Option<f64>,
     /// Half the width and height.
     medium: bool,
     /// Mirror left-right (front camera photos saved as previewed).
@@ -2094,7 +2590,13 @@ fn encode_and_write(
         stride: p.frame.stride,
         layout: p.frame.layout,
     };
-    let img = photo::crop_and_rotate(&raw, p.crop, opts.turn)?;
+    // The view's window of the frame (zoom, its center, the photo's
+    // shape, upright as the phone is held in portrait), then turned as
+    // the phone was held.
+    let window =
+        omacam_core::framing::frame_window(&p.transform, p.frame.size, opts.portrait_aspect);
+    let rect = photo::window_rect(raw.width, raw.height, window);
+    let img = photo::crop_window_and_rotate(&raw, rect, opts.turn)?;
     let mut img = photo::crop_to_aspect(img, opts.aspect);
     if opts.mirror {
         photo::mirror(&mut img);

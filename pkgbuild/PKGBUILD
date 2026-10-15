@@ -26,7 +26,8 @@ depends=(
   'libjpeg-turbo'
 )
 makedepends=('cargo' 'clang' 'pkgconf')
-optdepends=('loupe: open the last photo from the gallery button')
+optdepends=('loupe: open the last photo from the gallery button'
+            'geoclue: location tags')
 source=()
 sha256sums=()
 
@@ -46,5 +47,6 @@ package() {
   install -Dm644 NOTICE "$pkgdir/usr/share/licenses/$pkgname/NOTICE"
   install -Dm644 pkgbuild/omacam.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/omacam.svg"
   install -Dm644 pkgbuild/omacam.desktop "$pkgdir/usr/share/applications/omacam.desktop"
+  install -Dm644 data/geoclue/omacam.conf "$pkgdir/etc/geoclue/conf.d/91-omacam.conf"
   install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
 }

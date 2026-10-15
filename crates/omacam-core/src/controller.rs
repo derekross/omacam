@@ -9,7 +9,10 @@ use crate::capture::{self, CaptureController, Step};
 use crate::exposure;
 use crate::exposure_control::{self, Exposure};
 use crate::focus::{self, FocusController};
+use crate::framing;
+pub use crate::framing::Transform;
 use crate::lens::{Facing, Lens, LensTable, Role, TableSpec};
+use crate::lowlight::{self, LowLight};
 use crate::switch::{Action, FrameKind, SwitchController, Target};
 use crate::zoom::{Ladder, ZoomPlanner, ZoomSource};
 
@@ -31,6 +34,12 @@ pub struct Options {
     pub transfer_exposure: bool,
     /// Taps on the picture focus there.
     pub tap_to_focus: bool,
+    /// In dim light, show the telephoto's zoom as a crop of the main
+    /// camera ([`crate::lowlight`]).
+    pub low_light: bool,
+    /// Frames per second asked of a camera in video mode, where its mode
+    /// allows it (30 or 60).
+    pub video_fps: u32,
 }
 
 impl Default for Options {
@@ -41,6 +50,8 @@ impl Default for Options {
             still_buffers: 2,
             transfer_exposure: true,
             tap_to_focus: true,
+            low_light: true,
+            video_fps: 30,
         }
     }
 }
@@ -49,6 +60,9 @@ impl Default for Options {
 #[derive(Debug)]
 pub struct Picture {
     pub frame: Frame,
+    /// How the frame shows the view: the zoom crop, its center, the
+    /// mode's coverage, the turn upright.
+    pub transform: Transform,
     /// Center crop: keep 1/crop of each side (1 = the whole frame).
     pub crop: f64,
     /// Clockwise degrees that turn the frame upright.
@@ -78,9 +92,6 @@ pub enum Mode {
     Video,
 }
 
-/// The hint shown when a zoom would need another lens while recording.
-pub const RECORDING_LENS_HINT: &str = "The lens stays the same while recording";
-
 /// The exposure state the Pro panel and the EV slider show.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ExposureView {
@@ -98,18 +109,6 @@ pub struct ExposureView {
     pub shutter_us: Option<i32>,
     pub iso: Option<u32>,
     pub lens_position: Option<f32>,
-}
-
-/// How to draw a frame of one lens.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Transform {
-    /// Magnification of the frame about its center (the zoom crop), never
-    /// below 1.
-    pub scale: f64,
-    /// Clockwise degrees that turn the frame upright.
-    pub rotation: u32,
-    /// Mirror (left-right) after turning upright: the selfie preview.
-    pub mirror: bool,
 }
 
 /// The state the controls show.
@@ -134,12 +133,24 @@ pub struct ViewState {
     pub focus: Option<focus::Indicator>,
     pub mode: Mode,
     pub recording: bool,
+    /// The telephoto's zoom is shown by the main camera because the light
+    /// is too low for the tele.
+    pub low_light: bool,
+    /// The streaming camera can run at 60 fps in its current mode.
+    pub can_60fps: bool,
+    /// The frame rate video mode asks for now (30 or 60).
+    pub video_fps: u32,
 }
 
 struct Side {
     planner: ZoomPlanner,
     /// Ladder step to lens-table index.
     lenses: Vec<usize>,
+    roles: Vec<Role>,
+    /// (zoom factor, axis) of each step, for the view's center.
+    axes: Vec<(f64, (f64, f64))>,
+    /// Low light: the tele's step is shown by the main camera.
+    fallback: bool,
 }
 
 impl Side {
@@ -150,15 +161,41 @@ impl Side {
         }
         let factors = lenses.iter().map(|&i| table.get(i).zoom).collect();
         let ladder = Ladder::new(factors, table.max_zoom(facing));
+        let roles = lenses.iter().map(|&i| table.get(i).role).collect();
+        let axes = lenses
+            .iter()
+            .map(|&i| (table.get(i).zoom, table.get(i).axis))
+            .collect();
         // Open at 1x, or the widest lens when nothing reaches 1x.
         Some(Side {
             planner: ZoomPlanner::new(ladder, 1.0),
             lenses,
+            roles,
+            axes,
+            fallback: false,
         })
     }
 
-    fn lens(&self) -> usize {
+    /// The ladder's choice for the zoom, before any low-light fallback.
+    fn planned(&self) -> usize {
         self.lenses[self.planner.target()]
+    }
+
+    /// The main camera stands in for the tele: low light, the tele's step.
+    fn falls_back(&self) -> bool {
+        self.fallback
+            && self.roles[self.planner.target()] == Role::Tele
+            && self.roles.contains(&Role::Main)
+    }
+
+    /// The lens that streams for the zoom.
+    fn lens(&self) -> usize {
+        if self.falls_back() {
+            if let Some(main) = self.roles.iter().position(|&r| r == Role::Main) {
+                return self.lenses[main];
+            }
+        }
+        self.planned()
     }
 }
 
@@ -177,6 +214,13 @@ pub struct Controller {
     retry_at: Option<Instant>,
     mode: Mode,
     recording: bool,
+    low_light: LowLight,
+    /// The Pro panel is open: the lens is the one the zoom picks, never a
+    /// low-light stand-in.
+    pro: bool,
+    /// The highest frame rate each camera's current mode allows (from the
+    /// stream's start), by camera id.
+    max_fps: std::collections::HashMap<String, f64>,
 }
 
 impl Controller {
@@ -205,6 +249,9 @@ impl Controller {
             retry_at: None,
             mode: Mode::Photo,
             recording: false,
+            low_light: LowLight::default(),
+            pro: false,
+            max_fps: std::collections::HashMap::new(),
         }
     }
 
@@ -319,7 +366,32 @@ impl Controller {
             focus: self.focus.indicator(),
             mode: self.mode,
             recording: self.recording,
+            low_light: side.is_some_and(|s| s.falls_back()),
+            can_60fps: self.can_60fps(),
+            video_fps: self.opts.video_fps,
         }
+    }
+
+    /// The streaming camera's mode allows 60 fps.
+    fn can_60fps(&self) -> bool {
+        self.switch
+            .streaming()
+            .and_then(|(_, t)| self.max_fps.get(&t.camera))
+            .is_some_and(|&f| f >= 59.0)
+    }
+
+    /// The frame duration to ask of a stream of `camera`, microseconds:
+    /// 60 fps in video mode when asked for and its mode allows it, else
+    /// nothing (the camera's default, 30 fps).
+    fn frame_duration_for(&self, camera: &str, purpose: Purpose) -> Option<i64> {
+        // Only on a camera whose mode reported its frame durations (it
+        // takes FrameDurationLimits); elsewhere the camera keeps its own.
+        let max = *self.max_fps.get(camera)?;
+        let fast = self.mode == Mode::Video
+            && purpose == Purpose::Preview
+            && self.opts.video_fps >= 60
+            && max >= 59.0;
+        Some(if fast { 16_667 } else { 33_333 })
     }
 
     /// Slider position (0..1) for the current zoom.
@@ -342,25 +414,43 @@ impl Controller {
             .unwrap_or(1.0)
     }
 
-    /// How to draw a frame from `camera` at the current zoom.
+    /// How to draw a preview frame from `camera` at the current zoom.
     pub fn transform(&self, camera: &str) -> Option<Transform> {
+        self.transform_for(camera, Purpose::Preview)
+    }
+
+    /// How a frame of `camera`'s preview or still mode shows the current
+    /// view. Every lens of the side frames the view alike (the scale is
+    /// zoom over the lens's factor, about the center of [`framing`]); a
+    /// frame from the other side (frozen across a flip) keeps its whole
+    /// view. A frame is never drawn below 1x: a lens can't show more than
+    /// its own field of view, so a frozen frame from a narrower lens holds
+    /// at its full view until the wider lens's first frame.
+    pub fn transform_for(&self, camera: &str, purpose: Purpose) -> Option<Transform> {
         let i = self.table.index_of(camera)?;
         let lens = self.table.get(i);
-        let zoom = self.side().map(|s| s.planner.zoom()).unwrap_or(1.0);
-        // A frame from the other side (frozen across a flip) keeps 1x. A
-        // frame is never drawn below 1x: a lens can't show more than its
-        // own field of view, so a frozen frame from a narrower lens holds
-        // at its full view until the wider lens's first frame.
-        let scale = if lens.role.faces_front() == (self.facing == Facing::Front) {
-            (zoom / lens.zoom).max(1.0)
-        } else {
-            1.0
+        let rotation = lens.upright_clockwise();
+        let coverage = match purpose {
+            Purpose::Preview => framing::upright_pair(lens.coverage, rotation),
+            Purpose::Still => (1.0, 1.0),
         };
-        Some(Transform {
-            scale,
-            rotation: lens.upright_clockwise(),
+        let mut t = Transform {
+            rotation,
             mirror: lens.mirror,
-        })
+            coverage,
+            ..Transform::default()
+        };
+        let Some(side) = self.side() else {
+            return Some(t);
+        };
+        if lens.role.faces_front() != (self.facing == Facing::Front) {
+            return Some(t);
+        }
+        let zoom = side.planner.zoom();
+        t.scale = (zoom / lens.zoom).max(1.0);
+        let center = framing::view_center(zoom, &side.axes);
+        t.center = framing::lens_center(center, lens.zoom, lens.axis, t.scale);
+        Some(t)
     }
 
     /// Time until [`Controller::tick`] has something to do.
@@ -385,6 +475,7 @@ impl Controller {
         let settings = self.exposure.effective(&lens.caps);
         target.controls.af_continuous = lens.autofocus && settings.lens.is_auto();
         target.controls.settings = Some(settings);
+        target.controls.frame_duration_us = self.frame_duration_for(&lens.id, purpose);
         if self.opts.transfer_exposure {
             if let Some((from, meta)) = &self.last_meta {
                 let from_lens = self.table.get(*from);
@@ -500,13 +591,6 @@ impl Controller {
         if self.capture.is_busy() {
             return out;
         }
-        if self.recording {
-            let held = self.side_mut().is_some_and(|s| s.planner.set_locked(zoom));
-            if held {
-                out.push(Output::Error(RECORDING_LENS_HINT.into()));
-            }
-            return out;
-        }
         let changed = self
             .side_mut()
             .and_then(|s| s.planner.set(zoom, source, now));
@@ -519,9 +603,6 @@ impl Controller {
     /// A pinch or slider drag ended.
     pub fn zoom_released(&mut self, now: Instant) -> Vec<Output> {
         let mut out = Vec::new();
-        if self.recording {
-            return out;
-        }
         let changed = self.side_mut().and_then(|s| s.planner.release(now));
         if changed.is_some() {
             self.request_preview(now, &mut out);
@@ -539,10 +620,76 @@ impl Controller {
         self.opts.capture_mode = mode;
     }
 
-    /// Photo or video. Ignored while recording or taking a photo.
-    pub fn set_mode(&mut self, mode: Mode) {
-        if !self.recording && !self.capture.is_busy() {
+    /// Photo or video. Ignored while recording or taking a photo. Video
+    /// mode may run the camera faster (60 fps).
+    pub fn set_mode(&mut self, mode: Mode) -> Vec<Output> {
+        let mut out = Vec::new();
+        if !self.recording && !self.capture.is_busy() && self.mode != mode {
             self.mode = mode;
+            self.push_frame_rate(&mut out);
+        }
+        out
+    }
+
+    /// The video frame rate setting (30 or 60). Ignored while recording.
+    pub fn set_video_fps(&mut self, fps: u32) -> Vec<Output> {
+        let mut out = Vec::new();
+        if !self.recording && self.opts.video_fps != fps {
+            self.opts.video_fps = fps;
+            self.push_frame_rate(&mut out);
+        }
+        out
+    }
+
+    fn push_frame_rate(&self, out: &mut Vec<Output>) {
+        let Some((generation, lens)) = self.preview_lens() else {
+            return;
+        };
+        if let Some(d) = self.frame_duration_for(&lens.id, Purpose::Preview) {
+            out.push(Output::Backend(Command::SetControls {
+                generation,
+                controls: crate::backend::Controls {
+                    frame_duration_us: Some(d),
+                    ..Default::default()
+                },
+            }));
+        }
+    }
+
+    /// The Pro panel opened or closed: while it's open the zoom picks the
+    /// lens strictly by the ladder (no low-light stand-in), since the user
+    /// is choosing the camera's settings by hand.
+    pub fn set_pro(&mut self, on: bool, now: Instant) -> Vec<Output> {
+        let mut out = Vec::new();
+        self.pro = on;
+        self.apply_low_light(now, &mut out);
+        out
+    }
+
+    /// The low-light lens setting.
+    pub fn set_low_light(&mut self, on: bool, now: Instant) -> Vec<Output> {
+        let mut out = Vec::new();
+        self.opts.low_light = on;
+        self.apply_low_light(now, &mut out);
+        out
+    }
+
+    /// Bring the back side's fallback in line with the light, the
+    /// settings and the Pro panel, and switch lenses if that changes
+    /// which camera streams.
+    fn apply_low_light(&mut self, now: Instant, out: &mut Vec<Output>) {
+        let want = self.opts.low_light && !self.pro && self.low_light.is_dim();
+        let Some(back) = self.back.as_mut() else {
+            return;
+        };
+        if back.fallback == want {
+            return;
+        }
+        let before = back.lens();
+        back.fallback = want;
+        let after = back.lens();
+        if self.facing == Facing::Back && before != after && !self.capture.is_busy() {
+            self.request_preview(now, out);
         }
     }
 
@@ -639,6 +786,31 @@ impl Controller {
             }
             _ => None,
         };
+        // Video on a camera whose AF takes windows: continuous AF moves to
+        // the tapped window and keeps following it, instead of a one-shot
+        // scan that would hunt on camera and then hold.
+        let follow = self.mode == Mode::Video
+            && settings.lens.is_auto()
+            && lens.autofocus
+            && lens.af_windows
+            && lens.crop_maximum.is_some();
+        if follow {
+            let area = lens.crop_maximum.expect("checked");
+            let (x, y) = focus::picture_to_frame(u, v, &t);
+            let window = focus::window(x, y, area);
+            self.focus.follow(u, v, now);
+            out.push(Output::Backend(Command::SetControls {
+                generation,
+                controls: crate::backend::Controls {
+                    af_continuous: true,
+                    af_window: Some(window),
+                    settings: Some(settings),
+                    metering_window,
+                    ..Default::default()
+                },
+            }));
+            return out;
+        }
         let request = if settings.lens.is_auto() {
             self.focus.tap(
                 u,
@@ -896,10 +1068,12 @@ impl Controller {
         out
     }
 
-    fn picture(&self, frame: Frame, lens_idx: usize) -> Output {
+    fn picture(&self, frame: Frame, lens_idx: usize, purpose: Purpose) -> Output {
         let lens = self.table.get(lens_idx).clone();
         let zoom = self.side().map(|s| s.planner.zoom()).unwrap_or(1.0);
+        let transform = self.transform_for(&lens.id, purpose).unwrap_or_default();
         Output::Picture(Box::new(Picture {
+            transform,
             crop: (zoom / lens.zoom).max(1.0),
             rotation: lens.upright_clockwise(),
             zoom,
@@ -909,12 +1083,57 @@ impl Controller {
         }))
     }
 
+    /// Judge the light from a back lens's preview frame. Not while
+    /// recording (the lens doesn't change under a recording for the
+    /// light) or taking a photo.
+    fn judge_light(
+        &mut self,
+        lens_idx: usize,
+        meta: &FrameMeta,
+        now: Instant,
+        out: &mut Vec<Output>,
+    ) {
+        if self.facing != Facing::Back
+            || self.recording
+            || self.capture.is_busy()
+            || self.switch.is_switching()
+        {
+            return;
+        }
+        let Some(tele) = self.table.by_role(Role::Tele).map(|i| self.table.get(i)) else {
+            return;
+        };
+        let lens = self.table.get(lens_idx);
+        let (Some(f), Some(f_tele)) = (lens.f_number, tele.f_number) else {
+            return;
+        };
+        let demand = lowlight::tele_demand(meta, f, f_tele);
+        let max_gain = tele.caps.gain.map(|(_, hi)| hi as f64);
+        if self.low_light.update(demand, max_gain, now).is_some() {
+            tracing::info!(dim = self.low_light.is_dim(), "low light");
+            self.apply_low_light(now, out);
+        }
+    }
+
     pub fn on_event(&mut self, event: Event, now: Instant) -> Vec<Output> {
         let mut out = Vec::new();
         match event {
             Event::Cameras(_) => {}
             Event::Notice { message } => out.push(Output::Error(message)),
-            Event::Started { generation, .. } => {
+            Event::Started {
+                generation,
+                ref camera,
+                max_fps,
+                ..
+            } => {
+                match max_fps {
+                    Some(f) => {
+                        self.max_fps.insert(camera.clone(), f);
+                    }
+                    None => {
+                        self.max_fps.remove(camera);
+                    }
+                }
                 self.focus.reset();
                 let actions = self.switch.on_started(generation);
                 self.run(actions, &mut out);
@@ -954,9 +1173,10 @@ impl Controller {
         match purpose {
             Purpose::Preview => {
                 self.focus.on_meta(&frame.meta, now);
+                self.judge_light(lens_idx, &frame.meta, now, out);
                 self.last_meta = Some((lens_idx, frame.meta.clone()));
                 match self.capture.on_preview_frame(&frame.meta, now) {
-                    Step::Keep => out.push(self.picture(frame, lens_idx)),
+                    Step::Keep => out.push(self.picture(frame, lens_idx, purpose)),
                     step => {
                         self.capture_step(step, now, out);
                         out.push(Output::Show(frame));
@@ -965,7 +1185,7 @@ impl Controller {
             }
             Purpose::Still => match self.capture.on_still_frame(&frame.meta) {
                 Step::KeepAndRestore(_) => {
-                    out.push(self.picture(frame, lens_idx));
+                    out.push(self.picture(frame, lens_idx, purpose));
                     self.restore_preview(now, out);
                 }
                 Step::Discard => {}
@@ -1076,6 +1296,7 @@ mirror = true
             size: Size::new(4, 2),
             stride: 16,
             layout: PixelLayout::Xrgb8888,
+            max_fps: None,
         }
     }
 
@@ -1344,7 +1565,7 @@ mirror = true
     }
 
     #[test]
-    fn while_recording_the_lens_holds_and_flip_and_photos_wait() {
+    fn while_recording_lenses_switch_but_flip_and_photos_wait() {
         let now = Instant::now();
         let mut c = Controller::new(&spec(), &cameras(), Options::default());
         open(&mut c, now);
@@ -1356,22 +1577,240 @@ mirror = true
         assert!(c.view().recording);
         c.set_mode(Mode::Photo);
         assert_eq!(c.view().mode, Mode::Video, "no mode change mid-recording");
-        // Past the tele's threshold: the main crops instead.
-        assert!(commands(&c.set_zoom(6.0, ZoomSource::Preset, now)).is_empty());
-        assert_eq!(c.transform("main").unwrap().scale, 6.0);
-        // Below the main's view: held, with the hint.
-        let out = c.set_zoom(0.5, ZoomSource::Gesture, now);
-        assert!(matches!(out.as_slice(), [Output::Error(m)] if m == RECORDING_LENS_HINT));
-        assert_eq!(c.view().zoom, 1.0);
-        assert!(
-            c.tick(now + Duration::from_secs(1)).is_empty(),
-            "no switch later either"
-        );
+        // The zoom picks lenses as ever: the recorder follows the camera.
+        let (g, cam, _) = start_of(&c.set_zoom(6.0, ZoomSource::Preset, now));
+        assert_eq!(cam, "tele");
+        c.on_event(started(g, "tele"), now);
+        c.on_event(frame(g, "tele", 33_000), now);
+        let (_, cam, _) = start_of(&c.set_zoom(0.5, ZoomSource::Preset, now));
+        assert_eq!(cam, "uw");
         assert!(c.flip(now).is_empty());
         assert!(c.shutter(now).is_empty());
         c.set_recording(false);
-        let (_, cam, _) = start_of(&c.set_zoom(0.5, ZoomSource::Preset, now));
-        assert_eq!(cam, "uw", "switching again after");
+    }
+
+    /// A frame whose exposure says the scene is too dim for the tele: on
+    /// the main at 1/30 s and gain 6, the tele would need gain 21.
+    fn dim_frame(generation: u64, camera: &str) -> Event {
+        let mut e = frame(generation, camera, 33_333);
+        if let Event::Frame(f) = &mut e {
+            f.meta.analog_gain = Some(6.0);
+        }
+        e
+    }
+
+    #[test]
+    fn in_low_light_the_main_camera_stands_in_for_the_tele() {
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        let mut c = Controller::new(&spec(), &cameras(), Options::default());
+        let g = open(&mut c, t0);
+        // Dim, on the main at 1x: judged, but nothing to switch.
+        for n in (0..=1600).step_by(100) {
+            assert!(commands(&c.on_event(dim_frame(g, "main"), ms(n))).is_empty());
+        }
+        assert!(!c.view().low_light);
+        // 5x in the dark: the main crops 5x instead of starting the tele.
+        let out = c.set_zoom(5.0, ZoomSource::Preset, ms(1700));
+        assert!(commands(&out).is_empty(), "{out:?}");
+        let v = c.view();
+        assert!(v.low_light);
+        assert_eq!(v.lens_role, Some(Role::Main));
+        assert_eq!(c.transform("main").unwrap().scale, 5.0);
+        // Bright again for three seconds: back to the tele.
+        let mut started = None;
+        for n in (1800..=5000).step_by(100) {
+            let out = c.on_event(frame(g, "main", 5_000), ms(n));
+            if let [Command::Start { camera, .. }] = commands(&out).as_slice() {
+                started = Some((n, camera.clone()));
+                break;
+            }
+        }
+        let (n, cam) = started.expect("switched back");
+        assert_eq!(cam, "tele");
+        assert!(n >= 4800, "after the dwell, at {n} ms");
+        assert!(!c.view().low_light);
+    }
+
+    #[test]
+    fn low_light_on_the_tele_falls_back_and_pro_or_the_setting_prevent_it() {
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        let mut c = Controller::new(&spec(), &cameras(), Options::default());
+        open(&mut c, t0);
+        let (g, cam, _) = start_of(&c.set_zoom(5.0, ZoomSource::Preset, t0));
+        assert_eq!(cam, "tele");
+        c.on_event(started(g, "tele"), t0);
+        // The tele at 1/30 s and gain 12.
+        let tele_dim = |n| {
+            let mut e = frame(g, "tele", 33_333);
+            if let Event::Frame(f) = &mut e {
+                f.meta.analog_gain = Some(12.0);
+                f.meta.sequence = n;
+            }
+            e
+        };
+        let mut switched = None;
+        for n in 0..30u64 {
+            let out = c.on_event(tele_dim(n as u32), ms(n * 100));
+            if let [Command::Start {
+                camera, generation, ..
+            }] = commands(&out).as_slice()
+            {
+                switched = Some((n * 100, camera.clone(), *generation));
+                break;
+            }
+        }
+        let (at, cam, g) = switched.expect("fell back");
+        assert_eq!(cam, "main");
+        assert!(at >= 1500, "{at}");
+        c.on_event(started(g, "main"), ms(3500));
+        let settle = |c: &mut Controller, out: Vec<Output>| {
+            let (g, cam, _) = start_of(&out);
+            c.on_event(started(g, &cam), ms(4000));
+            cam
+        };
+        // The Pro panel puts the tele back, and keeps it while open.
+        let out = c.set_pro(true, ms(4000));
+        assert_eq!(settle(&mut c, out), "tele");
+        let out = c.set_pro(false, ms(4100));
+        assert_eq!(settle(&mut c, out), "main");
+        // So does turning the setting off.
+        let out = c.set_low_light(false, ms(4200));
+        assert_eq!(settle(&mut c, out), "tele");
+    }
+
+    #[test]
+    fn the_ultrawide_has_no_low_light_fallback() {
+        let t0 = Instant::now();
+        let mut c = Controller::new(&spec(), &cameras(), Options::default());
+        let g = open(&mut c, t0);
+        for n in 0..30u64 {
+            c.on_event(dim_frame(g, "main"), t0 + Duration::from_millis(n * 100));
+        }
+        let (_, cam, _) = start_of(&c.set_zoom(0.5, ZoomSource::Preset, t0));
+        assert_eq!(cam, "uw");
+        assert!(!c.view().low_light);
+    }
+
+    #[test]
+    fn sixty_fps_only_where_the_mode_allows_and_only_for_video() {
+        let now = Instant::now();
+        let mut c = Controller::new(
+            &spec(),
+            &cameras(),
+            Options {
+                video_fps: 60,
+                ..Options::default()
+            },
+        );
+        let (g, _, _) = start_of(&c.resume(now));
+        // No frame durations reported: nothing asked, 60 not offered.
+        c.on_event(started(g, "main"), now);
+        c.on_event(frame(g, "main", 10_000), now);
+        assert!(!c.view().can_60fps);
+        assert!(commands(&c.set_mode(Mode::Video)).is_empty());
+        c.set_mode(Mode::Photo);
+        // A mode that reaches 60 fps.
+        let (g, _, _) = start_of(&c.set_zoom(0.5, ZoomSource::Preset, now));
+        let mut e = started(g, "uw");
+        if let Event::Started { max_fps, .. } = &mut e {
+            *max_fps = Some(60.0);
+        }
+        c.on_event(e, now);
+        c.on_event(frame(g, "uw", 10_000), now);
+        assert!(c.view().can_60fps);
+        let duration = |out: &[Output]| match commands(out).as_slice() {
+            [Command::SetControls { controls, .. }] => controls.frame_duration_us,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(duration(&c.set_mode(Mode::Video)), Some(16_667));
+        assert_eq!(duration(&c.set_video_fps(30)), Some(33_333));
+        assert_eq!(duration(&c.set_video_fps(60)), Some(16_667));
+        assert_eq!(duration(&c.set_mode(Mode::Photo)), Some(33_333));
+    }
+
+    #[test]
+    fn a_video_tap_moves_continuous_af_to_the_window() {
+        let now = Instant::now();
+        let mut cams = cameras();
+        for c in cams.iter_mut() {
+            c.af_windows = true;
+            c.crop_maximum = Some(crate::backend::Rect {
+                x: 0,
+                y: 0,
+                width: 4080,
+                height: 3072,
+            });
+        }
+        let mut c = Controller::new(&spec(), &cams, Options::default());
+        open(&mut c, now);
+        c.set_mode(Mode::Video);
+        match commands(&c.tap(0.5, 0.5, None, now)).as_slice() {
+            [Command::SetControls { controls, .. }] => {
+                assert!(controls.af_continuous);
+                assert!(controls.af_window.is_some());
+                assert!(controls.focus.is_none(), "no one-shot scan");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            c.view().focus.map(|f| f.status),
+            Some(focus::Status::Following)
+        );
+    }
+
+    #[test]
+    fn every_lens_frames_the_view_alike() {
+        // With axes off center, at each switch the old and the new lens
+        // look at the same point of the scene.
+        let spec = TableSpec::parse(
+            r#"
+max_zoom = 15.0
+[[lens]]
+role = "main"
+id = "main"
+zoom = 1.0
+[[lens]]
+role = "ultrawide"
+id = "uw"
+zoom = 0.45
+axis = [0.47, 0.5]
+[[lens]]
+role = "tele"
+id = "tele"
+zoom = 4.78
+axis = [0.56, 0.48]
+"#,
+        )
+        .unwrap();
+        let now = Instant::now();
+        let mut c = Controller::new(&spec, &cameras(), Options::default());
+        // Where the view's center is in the main camera's picture, seen
+        // from each lens's frame.
+        let in_main = |c: &Controller, cam: &str, zoom: f64, axis: (f64, f64)| {
+            let t = c.transform(cam).unwrap();
+            (
+                axis.0 + (t.center.0 - 0.5) / zoom,
+                axis.1 + (t.center.1 - 0.5) / zoom,
+            )
+        };
+        for z in [0.99, 1.0, 4.77, 4.78] {
+            c.set_zoom(z, ZoomSource::Preset, now);
+            let a = in_main(&c, "main", 1.0, (0.5, 0.5));
+            let b = if z < 1.0 {
+                in_main(&c, "uw", 0.45, (0.47, 0.5))
+            } else {
+                in_main(&c, "tele", 4.78, (0.56, 0.48))
+            };
+            if (1.0..4.78).contains(&z) {
+                continue; // the tele can't show below its own factor
+            }
+            assert!(
+                (a.0 - b.0).abs() < 2e-3 && (a.1 - b.1).abs() < 2e-3,
+                "{z}: {a:?} {b:?}"
+            );
+        }
     }
 
     fn caps_all() -> crate::backend::Caps {

@@ -180,9 +180,13 @@ pub fn dialog(
     photo.add(&taking);
 
     let saving = adw::PreferencesGroup::builder().title("Saving").build();
-    saving.add(&later(
+    saving.add(&switch(
         "Location tags",
-        "Coming later; photos carry no location",
+        "Record where photos and videos are taken (GeoClue)",
+        s.location,
+        &state,
+        &on_change,
+        |s, v| s.location = v,
     ));
     let dir = adw::EntryRow::builder()
         .title("Save photos in")
@@ -225,8 +229,24 @@ pub fn dialog(
         &on_change,
         |s, v| s.video_resolution = v,
     ));
-    vgroup.add(&later("Frame rate", "30 fps; other rates later"));
-    vgroup.add(&later("Stabilization", "Coming later"));
+    vgroup.add(&combo(
+        "Frame rate",
+        Some("60 fps where the lens's mode allows it, else 30"),
+        &[30u32, 60],
+        |f| if f >= 60 { "60 fps" } else { "30 fps" },
+        s.video_fps,
+        &state,
+        &on_change,
+        |s, v| s.video_fps = v,
+    ));
+    vgroup.add(&switch(
+        "Stabilization",
+        "Steadies videos with the gyroscope; crops 10 % more",
+        s.stabilization,
+        &state,
+        &on_change,
+        |s, v| s.stabilization = v,
+    ));
     video.add(&vgroup);
 
     // Advanced and about.
@@ -260,9 +280,13 @@ pub fn dialog(
         &on_change,
         |s, v| s.keep_pro = v,
     ));
-    adv.add(&later(
-        "Lens switching",
-        "Automatic by zoom; a manual choice is coming later",
+    adv.add(&switch(
+        "Low-light lens",
+        "In dim light, the main camera shows the telephoto's zoom (not in Pro)",
+        s.low_light,
+        &state,
+        &on_change,
+        |s, v| s.low_light = v,
     ));
     adv.add(&later("RAW (DNG) with JPEG", "Coming later"));
     adv.add(&switch(

@@ -46,8 +46,33 @@ fn pixel(raw: &Raw<'_>, x: u32, y: u32) -> [u8; 4] {
     }
 }
 
+/// A fractional window (x, y, w, h) on a `width` x `height` frame as
+/// whole, even pixels inside it.
+pub fn window_rect(width: u32, height: u32, window: (f64, f64, f64, f64)) -> (u32, u32, u32, u32) {
+    let (x, y, w, h) = window;
+    let finite = |v: f64, d: f64| if v.is_finite() { v } else { d };
+    let size = |v: f64, whole: u32| {
+        (finite(v, whole as f64).max(0.0) as u32 & !1).clamp(2.min(whole), whole)
+    };
+    let (cw, ch) = (size(w, width), size(h, height));
+    let edge = |v: f64, size: u32, whole: u32| {
+        ((finite(v, 0.0).round().max(0.0) as u32) & !1).min((whole - size) & !1)
+    };
+    (edge(x, cw, width), edge(y, ch, height), cw, ch)
+}
+
 /// Crop by `crop` about the center and turn clockwise by `rotation`.
 pub fn crop_and_rotate(raw: &Raw<'_>, crop: f64, rotation: u32) -> Result<Bgrx> {
+    crop_window_and_rotate(raw, crop_rect(raw.width, raw.height, crop), rotation)
+}
+
+/// Crop to `rect` (x, y, w, h, inside the frame) and turn clockwise by
+/// `rotation`.
+pub fn crop_window_and_rotate(
+    raw: &Raw<'_>,
+    rect: (u32, u32, u32, u32),
+    rotation: u32,
+) -> Result<Bgrx> {
     let bpp = raw.layout.bytes_per_pixel();
     if raw.stride < raw.width * bpp
         || (raw.data.len() as u64)
@@ -55,7 +80,10 @@ pub fn crop_and_rotate(raw: &Raw<'_>, crop: f64, rotation: u32) -> Result<Bgrx> 
     {
         bail!("frame data is shorter than its size says");
     }
-    let (cx, cy, cw, ch) = crop_rect(raw.width, raw.height, crop);
+    let (cx, cy, cw, ch) = rect;
+    if cw == 0 || ch == 0 || cx + cw > raw.width || cy + ch > raw.height {
+        bail!("crop outside the frame");
+    }
     let rotation = rotation % 360;
     let (ow, oh) = if rotation % 180 == 90 {
         (ch, cw)
@@ -256,6 +284,38 @@ mod tests {
         let img = crop_and_rotate(&raw(&d), 1.0, 180).unwrap();
         assert_eq!(blue(&img, 0, 0), 31);
         assert_eq!(blue(&img, 3, 1), 0);
+    }
+
+    #[test]
+    fn windows_become_even_pixels_inside_the_frame() {
+        assert_eq!(
+            window_rect(4080, 3072, (0.0, 0.0, 4080.0, 3072.0)),
+            (0, 0, 4080, 3072)
+        );
+        assert_eq!(
+            window_rect(4080, 3072, (1019.6, 768.2, 2040.4, 1536.9)),
+            (1020, 768, 2040, 1536)
+        );
+        // Past the edges: held inside.
+        assert_eq!(
+            window_rect(100, 50, (90.0, -5.0, 40.0, 80.0)),
+            (60, 0, 40, 50)
+        );
+        assert_eq!(
+            window_rect(100, 50, (f64::NAN, 0.0, f64::NAN, 10.0)),
+            (0, 0, 100, 10)
+        );
+        let d = vec![0u8; 16 * 4 * 4];
+        let r = Raw {
+            data: &d,
+            width: 16,
+            height: 4,
+            stride: 64,
+            layout: PixelLayout::Xrgb8888,
+        };
+        let img = crop_window_and_rotate(&r, window_rect(16, 4, (2.0, 0.0, 6.0, 4.0)), 90).unwrap();
+        assert_eq!((img.width, img.height), (4, 6));
+        assert!(crop_window_and_rotate(&r, (14, 0, 4, 4), 0).is_err());
     }
 
     #[test]

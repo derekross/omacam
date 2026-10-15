@@ -195,7 +195,8 @@ pub struct Settings {
     pub grid: Grid,
     /// Save front-camera photos mirrored, as the preview shows them.
     pub mirror_front: bool,
-    /// Location tags (not built yet; off by default, CAMERA-APP-PLAN Q5).
+    /// Location tags in photos and videos, from GeoClue (off by default,
+    /// CAMERA-APP-PLAN Q5).
     pub location: bool,
     /// The shutter sound (on by default, Q7).
     pub shutter_sound: bool,
@@ -210,6 +211,12 @@ pub struct Settings {
     /// launch starts fully automatic).
     pub keep_pro: bool,
     pub pro: SavedPro,
+    /// In dim light, show the telephoto's zoom with the main camera.
+    pub low_light: bool,
+    /// Video frame rate: 30, or 60 where the lens's mode allows it.
+    pub video_fps: u32,
+    /// Steady videos with the gyroscope, where the phone has one.
+    pub stabilization: bool,
 }
 
 impl Default for Settings {
@@ -230,6 +237,9 @@ impl Default for Settings {
             video_resolution: VideoResolution::FullHd,
             keep_pro: false,
             pro: SavedPro::default(),
+            low_light: true,
+            video_fps: 30,
+            stabilization: true,
         }
     }
 }
@@ -271,6 +281,7 @@ impl Settings {
 
     fn sanitized(mut self) -> Settings {
         self.jpeg_quality = self.jpeg_quality.clamp(50, 100);
+        self.video_fps = if self.video_fps >= 60 { 60 } else { 30 };
         if self
             .save_dir
             .as_ref()
@@ -328,6 +339,9 @@ mod tests {
         assert_eq!(s.timer, Timer::Off);
         assert_eq!(s.grid, Grid::Off);
         assert_eq!(s.save_dir, None);
+        assert!(s.low_light, "the low-light lens on");
+        assert_eq!(s.video_fps, 30);
+        assert!(s.stabilization);
     }
 
     #[test]
@@ -360,6 +374,9 @@ mod tests {
                 white_balance: Some(SavedWb::Kelvin(4300)),
                 focus: None,
             },
+            low_light: false,
+            video_fps: 60,
+            stabilization: false,
         };
         s.save(&p).unwrap();
         let text = std::fs::read_to_string(&p).unwrap();
@@ -382,9 +399,10 @@ mod tests {
     #[test]
     fn out_of_range_values_are_clamped() {
         let p = tmp("clamp");
-        std::fs::write(&p, "jpeg_quality = 10\nsave_dir = \"\"\n").unwrap();
+        std::fs::write(&p, "jpeg_quality = 10\nsave_dir = \"\"\nvideo_fps = 45\n").unwrap();
         let s = Settings::load(&p);
         assert_eq!(s.jpeg_quality, 50);
+        assert_eq!(s.video_fps, 30, "only 30 or 60");
         assert_eq!(s.save_dir, None);
     }
 

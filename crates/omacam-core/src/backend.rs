@@ -304,6 +304,41 @@ pub struct Controls {
     /// The tapped window, for spot metering (AfMetering Windows +
     /// AfWindows; AeMeteringMode Spot meters it), even with manual focus.
     pub metering_window: Option<Rect>,
+    /// Continuous autofocus on this window (AfMode Continuous, AfMetering
+    /// Windows, AfWindows): a tap while recording video.
+    pub af_window: Option<Rect>,
+    /// FrameDurationLimits, both ends: a fixed frame rate (16 667 us is
+    /// 60 fps). None leaves the camera's.
+    pub frame_duration_us: Option<i64>,
+}
+
+impl Controls {
+    /// `newer` on top of `self`: what it sets wins, what it leaves alone
+    /// stays (two changes before the camera's next request).
+    pub fn merged(self, newer: Controls) -> Controls {
+        Controls {
+            exposure_us: newer.exposure_us.or(self.exposure_us),
+            analog_gain: newer.analog_gain.or(self.analog_gain),
+            color_gains: newer.color_gains.or(self.color_gains),
+            lens_position: newer.lens_position.or(self.lens_position),
+            af_continuous: newer.af_continuous || (self.af_continuous && newer.focus.is_none()),
+            focus: newer
+                .focus
+                .or(if newer.af_continuous || newer.af_window.is_some() {
+                    None
+                } else {
+                    self.focus
+                }),
+            settings: newer.settings.or(self.settings),
+            metering_window: newer.metering_window.or(self.metering_window),
+            af_window: newer.af_window.or(if newer.focus.is_some() {
+                None
+            } else {
+                self.af_window
+            }),
+            frame_duration_us: newer.frame_duration_us.or(self.frame_duration_us),
+        }
+    }
 }
 
 /// What the user set: everything Auto by default.
@@ -445,6 +480,10 @@ pub enum Event {
         size: Size,
         stride: u32,
         layout: PixelLayout,
+        /// The highest frame rate the configured mode allows, from its
+        /// FrameDurationLimits minimum; None when the camera doesn't
+        /// report frame durations (it runs at its own rate, 30 fps).
+        max_fps: Option<f64>,
     },
     Frame(Frame),
     /// Something the user should know that isn't a failure (a still taken

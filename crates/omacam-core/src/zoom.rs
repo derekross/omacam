@@ -174,17 +174,6 @@ impl ZoomPlanner {
         }
     }
 
-    /// Set the zoom without leaving the current lens (while recording):
-    /// clamped to the lens's own factor at the low end. Returns true when
-    /// the clamp held the zoom back.
-    pub fn set_locked(&mut self, zoom: f64) -> bool {
-        let floor = self.ladder.factor(self.target);
-        let wanted = self.ladder.clamp(zoom);
-        self.zoom = wanted.max(floor);
-        self.pending_since = None;
-        wanted < floor - 1e-9
-    }
-
     /// The gesture ended: decide at the next tick without waiting longer.
     pub fn release(&mut self, now: Instant) -> Option<usize> {
         if self.pending_since.is_some() {
@@ -371,21 +360,6 @@ mod tests {
             p.next_tick(t0 + Duration::from_millis(50)),
             Some(Duration::from_millis(100))
         );
-    }
-
-    #[test]
-    fn locked_zoom_stays_on_the_lens() {
-        let mut p = ZoomPlanner::new(cheetah(), 1.0);
-        assert!(!p.set_locked(3.0));
-        assert_eq!(p.target(), MAIN);
-        assert!(
-            !p.set_locked(8.0),
-            "past the tele's threshold: the main crops"
-        );
-        assert_eq!((p.target(), p.zoom()), (MAIN, 8.0));
-        assert!(p.set_locked(0.5), "below the main's own view: held at 1x");
-        assert_eq!((p.target(), p.zoom()), (MAIN, 1.0));
-        assert!(!p.is_settling());
     }
 
     #[test]

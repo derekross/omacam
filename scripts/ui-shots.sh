@@ -40,12 +40,24 @@ docker run --rm --user "$(id -u):$(id -g)" -e W="$w" -e H="$h" -e SCALE="$scale"
     mode video; wait 0.5; shot /out/video-mode.png;
     shutter; wait 2; zoom 2; wait 1; shot /out/recording.png; shutter; wait 3;
     shot /out/after-video.png; quit"
-' 2>&1 | grep -E "WARN|ERROR|window saved" || true
+  # A dim room whose cameras offer 60 fps: the low-light fallback at 5x,
+  # the controls turned for a phone held sideways, and a recording that
+  # switches lenses (main, ultrawide, main) as it goes.
+  WAYLAND_DISPLAY=wayland-9 GSK_RENDERER=cairo timeout 60 /omacam --fake --fake-light 0.05 --fake-fps 60 \
+    --output-dir /out/dim --script "
+    wait 2; zoom 5; wait 4; shot /out/low-light.png; hold left; wait 0.6; shot /out/held-left.png;
+    pro on; wait 0.6; shot /out/held-left-pro.png; pro off; hold normal; wait 0.5; zoom 1; mode video; wait 1.5;
+    shot /out/video-60.png; shutter; wait 2; zoom 0.5; wait 2; shot /out/recording-switched.png;
+    zoom 1; wait 2; shutter; wait 3; quit"
+  for v in /out/photos/VID_*.mp4 /out/dim/VID_*.mp4; do
+    gst-discoverer-1.0 "$v" 2>/dev/null | grep -E "Duration|video #|Location|geo" | sed "s|^|$(basename $v): |"
+  done
+' 2>&1 | grep -E "WARN|ERROR|window saved|VID_|recording from another camera" || true
 ls "$out"
-video=$(ls "$out"/photos/VID_*.mp4 2>/dev/null | head -1 || true)
-if [[ -n $video ]]; then
-  echo "recorded: $video ($(stat -c %s "$video") bytes)"
+videos=$(ls "$out"/photos/VID_*.mp4 "$out"/dim/VID_*.mp4 2>/dev/null | wc -l)
+if [[ $videos -ge 2 ]]; then
+  ls -l "$out"/photos/VID_*.mp4 "$out"/dim/VID_*.mp4
 else
-  echo "no video recorded" >&2
+  echo "expected two videos, got $videos" >&2
   exit 1
 fi
