@@ -105,7 +105,7 @@ pub fn dialog(
     let shape = adw::PreferencesGroup::builder().title("Picture").build();
     shape.add(&combo(
         "Aspect ratio",
-        Some("Cropped from the centre of the frame"),
+        Some("Cropped from the center of the frame"),
         &Aspect::ALL,
         Aspect::label,
         s.aspect,
@@ -226,7 +226,7 @@ pub fn dialog(
         |s, v| s.video_resolution = v,
     ));
     vgroup.add(&later("Frame rate", "30 fps; other rates later"));
-    vgroup.add(&later("Stabilisation", "Coming later"));
+    vgroup.add(&later("Stabilization", "Coming later"));
     video.add(&vgroup);
 
     // Advanced and about.
@@ -280,7 +280,7 @@ pub fn dialog(
         "Camera",
         &format!("omacam {}", env!("CARGO_PKG_VERSION")),
     ));
-    about.add(&info("Licence", "GPL-3.0-or-later"));
+    about.add(&info("License", "GPL-3.0-or-later"));
     about.add(&info(
         "Credits",
         "Theme support adapted from gliff by Kevin McConnell (MIT)",

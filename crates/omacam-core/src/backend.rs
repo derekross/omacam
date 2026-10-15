@@ -100,7 +100,7 @@ pub struct Caps {
     /// AwbMode presets.
     pub awb_modes: bool,
     /// ColourTemperature (with AwbEnable off), kelvin.
-    pub colour_temperature: Option<(i32, i32)>,
+    pub color_temperature: Option<(i32, i32)>,
     /// LensPosition with AfMode Manual: manual focus.
     pub lens_position: Option<(f32, f32)>,
     /// AeEnable: false holds the current exposure (AE lock).
@@ -111,7 +111,7 @@ pub struct Caps {
     pub af_pause: bool,
     /// ColourGains [red, blue] range (with AwbEnable off): white balance by
     /// gains where there's no ColourTemperature.
-    pub colour_gains: Option<(f32, f32)>,
+    pub color_gains: Option<(f32, f32)>,
 }
 
 impl Caps {
@@ -124,7 +124,7 @@ impl Caps {
     }
 
     pub fn white_balance(&self) -> bool {
-        self.awb_modes || self.colour_temperature.is_some() || self.colour_gains.is_some()
+        self.awb_modes || self.color_temperature.is_some() || self.color_gains.is_some()
     }
 
     /// Can AE/AF lock hold the exposure: AeEnable, or manual exposure.
@@ -154,7 +154,7 @@ impl<T: Copy> Setting<T> {
     }
 }
 
-/// White balance by preset or colour temperature.
+/// White balance by preset or color temperature.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Awb {
     Preset(AwbPreset),
@@ -180,7 +180,7 @@ impl AwbPreset {
         AwbPreset::Fluorescent,
     ];
 
-    /// The colour temperature a preset stands for, for cameras that take
+    /// The color temperature a preset stands for, for cameras that take
     /// a temperature but no presets.
     pub fn kelvin(self) -> u32 {
         match self {
@@ -290,8 +290,8 @@ pub enum AfState {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Controls {
     pub exposure_us: Option<i32>,
-    pub analogue_gain: Option<f32>,
-    pub colour_gains: Option<[f32; 2]>,
+    pub analog_gain: Option<f32>,
+    pub color_gains: Option<[f32; 2]>,
     pub lens_position: Option<f32>,
     /// Ask for continuous autofocus where the camera has it.
     pub af_continuous: bool,
@@ -338,9 +338,9 @@ pub struct FrameMeta {
     pub sequence: u32,
     pub timestamp_ns: u64,
     pub exposure_us: Option<i32>,
-    pub analogue_gain: Option<f32>,
+    pub analog_gain: Option<f32>,
     pub digital_gain: Option<f32>,
-    pub colour_gains: Option<[f32; 2]>,
+    pub color_gains: Option<[f32; 2]>,
     pub af_state: Option<AfState>,
     pub lens_position: Option<f32>,
     pub ae_state: Option<AeState>,

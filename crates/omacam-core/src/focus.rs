@@ -3,7 +3,7 @@
 //!
 //! A tap arrives as a point on the drawn picture, (0, 0) at its top left
 //! and (1, 1) at its bottom right. The picture is the frame turned upright,
-//! mirrored for the front camera, and cropped by the zoom about its centre,
+//! mirrored for the front camera, and cropped by the zoom about its center,
 //! so the tap is mapped back through each of those to a point on the frame,
 //! and from there to `ScalerCropMaximum`, the coordinates `AfWindows` uses.
 //! The processed frame is taken to show all of `ScalerCropMaximum`; the
@@ -33,7 +33,7 @@ pub const HOLD: Duration = Duration::from_secs(5);
 pub const NOTICE: Duration = Duration::from_millis(1500);
 
 /// A tap on the drawn picture back to a point on the frame, both
-/// normalised to 0..1.
+/// normalized to 0..1.
 pub fn picture_to_frame(u: f64, v: f64, t: &Transform) -> (f64, f64) {
     let scale = t.scale.max(1.0);
     let u = 0.5 + (u - 0.5) / scale;
@@ -62,7 +62,7 @@ pub fn frame_to_picture(x: f64, y: f64, t: &Transform) -> (f64, f64) {
     (0.5 + (u - 0.5) * scale, 0.5 + (v - 0.5) * scale)
 }
 
-/// A focus window centred on a frame point, inside `area`.
+/// A focus window centered on a frame point, inside `area`.
 pub fn window(x: f64, y: f64, area: Rect) -> Rect {
     // A square of WINDOW_FRACTION of the shorter side, but at least 10 %
     // of each side (libcamera 4.10's minimum for AfWindows).
@@ -184,8 +184,8 @@ impl FocusController {
                 },
                 (u, v),
             ),
-            // No windows: the AF scans its own centre window, so show the
-            // ring on the frame's centre.
+            // No windows: the AF scans its own center window, so show the
+            // ring on the frame's center.
             _ => (
                 FocusRequest { window: None },
                 frame_to_picture(0.5, 0.5, transform),
@@ -314,7 +314,7 @@ mod tests {
             picture_to_frame(0.2, 0.3, &t(0, false, 1.0)),
             (0.2, 0.3)
         ));
-        // The centre stays the centre whatever the transform.
+        // The center stays the center whatever the transform.
         for r in [0, 90, 180, 270] {
             for m in [false, true] {
                 assert!(close(picture_to_frame(0.5, 0.5, &t(r, m, 3.0)), (0.5, 0.5)));

@@ -248,7 +248,7 @@ impl Settings {
             Err(_) => return Settings::default(),
         };
         match toml::from_str::<Settings>(&text) {
-            Ok(s) => s.sanitised(),
+            Ok(s) => s.sanitized(),
             Err(e) => {
                 tracing::warn!(path = %path.display(), error = %e, "settings unreadable; using defaults");
                 let _ = std::fs::rename(path, path.with_extension("toml.bad"));
@@ -263,13 +263,13 @@ impl Settings {
             std::fs::create_dir_all(dir)?;
         }
         let text =
-            toml::to_string_pretty(&self.clone().sanitised()).map_err(std::io::Error::other)?;
+            toml::to_string_pretty(&self.clone().sanitized()).map_err(std::io::Error::other)?;
         let tmp = path.with_extension("toml.part");
         std::fs::write(&tmp, text)?;
         std::fs::rename(&tmp, path)
     }
 
-    fn sanitised(mut self) -> Settings {
+    fn sanitized(mut self) -> Settings {
         self.jpeg_quality = self.jpeg_quality.clamp(50, 100);
         if self
             .save_dir

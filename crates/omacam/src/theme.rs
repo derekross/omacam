@@ -7,7 +7,7 @@
 //! Follow the Omarchy theme. Omarchy 4 keeps the active theme in
 //! `~/.local/state/omarchy/current/theme/`, a directory it swaps atomically
 //! on every theme change, and describes the palette in `colors.toml` there.
-//! When that file exists, its colours are mapped onto the CSS variables that
+//! When that file exists, its colors are mapped onto the CSS variables that
 //! libadwaita styles every widget from, and the light/dark scheme is forced
 //! to match. Without it, the app stays on stock Adwaita and follows the
 //! desktop's dark/light preference.
@@ -80,7 +80,7 @@ fn apply(provider: &gtk::CssProvider, theme_dir: &Path) {
     let style = adw::StyleManager::default();
     match Palette::load(theme_dir) {
         Some(palette) => {
-            tracing::info!(mode = ?palette.mode, "applying Omarchy theme colours");
+            tracing::info!(mode = ?palette.mode, "applying Omarchy theme colors");
             style.set_color_scheme(match palette.mode {
                 Mode::Dark => adw::ColorScheme::ForceDark,
                 Mode::Light => adw::ColorScheme::ForceLight,
@@ -105,7 +105,7 @@ pub enum Mode {
 pub struct Rgb(pub u8, pub u8, pub u8);
 
 impl Rgb {
-    /// Accepts `#rrggbb` only, the form Omarchy's own colour maths requires.
+    /// Accepts `#rrggbb` only, the form Omarchy's own color maths requires.
     fn parse(s: &str) -> Option<Rgb> {
         let hex = s.strip_prefix('#')?.as_bytes();
         if hex.len() != 6 || !hex.iter().all(u8::is_ascii_hexdigit) {
@@ -149,7 +149,7 @@ impl Rgb {
         a.max(b) / a.min(b)
     }
 
-    /// Text colour that reads best on top of this colour, from the two
+    /// Text color that reads best on top of this color, from the two
     /// Adwaita uses on filled buttons: white, or near-black at 80%.
     fn contrasting_fg(self) -> &'static str {
         let near_black = self.mix(Rgb(0, 0, 6), 0.8);
@@ -164,7 +164,7 @@ impl Rgb {
 const BLACK: Rgb = Rgb(0, 0, 0);
 const WHITE: Rgb = Rgb(255, 255, 255);
 
-/// The colours the app needs, resolved from an Omarchy `colors.toml` with
+/// The colors the app needs, resolved from an Omarchy `colors.toml` with
 /// the same fallbacks Omarchy's own `omarchy-theme-color` applies.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Palette {
@@ -237,8 +237,8 @@ impl Palette {
     }
 
     /// CSS that overrides the libadwaita palette variables. The standalone
-    /// colours (`--accent-color` etc.) are left alone: Adwaita derives them
-    /// from these background colours.
+    /// colors (`--accent-color` etc.) are left alone: Adwaita derives them
+    /// from these background colors.
     pub fn css(&self) -> String {
         let (window, view, headerbar, raised) = match self.mode {
             Mode::Dark => (
@@ -430,7 +430,7 @@ blue = "#89b4fa"
     }
 
     #[test]
-    fn text_colour_maximises_contrast() {
+    fn text_color_maximizes_contrast() {
         assert_eq!(Rgb(0x64, 0x4a, 0xc9).contrasting_fg(), "#ffffff");
         assert_eq!(Rgb(0xf9, 0xe2, 0xaf).contrasting_fg(), "rgb(0 0 6 / 80%)");
         assert_eq!(Rgb(0x7a, 0xa2, 0xf7).contrasting_fg(), "rgb(0 0 6 / 80%)");
@@ -438,7 +438,7 @@ blue = "#89b4fa"
     }
 
     #[test]
-    fn rejects_malformed_colours_without_panicking() {
+    fn rejects_malformed_colors_without_panicking() {
         assert_eq!(Rgb::parse("#a\u{e9}xxx"), None);
         assert_eq!(Rgb::parse("#1e1e2e80"), None);
         assert_eq!(Rgb::parse("#fff"), None);

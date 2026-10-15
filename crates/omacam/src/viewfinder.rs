@@ -3,7 +3,7 @@
 //! transform (no pixel copies).
 //!
 //! The frame is fitted inside the widget (the whole frame shows, as the
-//! picture will) and centred in the part above the controls when it fits
+//! picture will) and centered in the part above the controls when it fits
 //! there.
 
 use std::cell::{Cell, RefCell};
@@ -16,7 +16,7 @@ use gtk4 as gtk;
 /// How to draw the current texture.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Placement {
-    /// Magnification about the centre (the zoom crop).
+    /// Magnification about the center (the zoom crop).
     pub scale: f64,
     /// Clockwise degrees to turn the frame upright.
     pub rotation: u32,
@@ -52,7 +52,7 @@ pub fn fit(frame: (f32, f32), widget: (f32, f32), inset: f32) -> graphene::Rect 
 }
 
 /// The part of an upright frame of `frame` size that shows at `scale`:
-/// a centred rectangle (x, y, w, h) in frame pixels. Drawing clips the
+/// a centered rectangle (x, y, w, h) in frame pixels. Drawing clips the
 /// scaled frame to its fitted rectangle, so this is what fills it.
 #[cfg(test)]
 fn visible_source(frame: (f32, f32), scale: f64) -> (f32, f32, f32, f32) {
@@ -203,7 +203,7 @@ pub struct Ring {
     pub color: gdk::RGBA,
 }
 
-/// The largest centred part of an upright frame with the given aspect
+/// The largest centered part of an upright frame with the given aspect
 /// (width over height); the whole frame for None.
 pub fn crop_to_aspect(upright: (f32, f32), aspect: Option<f64>) -> (f32, f32) {
     let Some(a) = aspect.filter(|a| a.is_finite() && *a > 0.0) else {
@@ -368,7 +368,7 @@ mod tests {
     }
 
     #[test]
-    fn portrait_4_3_frame_centres_above_the_controls() {
+    fn portrait_4_3_frame_centers_above_the_controls() {
         let r = fit((1512.0, 2016.0), (480.0, 1040.0), 220.0);
         assert!((r.height() - 640.0).abs() < 0.01);
         assert!((r.y() - 90.0).abs() < 0.01);
@@ -428,7 +428,7 @@ mod tests {
     }
 
     #[test]
-    fn aspect_crops_keep_the_centre_and_the_requested_shape() {
+    fn aspect_crops_keep_the_center_and_the_requested_shape() {
         // Main camera upright: 1136x2008.
         let up = (1136.0, 2008.0);
         assert_eq!(crop_to_aspect(up, None), up);
@@ -442,7 +442,7 @@ mod tests {
     fn taps_on_the_shown_picture_map_to_the_whole_picture() {
         let up = (1136.0, 2008.0);
         let widget = (456.0, 730.0);
-        // The centre is the centre.
+        // The center is the center.
         let shown = crop_to_aspect(up, Some(1.0));
         let r = fit(shown, widget, 0.0);
         let c = widget_to_picture(

@@ -204,7 +204,7 @@ Automatic by default, with manual control where the camera allows it:
   Windows with one AfWindows rectangle (at least 10 % of the picture per
   side, in sensor active-area coordinates), AeMeteringMode Spot (which
   meters the same rectangle) and AfTrigger Start. Without AeMeteringMode
-  the area is metered by brightness: its mean luma is brought to mid-grey
+  the area is metered by brightness: its mean luma is brought to mid-gray
   (118 of 255) through `ExposureValue`, at most ±2 EV.
 - **The EV slider** appears beside the focus ring for a few seconds after
   a tap, -2..+2 EV on top of the metering; the next tap or a lens switch
@@ -220,19 +220,19 @@ Automatic by default, with manual control where the camera allows it:
   drives the other), white balance and manual focus (AfMode Manual +
   LensPosition, 0-1), each with an "A" (auto) state. White balance has
   four presets, Sun, Cloud, Bulb and Tube: on a camera that advertises
-  ColourTemperature (only the ultrawide, 2890-7900 K) they are colour
+  ColourTemperature (only the ultrawide, 2890-7900 K) they are color
   temperatures, elsewhere fixed ColourGains [r, b] with AwbEnable false.
   Chips show auto's live choice from the frame metadata when on auto. ISO
-  is analogue gain × the sensor's base ISO (`base_iso` in the lens table:
+  is analog gain × the sensor's base ISO (`base_iso` in the lens table:
   50, an estimate). A histogram of the picture's luma can be shown over
   the picture. Pro values hold across lens switches, apply to stills and
   video alike, and reset at each launch unless "Keep Pro settings" is on.
 - **Stills wait for the exposure to settle.** After the switch to the
-  still mode, the capture waits for AeState Converged (and the colour to
+  still mode, the capture waits for AeState Converged (and the color to
   settle), at most 10 frames; a camera without AeState gets 8 frames.
 - **What the camera offers decides what's enabled.** Every control is
   looked up in the camera's ControlInfoMap at startup (logged as "camera
-  controls"); a chip whose control is missing is greyed with a tooltip.
+  controls"); a chip whose control is missing is grayed with a tooltip.
   On the phone's libcamera 0.7.2-4.8 the main camera offers AfMode,
   AfTrigger and LensPosition (0-1) and none of the exposure or white
   balance controls, so manual focus works there and the rest waits for
@@ -263,12 +263,12 @@ active zoom button and the busy shutter take the theme's accent.
 - Tap to focus and exposure compensation (need the libcamera patches L1,
   L2 in Omarchy Mobile's `packages/libcamera`).
 - Location tags, the in-app viewer of recent shots.
-- Video: other frame rates, stabilisation, lens switching while recording.
+- Video: other frame rates, stabilization, lens switching while recording.
 - The on-screen controls don't turn with the phone yet.
 - Location tags: the EXIF GPS writer is done and tested (`exif::Gps`);
   the setting stays off until omacam gets fixes from GeoClue.
 - Exposure carried across a lens switch: computed (`exposure.rs`), passed to
   libcamera only with `--exposure-hints` until it's checked whether the
   simple IPA takes `ExposureTime` as a starting point or as manual exposure.
-- Calibration of the zoom factors and lens centre offsets (P4); the
+- Calibration of the zoom factors and lens center offsets (P4); the
   cross-fade at a switch.

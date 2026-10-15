@@ -27,7 +27,7 @@ pub struct Bgrx {
     pub data: Vec<u8>,
 }
 
-/// The centred crop rectangle for a zoom crop factor: (x, y, w, h), even.
+/// The centered crop rectangle for a zoom crop factor: (x, y, w, h), even.
 pub fn crop_rect(width: u32, height: u32, crop: f64) -> (u32, u32, u32, u32) {
     let crop = if crop.is_finite() { crop.max(1.0) } else { 1.0 };
     let w = (((width as f64 / crop) as u32) & !1).clamp(2.min(width), width);
@@ -46,7 +46,7 @@ fn pixel(raw: &Raw<'_>, x: u32, y: u32) -> [u8; 4] {
     }
 }
 
-/// Crop by `crop` about the centre and turn clockwise by `rotation`.
+/// Crop by `crop` about the center and turn clockwise by `rotation`.
 pub fn crop_and_rotate(raw: &Raw<'_>, crop: f64, rotation: u32) -> Result<Bgrx> {
     let bpp = raw.layout.bytes_per_pixel();
     if raw.stride < raw.width * bpp
@@ -85,7 +85,7 @@ pub fn crop_and_rotate(raw: &Raw<'_>, crop: f64, rotation: u32) -> Result<Bgrx> 
     })
 }
 
-/// The largest centred part of `img` with `aspect` (width over height).
+/// The largest centered part of `img` with `aspect` (width over height).
 pub fn crop_to_aspect(img: Bgrx, aspect: Option<f64>) -> Bgrx {
     let Some(a) = aspect.filter(|a| a.is_finite() && *a > 0.0) else {
         return img;
@@ -161,8 +161,8 @@ pub fn encode_jpeg(img: &Bgrx, quality: i32) -> Result<Vec<u8>> {
     Ok(jpeg.to_vec())
 }
 
-/// A small square copy for the round gallery button: the centre square,
-/// scaled to [`THUMB`] pixels (nearest neighbour; it's tiny).
+/// A small square copy for the round gallery button: the center square,
+/// scaled to [`THUMB`] pixels (nearest neighbor; it's tiny).
 pub fn thumbnail(img: &Bgrx) -> Bgrx {
     let side = img.width.min(img.height).max(1);
     let (x0, y0) = ((img.width - side) / 2, (img.height - side) / 2);
@@ -259,7 +259,7 @@ mod tests {
     }
 
     #[test]
-    fn crop_keeps_the_centre() {
+    fn crop_keeps_the_center() {
         assert_eq!(crop_rect(4080, 3072, 2.0), (1020, 768, 2040, 1536));
         assert_eq!(crop_rect(4080, 3072, 1.0), (0, 0, 4080, 3072));
         assert_eq!(crop_rect(4080, 3072, 0.5), (0, 0, 4080, 3072));
@@ -317,7 +317,7 @@ mod tests {
         };
         let sq = crop_to_aspect(img.clone(), Some(1.0));
         assert_eq!((sq.width, sq.height), (4, 4));
-        // The centre rows: 2..6.
+        // The center rows: 2..6.
         assert_eq!(sq.data[1], 2);
         assert_eq!(crop_to_aspect(img.clone(), None), img);
         let h = half(&img);

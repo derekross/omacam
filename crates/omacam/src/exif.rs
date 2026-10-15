@@ -46,9 +46,9 @@ pub struct Info {
 pub struct Gps {
     pub latitude: f64,
     pub longitude: f64,
-    /// Metres above sea level.
+    /// Meters above sea level.
     pub altitude: Option<f64>,
-    /// Horizontal accuracy, metres.
+    /// Horizontal accuracy, meters.
     pub accuracy: Option<f64>,
     /// UTC date "YYYY:MM:DD" and time (h, m, s) of the fix.
     pub date: String,

@@ -199,7 +199,7 @@ impl Config {
 }
 
 /// The crop (left, right, top, bottom, in input pixels) that takes the
-/// output's aspect out of the centre of the frame and then zooms by
+/// output's aspect out of the center of the frame and then zooms by
 /// `scale` (1 = no zoom).
 pub fn crop_for(in_w: u32, in_h: u32, out_w: u32, out_h: u32, scale: f64) -> (u32, u32, u32, u32) {
     let (iw, ih) = (in_w as f64, in_h as f64);
@@ -608,14 +608,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn crop_takes_16_9_from_4_3_and_zooms_about_the_centre() {
+    fn crop_takes_16_9_from_4_3_and_zooms_about_the_center() {
         // The ultrawide's 2008x1508 to 1920x1080: full width, 1129 rows.
         let (l, r, t, b) = crop_for(2008, 1508, 1920, 1080, 1.0);
         assert_eq!((l, r), (0, 0));
         let h = 1508 - t - b;
         assert!((h as i32 - 1129).abs() <= 1, "{h}");
         assert!(t.abs_diff(b) <= 2);
-        // At 2x, half of that each way, centred.
+        // At 2x, half of that each way, centered.
         let (l, r, t, b) = crop_for(2008, 1508, 1920, 1080, 2.0);
         assert_eq!(2008 - l - r, 1004);
         assert!(l.abs_diff(r) <= 2 && t.abs_diff(b) <= 2);

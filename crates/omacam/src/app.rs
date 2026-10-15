@@ -291,7 +291,7 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
     rec_label.set_can_target(false);
     overlay.add_overlay(&rec_label);
 
-    // Centre: zoom readout while zooming, and status text.
+    // Center: zoom readout while zooming, and status text.
     let zoom_indicator = gtk::Label::new(None);
     zoom_indicator.add_css_class("zoom-indicator");
     zoom_indicator.set_halign(gtk::Align::Center);
@@ -356,7 +356,7 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
     // come and go without moving anything.
     let picture_bottom = gtk::Box::new(gtk::Orientation::Vertical, 6);
     picture_bottom.set_valign(gtk::Align::End);
-    // Full width, for the Pro panel; the label and slider centre
+    // Full width, for the Pro panel; the label and slider center
     // themselves.
     picture_bottom.set_halign(gtk::Align::Fill);
     picture_bottom.set_margin_bottom(8);
@@ -902,7 +902,7 @@ impl App {
         if self.cli.debug || self.cli.script.is_some() {
             self.shown_luma.set(mean_luma(&frame));
             self.shown_ae
-                .set((frame.meta.exposure_us, frame.meta.analogue_gain));
+                .set((frame.meta.exposure_us, frame.meta.analog_gain));
         }
         if let (FrameData::Shared(px), 4) = (&frame.data, frame.layout.bytes_per_pixel()) {
             *self.last_pixels.borrow_mut() = Some((
@@ -2102,13 +2102,13 @@ fn encode_and_write(
     let img = if opts.medium { photo::half(&img) } else { img };
     let jpeg = photo::encode_jpeg(&img, opts.quality)?;
     let m = &p.frame.meta;
-    let gain = m.analogue_gain.unwrap_or(1.0) as f64 * m.digital_gain.unwrap_or(1.0) as f64;
+    let gain = m.analog_gain.unwrap_or(1.0) as f64 * m.digital_gain.unwrap_or(1.0) as f64;
     let info = exif::Info {
         width: img.width,
         height: img.height,
         exposure_us: m.exposure_us,
         iso: m
-            .analogue_gain
+            .analog_gain
             .map(|_| omacam_core::exposure_control::iso(gain, p.lens.base_iso)),
         manual_exposure: !p.settings.shutter.is_auto() || !p.settings.gain.is_auto(),
         manual_white_balance: !p.settings.white_balance.is_auto(),
@@ -2133,9 +2133,9 @@ fn encode_and_write(
         size = %format!("{}x{}", img.width, img.height),
         bytes = jpeg.len(),
         ms = started.elapsed().as_millis() as u64,
-        colour_gains = ?p.frame.meta.colour_gains,
+        color_gains = ?p.frame.meta.color_gains,
         exposure_us = ?p.frame.meta.exposure_us,
-        gain = ?p.frame.meta.analogue_gain,
+        gain = ?p.frame.meta.analog_gain,
         "photo encoded"
     );
     Ok((path, photo::thumbnail(&img)))

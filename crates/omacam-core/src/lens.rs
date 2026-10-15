@@ -39,7 +39,7 @@ pub struct Lens {
     pub zoom: f64,
     pub f_number: Option<f64>,
     pub focal_length_35mm: Option<u32>,
-    /// The real focal length, millimetres.
+    /// The real focal length, millimeters.
     pub focal_length_mm: Option<f64>,
     pub preview: Option<Size>,
     pub still: Option<Size>,
@@ -49,7 +49,7 @@ pub struct Lens {
     pub crop_maximum: Option<crate::backend::Rect>,
     /// The camera's manual controls.
     pub caps: crate::backend::Caps,
-    /// ISO at analogue gain 1, for showing gain as ISO.
+    /// ISO at analog gain 1, for showing gain as ISO.
     pub base_iso: f64,
     pub mirror: bool,
     /// The camera's Rotation in libcamera's sense (correct by turning

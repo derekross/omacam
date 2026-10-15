@@ -607,7 +607,7 @@ impl Worker {
             return; // a stopped stream's leftovers
         };
         if req.status() != RequestStatus::Complete {
-            return; // cancelled by a stop
+            return; // canceled by a stop
         }
         let Some(fb) = req.buffer::<MappedBuffer>(&a.stream) else {
             return;
@@ -705,7 +705,7 @@ impl Worker {
         if let Err(e) = a.cam.stop() {
             tracing::warn!(error = %e, "stop failed");
         }
-        // stop() completed every queued request as cancelled: collect them
+        // stop() completed every queued request as canceled: collect them
         // so they're dropped before the camera and its allocator.
         while let Ok(m) = rx.try_recv() {
             match m {
@@ -720,7 +720,7 @@ impl Worker {
 }
 
 /// ColourGains is an array control: its range is per element.
-fn colour_gains_range(map: &ControlInfoMap) -> Option<(f32, f32)> {
+fn color_gains_range(map: &ControlInfoMap) -> Option<(f32, f32)> {
     let info = map.find(<controls::ColourGains as ControlEntry>::ID).ok()?;
     let first = |v: ControlValue| match v {
         ControlValue::Float(x) => x.first().copied(),
@@ -763,7 +763,7 @@ fn caps(map: &ControlInfoMap) -> Caps {
         manual_exposure: has(<controls::ExposureTimeMode as ControlEntry>::ID)
             || has(<controls::AeEnable as ControlEntry>::ID),
         awb_modes: has(<controls::AwbMode as ControlEntry>::ID),
-        colour_temperature: range(map, <controls::ColourTemperature as ControlEntry>::ID)
+        color_temperature: range(map, <controls::ColourTemperature as ControlEntry>::ID)
             .filter(|_| has(<controls::AwbEnable as ControlEntry>::ID))
             .map(|(a, b)| (a as i32, b as i32)),
         lens_position: range(map, <controls::LensPosition as ControlEntry>::ID)
@@ -773,7 +773,7 @@ fn caps(map: &ControlInfoMap) -> Caps {
         ae_metering: has(<controls::AeMeteringMode as ControlEntry>::ID)
             && has(<controls::AfWindows as ControlEntry>::ID),
         af_pause: has(<controls::AfPause as ControlEntry>::ID),
-        colour_gains: colour_gains_range(map)
+        color_gains: color_gains_range(map)
             .filter(|_| has(<controls::AwbEnable as ControlEntry>::ID)),
     }
 }
@@ -888,7 +888,7 @@ fn set_controls(list: &mut ControlList, c: &Controls, exposure_hints: bool) {
         if let Some(t) = c.exposure_us {
             let _ = list.set(controls::ExposureTime(t));
         }
-        if let Some(g) = c.analogue_gain {
+        if let Some(g) = c.analog_gain {
             let _ = list.set(controls::AnalogueGain(g));
         }
     }
@@ -903,9 +903,9 @@ fn frame_meta(req: &Request) -> FrameMeta {
             .map(|t| t.0 as u64)
             .unwrap_or(0),
         exposure_us: md.get::<controls::ExposureTime>().ok().map(|v| v.0),
-        analogue_gain: md.get::<controls::AnalogueGain>().ok().map(|v| v.0),
+        analog_gain: md.get::<controls::AnalogueGain>().ok().map(|v| v.0),
         digital_gain: md.get::<controls::DigitalGain>().ok().map(|v| v.0),
-        colour_gains: md.get::<controls::ColourGains>().ok().map(|v| v.0),
+        color_gains: md.get::<controls::ColourGains>().ok().map(|v| v.0),
         af_state: md.get::<controls::AfState>().ok().map(|s| match s {
             controls::AfState::Idle => AfState::Idle,
             controls::AfState::Scanning => AfState::Scanning,

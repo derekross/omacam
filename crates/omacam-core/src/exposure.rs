@@ -7,7 +7,7 @@
 //! with f-number N_new, exposure × gain must grow by (N_new/N_old)². Time
 //! is kept under the frame budget, and the rest goes to gain.
 
-/// Exposure as time and analogue gain.
+/// Exposure as time and analog gain.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Exposure {
     pub time_us: f64,

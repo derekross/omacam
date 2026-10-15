@@ -22,12 +22,12 @@ pub fn full_caps(movable_lens: bool) -> omacam_core::backend::Caps {
         gain: Some((1.0, 16.0)),
         manual_exposure: true,
         awb_modes: true,
-        colour_temperature: Some((2500, 8000)),
+        color_temperature: Some((2500, 8000)),
         lens_position: movable_lens.then_some((0.0, 1.0)),
         ae_enable: true,
         ae_metering: true,
         af_pause: true,
-        colour_gains: Some((0.25, 4.0)),
+        color_gains: Some((0.25, 4.0)),
     }
 }
 
@@ -211,7 +211,7 @@ fn fit(size: Size, max: Size) -> Size {
     )
 }
 
-/// A test card: a tinted gradient, a centre cross (to check crop and
+/// A test card: a tinted gradient, a center cross (to check crop and
 /// rotation centring), a block in the top-left corner (to check
 /// orientation) and a bar that moves with the frame count.
 fn render(stream: &Stream) -> Vec<u8> {
@@ -221,7 +221,7 @@ fn render(stream: &Stream) -> Vec<u8> {
     let mut px = vec![0u8; stride * h];
     let bar = (stream.sequence as usize * 8) % w;
     // What the settings would do to a real picture: EV and a manual
-    // exposure brighten or darken it, white balance shifts its colour.
+    // exposure brighten or darken it, white balance shifts its color.
     use omacam_core::backend::{Awb, AwbPreset, Setting};
     let set = &stream.settings;
     let mut light = 2f32.powf(set.ev);
@@ -400,7 +400,7 @@ fn step(s: &mut Stream, sink: &EventSink, opts: &Options, epoch: Instant) {
             sequence: s.sequence,
             timestamp_ns: now.duration_since(epoch).as_nanos() as u64,
             exposure_us: Some(s.settings.shutter.manual().unwrap_or(exposure)),
-            analogue_gain: Some(s.settings.gain.manual().unwrap_or(1.0)),
+            analog_gain: Some(s.settings.gain.manual().unwrap_or(1.0)),
             lens_position: Some(s.settings.lens.manual().unwrap_or(0.5)),
             ..FrameMeta::default()
         },
@@ -457,7 +457,7 @@ mod tests {
     }
 
     #[test]
-    fn render_marks_the_centre_and_the_top_left() {
+    fn render_marks_the_center_and_the_top_left() {
         let s = Stream {
             generation: 1,
             camera: "x".into(),

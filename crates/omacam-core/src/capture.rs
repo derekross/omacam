@@ -4,7 +4,7 @@
 //! is a short reconfiguration into the camera's large mode:
 //!
 //! 1. Shutter: if autofocus is still scanning, wait for it (at most
-//!    [`FOCUS_WAIT`]); then read the last exposure, gain and colour gains.
+//!    [`FOCUS_WAIT`]); then read the last exposure, gain and color gains.
 //! 2. Reconfigure to the still mode, with those values as start hints.
 //! 3. Drop frames until the auto-exposure says Converged (libcamera
 //!    4.10's AeState) and the white balance is back near the preview's,
@@ -36,7 +36,7 @@ pub const MAX_DISCARD: u32 = 10;
 pub const FIXED_DISCARD: u32 = 8;
 /// Longest wait for the still frame before giving up.
 pub const STILL_TIMEOUT: Duration = Duration::from_secs(6);
-/// How close each colour gain must be to the preview's.
+/// How close each color gain must be to the preview's.
 pub const GAINS_WITHIN: f64 = 0.10;
 /// Without the preview's gains to compare: how little they may change
 /// from one frame to the next to count as settled.
@@ -93,15 +93,15 @@ impl Default for CaptureController {
     }
 }
 
-/// The controls that hold the exposure and colour of `meta`.
+/// The controls that hold the exposure and color of `meta`.
 pub fn lock_from(meta: Option<&FrameMeta>) -> Controls {
     let Some(m) = meta else {
         return Controls::default();
     };
     Controls {
         exposure_us: m.exposure_us,
-        analogue_gain: m.analogue_gain,
-        colour_gains: m.colour_gains,
+        analog_gain: m.analog_gain,
+        color_gains: m.color_gains,
         lens_position: m.lens_position,
         af_continuous: false,
         focus: None,
@@ -205,7 +205,7 @@ impl CaptureController {
         };
         *seen += 1;
         let seen = *seen;
-        let previous = std::mem::replace(last_gains, meta.colour_gains);
+        let previous = std::mem::replace(last_gains, meta.color_gains);
         if seen <= MIN_DISCARD {
             return Step::Discard;
         }
@@ -214,7 +214,7 @@ impl CaptureController {
                 .zip(b)
                 .all(|(x, y)| y > 0.0 && ((x - y) / y).abs() as f64 <= within)
         };
-        let colour = match (meta.colour_gains, self.locked.colour_gains, previous) {
+        let color = match (meta.color_gains, self.locked.color_gains, previous) {
             (Some(got), Some(want), _) => close(got, want, GAINS_WITHIN),
             (Some(got), None, Some(prev)) => close(got, prev, GAINS_STEADY),
             (Some(_), None, None) => false,
@@ -224,7 +224,7 @@ impl CaptureController {
         let ready = match meta.ae_state {
             // libcamera 4.10 says when its AE has converged (also when it
             // sits at a limit).
-            Some(state) => state == AeState::Converged && colour,
+            Some(state) => state == AeState::Converged && color,
             // Older: a fixed wait.
             None => seen > FIXED_DISCARD,
         };
@@ -261,7 +261,7 @@ mod tests {
     fn meta(exposure: i32, gain: f32, af: Option<AfState>) -> FrameMeta {
         FrameMeta {
             exposure_us: Some(exposure),
-            analogue_gain: Some(gain),
+            analog_gain: Some(gain),
             af_state: af,
             ..FrameMeta::default()
         }
@@ -279,7 +279,7 @@ mod tests {
 
     fn converged(exposure: i32, gains: Option<[f32; 2]>, state: AeState) -> FrameMeta {
         FrameMeta {
-            colour_gains: gains,
+            color_gains: gains,
             ae_state: Some(state),
             ..meta(exposure, 1.0, None)
         }
@@ -346,11 +346,11 @@ mod tests {
         let now = Instant::now();
         let mut c = CaptureController::new();
         let last = FrameMeta {
-            colour_gains: Some([1.09, 1.56]),
+            color_gains: Some([1.09, 1.56]),
             ..meta(20_000, 1.0, None)
         };
         c.begin(Mode::Full, false, Some(&last), now);
-        assert_eq!(c.locked().colour_gains, Some([1.09, 1.56]));
+        assert_eq!(c.locked().color_gains, Some([1.09, 1.56]));
         let frames = [
             [1.0, 1.0],
             [1.0, 1.0],

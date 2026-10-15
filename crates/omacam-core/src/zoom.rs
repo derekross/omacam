@@ -253,7 +253,7 @@ mod tests {
         // 0.5x is a 10 % crop of the ultrawide
         assert!((l.scale(0.5, l.natural(0.5)) - 1.111).abs() < 0.001);
         assert_eq!(l.scale(1.0, l.natural(1.0)), 1.0);
-        // 2x is a centre crop of the main
+        // 2x is a center crop of the main
         assert_eq!(l.scale(2.0, l.natural(2.0)), 2.0);
         // 5x is the tele cropped by 5/4.78
         assert!((l.scale(5.0, l.natural(5.0)) - 1.046).abs() < 0.001);

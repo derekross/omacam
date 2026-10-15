@@ -9,7 +9,7 @@
 # preview/still: the processed stream sizes asked of libcamera's software
 #   ISP. libcamera may adjust them; the app uses what it gets.
 # rotation: leave out to use libcamera's Rotation property.
-# base_iso: ISO at analogue gain 1, to show and record gain as ISO
+# base_iso: ISO at analog gain 1, to show and record gain as ISO
 #   (ISO = gain x base_iso). 50 for each sensor, an estimate: no published
 #   figure; calibrate against a reference meter.
 # focal_length_mm: the real focal length, for EXIF, from the sensor

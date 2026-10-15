@@ -2,8 +2,8 @@
 //! an Auto ("A") state, over the bottom of the picture.
 //!
 //! A chip per control shows its value: the manual one in the accent
-//! colour, or auto's current choice (from the frame metadata) dimmed. A
-//! chip whose control the camera doesn't offer is greyed out, with a
+//! color, or auto's current choice (from the frame metadata) dimmed. A
+//! chip whose control the camera doesn't offer is grayed out, with a
 //! tooltip saying so (libcamera 0.7.2-4.8 offers none of them; they light
 //! up as libcamera does). Tapping a chip opens its editor: an "A" button
 //! and a slider over the values the camera allows, or the white-balance

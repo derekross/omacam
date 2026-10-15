@@ -4,7 +4,7 @@
 //!
 //! - **Tap to meter.** libcamera has no standard control for an exposure
 //!   region, so a tap meters by brightness: the mean luma of the tapped
-//!   area is brought to mid-grey through `ExposureValue`
+//!   area is brought to mid-gray through `ExposureValue`
 //!   (CAMERA-APP-PLAN §3.5). A camera without ExposureValue only focuses.
 //! - **The EV slider** adds to that, -2..+2 EV, and resets at the next tap
 //!   or lens switch.
@@ -16,7 +16,7 @@
 
 use crate::backend::{Awb, Caps, ExposureSettings, FrameMeta, Setting};
 
-/// The brightness a metered area is brought to: 18 % grey in sRGB.
+/// The brightness a metered area is brought to: 18 % gray in sRGB.
 pub const MID_GREY: f64 = 118.0;
 /// The EV range of the tap metering and the slider.
 pub const EV_LIMIT: f32 = 2.0;
@@ -90,18 +90,18 @@ impl Exposure {
         let white_balance = match self.pro.white_balance {
             Setting::Manual(Awb::Preset(p)) if caps.awb_modes => Setting::Manual(Awb::Preset(p)),
             // No presets: the preset's temperature, or its gains.
-            Setting::Manual(Awb::Preset(p)) => match (caps.colour_temperature, caps.colour_gains) {
+            Setting::Manual(Awb::Preset(p)) => match (caps.color_temperature, caps.color_gains) {
                 (Some((lo, hi)), _) => {
                     Setting::Manual(Awb::Kelvin((p.kelvin() as i32).clamp(lo, hi) as u32))
                 }
                 (None, Some(range)) => Setting::Manual(Awb::Gains(clamp_gains(p.gains(), range))),
                 _ => Setting::Auto,
             },
-            Setting::Manual(Awb::Kelvin(k)) => match caps.colour_temperature {
+            Setting::Manual(Awb::Kelvin(k)) => match caps.color_temperature {
                 Some((lo, hi)) => Setting::Manual(Awb::Kelvin((k as i32).clamp(lo, hi) as u32)),
                 None => Setting::Auto,
             },
-            Setting::Manual(Awb::Gains(g)) => match caps.colour_gains {
+            Setting::Manual(Awb::Gains(g)) => match caps.color_gains {
                 Some(range) => Setting::Manual(Awb::Gains(clamp_gains(g, range))),
                 None => Setting::Auto,
             },
@@ -138,7 +138,7 @@ impl Exposure {
         self.lock = None;
         self.ev_user = 0.0;
         // Real spot metering where the camera offers it; else bring the
-        // area's brightness to mid-grey through EV.
+        // area's brightness to mid-gray through EV.
         self.spot = caps.ae_metering;
         self.ev_meter = match (luma, caps.ev.is_some(), self.spot) {
             (Some(l), true, false) if l > 0.5 => clamp_ev((MID_GREY / l).log2() as f32, caps),
@@ -162,7 +162,7 @@ impl Exposure {
     /// AfPause.
     pub fn lock(&mut self, meta: Option<&FrameMeta>, caps: &Caps) -> bool {
         let manual = meta
-            .and_then(|m| m.exposure_us.zip(m.analogue_gain))
+            .and_then(|m| m.exposure_us.zip(m.analog_gain))
             .filter(|_| caps.manual_shutter() && caps.manual_gain());
         if !caps.ae_enable && manual.is_none() {
             return false;
@@ -285,12 +285,12 @@ mod tests {
             gain: Some((1.0, 16.0)),
             manual_exposure: true,
             awb_modes: true,
-            colour_temperature: Some((2500, 7500)),
+            color_temperature: Some((2500, 7500)),
             lens_position: Some((0.0, 1.0)),
             ae_enable: false,
             ae_metering: false,
             af_pause: false,
-            colour_gains: None,
+            color_gains: None,
         }
     }
 
@@ -303,12 +303,12 @@ mod tests {
             gain: Some((1.0, 16.0)),
             manual_exposure: true,
             awb_modes: false,
-            colour_temperature: None,
+            color_temperature: None,
             lens_position: Some((0.0, 1.0)),
             ae_enable: true,
             ae_metering: true,
             af_pause: true,
-            colour_gains: Some((0.25, 4.0)),
+            color_gains: Some((0.25, 4.0)),
         }
     }
 
@@ -349,7 +349,7 @@ mod tests {
         );
         // The ultrawide offers a temperature: the preset's kelvin.
         let uw = Caps {
-            colour_temperature: Some((2890, 7900)),
+            color_temperature: Some((2890, 7900)),
             ..caps
         };
         assert_eq!(
@@ -368,7 +368,7 @@ mod tests {
     }
 
     #[test]
-    fn a_tap_meters_the_area_to_mid_grey() {
+    fn a_tap_meters_the_area_to_mid_gray() {
         let mut e = Exposure::new();
         // A dark area (29.5, two stops under) brightens by 2 EV.
         assert!(e.tap(Some(29.5), &full()));
@@ -408,7 +408,7 @@ mod tests {
         let mut e = Exposure::new();
         let meta = FrameMeta {
             exposure_us: Some(10_000),
-            analogue_gain: Some(2.5),
+            analog_gain: Some(2.5),
             lens_position: Some(0.4),
             ..FrameMeta::default()
         };

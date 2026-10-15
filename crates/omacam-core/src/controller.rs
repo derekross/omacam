@@ -49,7 +49,7 @@ impl Default for Options {
 #[derive(Debug)]
 pub struct Picture {
     pub frame: Frame,
-    /// Centre crop: keep 1/crop of each side (1 = the whole frame).
+    /// Center crop: keep 1/crop of each side (1 = the whole frame).
     pub crop: f64,
     /// Clockwise degrees that turn the frame upright.
     pub rotation: u32,
@@ -103,7 +103,7 @@ pub struct ExposureView {
 /// How to draw a frame of one lens.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Transform {
-    /// Magnification of the frame about its centre (the zoom crop), never
+    /// Magnification of the frame about its center (the zoom crop), never
     /// below 1.
     pub scale: f64,
     /// Clockwise degrees that turn the frame upright.
@@ -394,7 +394,7 @@ impl Controller {
                     let e = exposure::transfer(
                         exposure::Exposure {
                             time_us: t as f64,
-                            gain: meta.analogue_gain.unwrap_or(1.0) as f64,
+                            gain: meta.analog_gain.unwrap_or(1.0) as f64,
                         },
                         f_old,
                         f_new,
@@ -402,7 +402,7 @@ impl Controller {
                         exposure::Limits::default(),
                     );
                     target.controls.exposure_us = Some(e.time_us.round() as i32);
-                    target.controls.analogue_gain = Some(e.gain as f32);
+                    target.controls.analog_gain = Some(e.gain as f32);
                 }
             }
         }
@@ -604,7 +604,7 @@ impl Controller {
             base_iso,
             shutter_us: meta.and_then(|m| m.exposure_us),
             iso: meta.and_then(|m| {
-                m.analogue_gain.map(|g| {
+                m.analog_gain.map(|g| {
                     exposure_control::iso(g as f64 * m.digital_gain.unwrap_or(1.0) as f64, base_iso)
                 })
             }),
@@ -740,7 +740,7 @@ impl Controller {
         out
     }
 
-    /// ISO, as the Pro panel shows it; sent as analogue gain.
+    /// ISO, as the Pro panel shows it; sent as analog gain.
     pub fn set_iso(&mut self, iso: Setting<u32>) -> Vec<Output> {
         let base = self.exposure_view().base_iso;
         self.exposure.set_gain(match iso {
@@ -833,8 +833,8 @@ impl Controller {
                     // The still keeps the exposure settings; the locked
                     // values are start hints.
                     target.controls.exposure_us = controls.exposure_us;
-                    target.controls.analogue_gain = controls.analogue_gain;
-                    target.controls.colour_gains = controls.colour_gains;
+                    target.controls.analog_gain = controls.analog_gain;
+                    target.controls.color_gains = controls.color_gains;
                     target.controls.lens_position = controls.lens_position;
                     target.controls.af_continuous = false;
                     self.request(Some(target), now, out);
@@ -852,7 +852,7 @@ impl Controller {
         if let Some(mut target) = self.target(Purpose::Preview) {
             let locked = self.capture.locked().clone();
             target.controls.exposure_us = locked.exposure_us;
-            target.controls.analogue_gain = locked.analogue_gain;
+            target.controls.analog_gain = locked.analog_gain;
             self.request(Some(target), now, out);
         }
     }
@@ -1063,7 +1063,7 @@ mirror = true
             data: FrameData::Memory(vec![0; 32]),
             meta: FrameMeta {
                 exposure_us: Some(exposure),
-                analogue_gain: Some(1.0),
+                analog_gain: Some(1.0),
                 ..FrameMeta::default()
             },
         })
@@ -1135,7 +1135,7 @@ mirror = true
                 // 10 ms at f/1.85 needs 35.8 ms at f/3.5: time capped at
                 // 33.3 ms, the rest in gain.
                 assert_eq!(controls.exposure_us, Some(33_333));
-                assert!(controls.analogue_gain.unwrap() > 1.0);
+                assert!(controls.analog_gain.unwrap() > 1.0);
                 assert!(!controls.af_continuous, "the tele has no AF");
             }
             other => panic!("{other:?}"),
@@ -1381,7 +1381,7 @@ mirror = true
             gain: Some((1.0, 16.0)),
             manual_exposure: true,
             awb_modes: true,
-            colour_temperature: Some((2500, 7500)),
+            color_temperature: Some((2500, 7500)),
             lens_position: Some((0.0, 1.0)),
             ..Default::default()
         }
