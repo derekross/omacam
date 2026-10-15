@@ -22,7 +22,10 @@ finds.
 - Zoom from 0.45x to 15x: the 0.5, 1, 2 and 5 buttons, a slider (drag
   sideways across the buttons), or a pinch anywhere on the picture. The
   ultrawide, main and telephoto cameras take over as you pass 1x and 4.78x,
-  framed alike and with a short cross-fade, so the switch doesn't jump.
+  with a short cross-fade. (Until the main camera has a 4:3 preview mode,
+  its 16:9 preview fills the screen and shows less than its photos: the
+  photo holds about a third more width than the preview at 1x, except in
+  16:9, and the view jumps by as much at its switches.)
 - Low light: when it's too dark for the telephoto, its zoom comes from the
   main camera instead (a "Low light" note shows), and the telephoto comes
   back when the light does. Not in the Pro panel, where the lens is the

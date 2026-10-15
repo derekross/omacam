@@ -113,18 +113,28 @@ things decide the framing, all in the lens table:
   camera's, from Google's published fields of view.
 - **What the preview mode covers** (`coverage`): the main camera's
   2016x1136 preview is the 2x2-binned middle of its 4080x3072 sensor: 99 %
-  of its width but only 74 % of its height. Up to 0.2.0 the viewfinder
-  fitted each lens's frame to the screen, so the main camera's 16:9 frame
-  showed the scene a third larger than the ultrawide's and telephoto's 4:3
-  frames at the same zoom, and the main camera's 4:3 photo held more than
-  its preview showed. Now the picture is each lens's whole field of view
-  (the still mode's, 4:3 on all three back cameras) and a preview frame is
-  drawn at its true size inside it: every lens fills the same rectangle at
-  the same scale. Near 1x on the main camera, the 16:9 preview leaves dark
-  bands at the sides of a 4:3 picture; the photo has picture there. (A 4:3
-  preview mode on the main camera, 2032x1536, waits on the camera
-  receiver: CAMERA-PLAN CAM-M.5b.) Derived from the preview and still
-  sizes unless the table says otherwise.
+  of its width but only 74 % of its height (derived from the preview and
+  still sizes unless the table says otherwise). Drawn at its true size
+  inside the lens's whole 4:3 picture, it would frame the scene exactly as
+  the other lenses do, but near 1x it leaves empty bands at the sides of
+  the main camera's view, the app's default view, which looks broken. So
+  by default a preview that covers less than its picture **fills the view**
+  instead (`Lens::shown_coverage`), as in 0.2.0, and the costs are known:
+  - **The photo shows more than the preview on the main camera.** At 1x
+    the preview shows 74 % of the photo's width (all of its height in the
+    Full aspect, 75 % of it in 4:3); the photo takes the main camera's
+    whole 4:3 view. In the 16:9 aspect the two match. Zoomed in, the
+    photo's crop is the zoom's share of the whole 4:3 view, so it stays
+    about a third wider than the preview.
+  - **The framing jumps at the main camera's switches** (0.99x to 1x, 4.77x
+    to 4.78x) by that third; the cross-fade softens it.
+
+  The drawing, tap to focus, the photo and the recorder already work in
+  the picture's terms, so true framing turns on by itself for a lens whose
+  preview covers its whole picture (a 4:3 preview mode, CAMERA-PLAN
+  CAM-M.5b), or with `true_framing = true` in the lens table. libcamera
+  doesn't report a mode's sensor crop yet, so it can't be detected from
+  the configured camera.
 - **Where each lens points** (`axis`): the lenses sit a centimeter or two
   apart, so their pictures' centers differ. The view's center slides from
   one lens's axis to the next one's as the zoom goes from the one's factor
@@ -134,8 +144,9 @@ things decide the framing, all in the lens table:
   place.
 
 The viewfinder, tap to focus, photos (`framing::frame_window`) and the
-recorder all use the same transform, so what the screen shows is what the
-file gets.
+recorder all use the same transform, so with true framing what the screen
+shows is what the file gets (videos always match the screen: they record
+the preview's own frames).
 
 ### Low light (`lowlight.rs`)
 

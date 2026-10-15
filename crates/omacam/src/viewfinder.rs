@@ -538,17 +538,25 @@ mod tests {
         }
     }
 
-    /// The pictures of the Pixel 7 Pro's back lenses have one shape (their
-    /// 4:3 sensors' whole view), whatever their preview modes crop, so a
-    /// lens switch keeps the picture's size on screen; and at each switch
-    /// zoom the scene shows at the same scale (screen pixels per degree).
+    /// With true framing, the pictures of the Pixel 7 Pro's back lenses
+    /// have one shape (their 4:3 sensors' whole view), whatever their
+    /// preview modes crop, so a lens switch keeps the picture's size on
+    /// screen; and at each switch zoom the scene shows at the same scale
+    /// (screen pixels per degree).
     #[test]
     fn back_lenses_share_the_picture_shape_and_scale_at_switches() {
         use omacam_core::controller::Options;
         use omacam_core::zoom::ZoomSource;
         use omacam_core::Controller;
         let cams = omacam_fake::cheetah_cameras();
-        let spec = omacam_core::lens::TableSpec::cheetah();
+        // With true framing on the main camera (the default once it has a
+        // 4:3 preview mode).
+        let text = omacam_core::lens::CHEETAH.replacen(
+            "still = [4080, 3072]",
+            "still = [4080, 3072]\ntrue_framing = true",
+            1,
+        );
+        let spec = omacam_core::lens::TableSpec::parse(&text).unwrap();
         let table = spec.resolve(&cams);
         let mut c = Controller::new(&spec, &cams, Options::default());
         let now = std::time::Instant::now();
@@ -589,6 +597,28 @@ mod tests {
         let a = per_view(&main, 4.78);
         let b = per_view(&tele, 4.78);
         assert!((a / b - 1.0).abs() < 0.01, "main {a} tele {b}");
+    }
+
+    /// By default the main camera's 16:9 preview fills the view (no empty
+    /// bands), as its picture is the frame itself.
+    #[test]
+    fn the_main_cameras_preview_fills_the_view_by_default() {
+        use omacam_core::controller::Options;
+        use omacam_core::Controller;
+        let cams = omacam_fake::cheetah_cameras();
+        let spec = omacam_core::lens::TableSpec::cheetah();
+        let table = spec.resolve(&cams);
+        let c = Controller::new(&spec, &cams, Options::default());
+        let main = table.get(table.by_role(omacam_core::Role::Main).unwrap());
+        let t = c.transform(&main.id).unwrap();
+        assert_eq!(t.coverage, (1.0, 1.0));
+        let p = Placement {
+            coverage: t.coverage,
+            rotation: t.rotation,
+            ..Placement::default()
+        };
+        let (upright, picture) = p.sizes((2016.0, 1136.0));
+        assert_eq!(upright, picture);
     }
 
     #[test]

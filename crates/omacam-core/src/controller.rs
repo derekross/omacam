@@ -431,7 +431,7 @@ impl Controller {
         let lens = self.table.get(i);
         let rotation = lens.upright_clockwise();
         let coverage = match purpose {
-            Purpose::Preview => framing::upright_pair(lens.coverage, rotation),
+            Purpose::Preview => framing::upright_pair(lens.shown_coverage(), rotation),
             Purpose::Still => (1.0, 1.0),
         };
         let mut t = Transform {

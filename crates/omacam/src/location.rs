@@ -11,8 +11,8 @@
 //! Without GeoClue, without an agent, or before a fix, photos and videos
 //! carry no location; nothing waits for one.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use gtk4::gio;
@@ -76,11 +76,17 @@ pub fn fix_from(
     })
 }
 
-/// A running GeoClue client. Stopped when dropped.
+/// A GeoClue client on a thread of its own (with its own main context),
+/// so a missing or slow GeoClue never holds up the window: every D-Bus
+/// call there has a timeout, and the UI only reads the newest fix.
+/// Stopped when dropped.
 pub struct Locator {
-    client: gio::DBusProxy,
-    latest: Rc<RefCell<Option<Fix>>>,
+    latest: Arc<Mutex<Option<Fix>>>,
+    stop: Arc<AtomicBool>,
 }
+
+/// The longest any one GeoClue call may take.
+const CALL_TIMEOUT_MS: i32 = 3000;
 
 fn read_location(path: &str) -> Option<Fix> {
     let loc = gio::DBusProxy::for_bus_sync(
@@ -103,106 +109,153 @@ fn read_location(path: &str) -> Option<Fix> {
     )
 }
 
-impl Locator {
-    /// Ask GeoClue for fixes. None when there is no GeoClue (or it
-    /// refuses); the reason is logged.
-    pub fn start() -> Option<Locator> {
-        let manager = gio::DBusProxy::for_bus_sync(
-            gio::BusType::System,
-            gio::DBusProxyFlags::DO_NOT_LOAD_PROPERTIES,
+/// Ask GeoClue for a client, configure it and start it. Runs on the
+/// locator's thread.
+fn client(latest: Arc<Mutex<Option<Fix>>>) -> Result<gio::DBusProxy, String> {
+    let manager = gio::DBusProxy::for_bus_sync(
+        gio::BusType::System,
+        gio::DBusProxyFlags::DO_NOT_LOAD_PROPERTIES,
+        None,
+        NAME,
+        MANAGER,
+        "org.freedesktop.GeoClue2.Manager",
+        gio::Cancellable::NONE,
+    )
+    .map_err(|e| format!("no GeoClue: {e}"))?;
+    let path = manager
+        .call_sync(
+            "GetClient",
             None,
-            NAME,
-            MANAGER,
-            "org.freedesktop.GeoClue2.Manager",
+            gio::DBusCallFlags::NONE,
+            CALL_TIMEOUT_MS,
             gio::Cancellable::NONE,
         )
-        .map_err(|e| tracing::info!(error = %e, "no GeoClue"))
-        .ok()?;
-        let path = manager
+        .map_err(|e| format!("GeoClue gave no client: {e}"))?
+        .child_value(0)
+        .get::<glib::variant::ObjectPath>()
+        .ok_or("GeoClue's client path")?;
+    let client = gio::DBusProxy::for_bus_sync(
+        gio::BusType::System,
+        gio::DBusProxyFlags::NONE,
+        None,
+        NAME,
+        path.as_str(),
+        "org.freedesktop.GeoClue2.Client",
+        gio::Cancellable::NONE,
+    )
+    .map_err(|e| format!("GeoClue client: {e}"))?;
+    let set = |prop: &str, value: glib::Variant| {
+        client
             .call_sync(
-                "GetClient",
-                None,
+                "org.freedesktop.DBus.Properties.Set",
+                Some(&("org.freedesktop.GeoClue2.Client", prop, value).to_variant()),
                 gio::DBusCallFlags::NONE,
-                3000,
+                CALL_TIMEOUT_MS,
                 gio::Cancellable::NONE,
             )
-            .map_err(|e| tracing::info!(error = %e, "GeoClue gave no client"))
-            .ok()?
-            .child_value(0)
-            .get::<glib::variant::ObjectPath>()?;
-        let client = gio::DBusProxy::for_bus_sync(
-            gio::BusType::System,
-            gio::DBusProxyFlags::NONE,
-            None,
-            NAME,
-            path.as_str(),
-            "org.freedesktop.GeoClue2.Client",
-            gio::Cancellable::NONE,
-        )
-        .ok()?;
-        let set = |prop: &str, value: glib::Variant| {
-            client
-                .call_sync(
-                    "org.freedesktop.DBus.Properties.Set",
-                    Some(&("org.freedesktop.GeoClue2.Client", prop, value).to_variant()),
-                    gio::DBusCallFlags::NONE,
-                    3000,
-                    gio::Cancellable::NONE,
-                )
-                .map_err(|e| tracing::info!(error = %e, prop, "GeoClue client property"))
-                .ok()
-        };
-        set("DesktopId", "omacam".to_variant())?;
-        set("RequestedAccuracyLevel", ACCURACY_EXACT.to_variant())?;
-        // Every new fix, however small the move: a photo should have the
-        // newest one.
-        set("DistanceThreshold", 0u32.to_variant());
-        let latest = Rc::new(RefCell::new(None));
-        let l = latest.clone();
-        client.connect_local("g-signal", false, move |args| {
-            let signal = args[2].get::<String>().ok()?;
-            if signal != "LocationUpdated" {
-                return None;
-            }
-            let params = args[3].get::<glib::Variant>().ok()?;
-            let new = params.child_value(1).get::<glib::variant::ObjectPath>()?;
-            if let Some(fix) = read_location(new.as_str()) {
-                tracing::info!(accuracy_m = fix.accuracy.round(), "location fix");
-                *l.borrow_mut() = Some(fix);
-            }
-            None
-        });
-        if let Err(e) = client.call_sync(
+            .map(|_| ())
+            .map_err(|e| format!("GeoClue client {prop}: {e}"))
+    };
+    set("DesktopId", "omacam".to_variant())?;
+    set("RequestedAccuracyLevel", ACCURACY_EXACT.to_variant())?;
+    // Every new fix, however small the move: a photo should have the
+    // newest one.
+    let _ = set("DistanceThreshold", 0u32.to_variant());
+    client.connect_local("g-signal", false, move |args| {
+        let signal = args[2].get::<String>().ok()?;
+        if signal != "LocationUpdated" {
+            return None;
+        }
+        let params = args[3].get::<glib::Variant>().ok()?;
+        let new = params.child_value(1).get::<glib::variant::ObjectPath>()?;
+        if let Some(fix) = read_location(new.as_str()) {
+            tracing::info!(accuracy_m = fix.accuracy.round(), "location fix");
+            *latest.lock().unwrap() = Some(fix);
+        }
+        None
+    });
+    // Most often this fails because no agent runs for the user (the
+    // Location switch is off).
+    client
+        .call_sync(
             "Start",
             None,
             gio::DBusCallFlags::NONE,
-            5000,
+            CALL_TIMEOUT_MS,
             gio::Cancellable::NONE,
-        ) {
-            // Most often: no agent runs for this user (the Location
-            // switch is off).
-            tracing::info!(error = %e, "GeoClue didn't start");
-            return None;
+        )
+        .map_err(|e| format!("GeoClue didn't start: {e}"))?;
+    Ok(client)
+}
+
+impl Locator {
+    /// Start asking GeoClue for fixes, on a thread of its own; returns at
+    /// once. `failed` is called (on that thread) with the reason if
+    /// GeoClue can't be had.
+    pub fn start(failed: impl FnOnce(String) + Send + 'static) -> Locator {
+        let latest = Arc::new(Mutex::new(None));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (l, st) = (latest.clone(), stop.clone());
+        let spawned = std::thread::Builder::new()
+            .name("omacam-geoclue".into())
+            .spawn(move || {
+                let ctx = glib::MainContext::new();
+                let _ = ctx.with_thread_default(|| {
+                    let client = match client(l) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::info!(error = %e, "no location");
+                            failed(e);
+                            return;
+                        }
+                    };
+                    tracing::info!("location tags: GeoClue started");
+                    let main_loop = glib::MainLoop::new(Some(&ctx), false);
+                    let ml = main_loop.clone();
+                    glib::timeout_source_new(
+                        Duration::from_millis(250),
+                        None,
+                        glib::Priority::DEFAULT,
+                        move || {
+                            if st.load(Ordering::Relaxed) {
+                                ml.quit();
+                                glib::ControlFlow::Break
+                            } else {
+                                glib::ControlFlow::Continue
+                            }
+                        },
+                    )
+                    .attach(Some(&ctx));
+                    main_loop.run();
+                    let _ = client.call_sync(
+                        "Stop",
+                        None,
+                        gio::DBusCallFlags::NONE,
+                        1000,
+                        gio::Cancellable::NONE,
+                    );
+                    tracing::info!("location tags: GeoClue stopped");
+                });
+            });
+        if let Err(e) = spawned {
+            tracing::warn!(error = %e, "no location thread");
         }
-        tracing::info!("location tags: GeoClue started");
-        Some(Locator { client, latest })
+        Locator { latest, stop }
     }
 
     /// The newest fix, if recent.
     pub fn fix(&self) -> Option<Fix> {
-        self.latest.borrow().and_then(|f| f.fresh(Instant::now()))
+        self.latest
+            .lock()
+            .unwrap()
+            .and_then(|f| f.fresh(Instant::now()))
     }
 }
 
 impl Drop for Locator {
     fn drop(&mut self) {
-        let _ = self.client.call_sync(
-            "Stop",
-            None,
-            gio::DBusCallFlags::NONE,
-            1000,
-            gio::Cancellable::NONE,
-        );
+        // The thread stops GeoClue's client and ends; nothing waits here.
+        self.stop.store(true, Ordering::Relaxed);
     }
 }
 

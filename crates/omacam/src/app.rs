@@ -130,6 +130,8 @@ enum Msg {
     /// A command on the control socket (`omacam --remote shutter`).
     Remote(String),
     VideoSaved(Result<PathBuf, String>),
+    /// GeoClue couldn't be had (location tags stay empty).
+    NoLocation(String),
 }
 
 struct Fps {
@@ -1149,6 +1151,12 @@ impl App {
                 *self.last_photo.borrow_mut() = Some(path);
             }
             Msg::VideoSaved(Err(e)) => self.error(&format!("Video not saved: {e}")),
+            Msg::NoLocation(why) => {
+                tracing::info!(why, "location tags without a location");
+                // Tried again when the setting is next changed.
+                self.locator.borrow_mut().take();
+                self.error("No location for tags: turn on Location in the quick settings");
+            }
             Msg::Remote(cmd) => match cmd.as_str() {
                 "shutter" => self.press_shutter(),
                 other => tracing::warn!(command = other, "unknown remote command"),
@@ -1944,10 +1952,12 @@ impl App {
         let on = self.settings.borrow().location;
         let running = self.locator.borrow().is_some();
         if on && !running {
-            *self.locator.borrow_mut() = crate::location::Locator::start();
-            if self.locator.borrow().is_none() {
-                self.error("No location: turn on Location in the quick settings");
-            }
+            // GeoClue answers on its own thread; a failure comes back as a
+            // message.
+            let tx = self.tx.clone();
+            *self.locator.borrow_mut() = Some(crate::location::Locator::start(move |why| {
+                let _ = tx.send_blocking(Msg::NoLocation(why));
+            }));
         } else if !on && running {
             self.locator.borrow_mut().take();
         }
@@ -2208,7 +2218,7 @@ impl App {
                 RecLens {
                     rotation: t.rotation,
                     mirror: t.mirror,
-                    coverage: lens.coverage,
+                    coverage: lens.shown_coverage(),
                     view: rec_view(&t, margin),
                     focal,
                     scale: t.scale * margin,

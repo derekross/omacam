@@ -67,6 +67,12 @@ pub struct Lens {
     /// difference to keep the subject still. From the table; the center
     /// until calibrated.
     pub axis: (f64, f64),
+    /// Draw a preview that covers less than the whole picture at its true
+    /// size inside it (`true_framing` in the table). Off, such a preview
+    /// fills the picture as before, and frames the scene a little tighter
+    /// than the lens's other modes and the other lenses: see
+    /// [`Lens::shown_coverage`].
+    pub true_framing: bool,
 }
 
 /// The share of a still mode's field of view that a preview mode shows,
@@ -97,6 +103,21 @@ pub fn upright_clockwise(rotation: u32) -> u32 {
 }
 
 impl Lens {
+    /// The coverage the preview is drawn with: its real one where it
+    /// covers the lens's whole picture or the table asks for true framing;
+    /// otherwise the whole picture, so the preview fills the view with no
+    /// empty bands (the main camera's 16:9 preview until it has a 4:3
+    /// mode), at the cost of a tighter view than the photo's and a jump
+    /// in framing at the switches to and from that lens.
+    pub fn shown_coverage(&self) -> (f64, f64) {
+        let full = self.coverage.0 >= 0.999 && self.coverage.1 >= 0.999;
+        if full || self.true_framing {
+            self.coverage
+        } else {
+            (1.0, 1.0)
+        }
+    }
+
     /// Clockwise degrees that turn this camera's frames upright.
     pub fn upright_clockwise(&self) -> u32 {
         upright_clockwise(self.rotation)
@@ -136,6 +157,8 @@ struct LensEntry {
     coverage: Option<[f64; 2]>,
     /// Where the optical axis lands on the main camera's upright picture.
     axis: Option<[f64; 2]>,
+    #[serde(default)]
+    true_framing: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -261,6 +284,7 @@ impl TableSpec {
                         )
                     }),
                     axis: e.axis.map(|[a, b]| (a, b)).unwrap_or((0.5, 0.5)),
+                    true_framing: e.true_framing,
                 });
             }
         }
@@ -295,6 +319,7 @@ impl TableSpec {
                 rotation: cam.rotation % 360,
                 coverage: (1.0, 1.0),
                 axis: (0.5, 0.5),
+                true_framing: false,
             });
         }
         LensTable {
@@ -448,6 +473,14 @@ mod tests {
         assert!((w - 4032.0 / 4080.0).abs() < 1e-9, "{w}");
         assert!((h - 2272.0 / 3072.0).abs() < 1e-9, "{h}");
         assert_eq!(cov(Role::Ultrawide), (1.0, 1.0));
+        // Shown filling the view until the main camera has a 4:3 preview.
+        let main = t.get(t.by_role(Role::Main).unwrap());
+        assert_eq!(main.shown_coverage(), (1.0, 1.0));
+        let truly = Lens {
+            true_framing: true,
+            ..main.clone()
+        };
+        assert_eq!(truly.shown_coverage(), main.coverage);
         assert_eq!(cov(Role::Tele), (1.0, 1.0));
         assert_eq!(derived_coverage(None, Some(Size::new(4, 3))), (1.0, 1.0));
         assert_eq!(

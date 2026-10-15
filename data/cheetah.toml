@@ -16,8 +16,15 @@
 #   field of view (its still mode's) that the preview mode shows. Left out,
 #   it is derived from the preview and still sizes (whole-factor binning, a
 #   centered crop): the main camera's 16:9 preview is 0.99 x 0.74 of its 4:3
-#   sensor. The viewfinder, photos and videos use it so that every lens
-#   frames the scene alike.
+#   sensor.
+# true_framing: draw a preview that covers less than the lens's whole view
+#   at its true size inside it, so every lens frames the scene alike (with
+#   empty bands where the preview doesn't reach). Off by default: such a
+#   preview fills the view, tighter than the photo (which has the whole
+#   4:3 view) and than the other lenses at the same zoom. A preview that
+#   covers the whole view is always drawn true. Turn it on for the main
+#   camera once it previews in a 4:3 mode (CAMERA-PLAN CAM-M.5b), or drop
+#   its 16:9 preview for a 4:3 one, which needs no flag.
 # axis: [x, y], where the lens's optical axis lands on the main camera's
 #   upright picture (0..1). The lenses sit 1-2 cm apart; at a lens switch the
 #   crop moves by the difference so the subject stays put. The center until
