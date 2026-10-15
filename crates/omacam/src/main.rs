@@ -2,6 +2,7 @@
 
 mod app;
 mod exif;
+mod journal;
 mod location;
 mod photo;
 mod prefs;
@@ -190,24 +191,23 @@ fn list(cli: &Cli) -> anyhow::Result<()> {
 /// Log to the terminal when there is one; otherwise (started from the app
 /// launcher, where stderr goes nowhere) to the journal as `omacam`, and
 /// have libcamera log to syslog (the journal) too, warnings and errors
-/// only. `journalctl -t omacam` shows omacam's lines; libcamera's arrive
-/// under its own identifier, `journalctl -t libcamera` or `_PID=`.
+/// only. `journalctl -t omacam` shows omacam's lines, each with its
+/// fields (`journal.rs`); libcamera's arrive under its own identifier,
+/// `journalctl -t libcamera` or `_PID=`.
 fn init_logging() {
     use std::io::IsTerminal;
-    use tracing_subscriber::prelude::*;
     let filter = || {
-        tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| "omacam=info,omacam_libcamera=info".into())
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            "omacam=info,omacam_core=info,omacam_record=info,omacam_libcamera=info".into()
+        })
     };
     let journal = if std::io::stderr().is_terminal() {
         None
     } else {
-        tracing_journald::layer()
-            .map(|l| l.with_syslog_identifier("omacam".into()))
-            .ok()
+        journal::Journal::open("omacam")
     };
     match journal {
-        Some(layer) => {
+        Some(journal) => {
             // SAFETY: called first thing in main, before any thread starts.
             unsafe {
                 if std::env::var_os("LIBCAMERA_LOG_FILE").is_none() {
@@ -217,8 +217,12 @@ fn init_logging() {
                     std::env::set_var("LIBCAMERA_LOG_LEVELS", "*:WARN");
                 }
             }
-            tracing_subscriber::registry()
-                .with(layer.with_filter(filter()))
+            tracing_subscriber::fmt()
+                .with_env_filter(filter())
+                .with_writer(journal)
+                .with_ansi(false)
+                .without_time()
+                .with_target(false)
                 .init();
         }
         None => tracing_subscriber::fmt()

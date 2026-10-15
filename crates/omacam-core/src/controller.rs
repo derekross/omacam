@@ -1183,8 +1183,23 @@ impl Controller {
                     }
                 }
             }
-            Purpose::Still => match self.capture.on_still_frame(&frame.meta) {
+            Purpose::Still => match self.capture.on_still_frame(&frame.meta, now) {
                 Step::KeepAndRestore(_) => {
+                    if let Some(r) = self.capture.last_still() {
+                        let m = &r.meta;
+                        let lens = &self.table.get(lens_idx).name;
+                        tracing::info!(
+                            "still from {lens}: frame {} after {} ms ({}), exposure {} us, \
+                             analog gain {}, digital gain {}, AE {}",
+                            r.frames,
+                            r.elapsed.as_millis(),
+                            if r.settled { "settled" } else { "wait ran out" },
+                            opt(m.exposure_us),
+                            opt(m.analog_gain.map(|g| format!("{g:.2}"))),
+                            opt(m.digital_gain.map(|g| format!("{g:.2}"))),
+                            opt(m.ae_state.map(|s| format!("{s:?}"))),
+                        );
+                    }
                     out.push(self.picture(frame, lens_idx, purpose));
                     self.restore_preview(now, out);
                 }
@@ -1193,6 +1208,11 @@ impl Controller {
             },
         }
     }
+}
+
+/// A value for a log line, or "-".
+fn opt<T: std::fmt::Display>(v: Option<T>) -> String {
+    v.map(|v| v.to_string()).unwrap_or_else(|| "-".into())
 }
 
 #[cfg(test)]
@@ -1973,11 +1993,13 @@ axis = [0.56, 0.48]
         }
         assert!(c.view().capturing);
         c.on_event(started(gs, "main"), now);
-        // No AeState in these frames: a fixed wait, then one is kept.
-        for _ in 0..capture::FIXED_DISCARD {
-            assert!(c.on_event(frame(gs, "main", 10_000), now).is_empty());
+        // No AeState in these frames: a fixed wait (frames and time; the
+        // full mode at 5 fps), then one is kept.
+        let at = |i: u32| now + Duration::from_millis(200 * i as u64);
+        for i in 0..capture::FIXED_DISCARD {
+            assert!(c.on_event(frame(gs, "main", 10_000), at(i)).is_empty());
         }
-        let out = c.on_event(frame(gs, "main", 10_000), now);
+        let out = c.on_event(frame(gs, "main", 10_000), at(capture::FIXED_DISCARD));
         assert!(matches!(out[0], Output::Picture(_)));
         let (gp, _, purpose) = start_of(&out[1..]);
         assert_eq!(purpose, Purpose::Preview);

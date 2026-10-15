@@ -8,11 +8,17 @@
 //! 2. Reconfigure to the still mode, with those values as start hints.
 //! 3. Drop frames until the auto-exposure says Converged (libcamera
 //!    4.10's AeState) and the white balance is back near the preview's,
-//!    or, on a libcamera without AeState, a fixed [`FIXED_DISCARD`]
-//!    frames; at least [`MIN_DISCARD`], at most [`MAX_DISCARD`]. Then keep
-//!    one. A freshly started mode begins with
-//!    the AWB's default gains; a still kept on its first frames came out
-//!    yellow on the telephoto (blue gain 1.56 needed).
+//!    or, on a libcamera without AeState, [`FIXED_DISCARD`] frames and
+//!    [`SETTLE_MIN`]; at least [`MIN_DISCARD`] frames. If that doesn't
+//!    come, keep a frame anyway once both [`MAX_DISCARD`] frames and
+//!    [`SETTLE_MIN`] have passed, or at [`SETTLE_MAX`]. The wait is by
+//!    time as well as frames because the full-resolution modes run at
+//!    5-13 fps: ten frames could end before the AGC had converged, and the
+//!    telephoto's stills came out dark (mean luma 27-32 at minimum gain).
+//!    A freshly started mode also begins with the AWB's default gains; a
+//!    still kept on its first frames came out yellow on the telephoto
+//!    (blue gain 1.56 needed). Times count from the still stream's first
+//!    frame.
 //! 4. Reconfigure back to the preview mode with the same hints.
 //!
 //! Quick mode keeps the next preview frame instead, with no reconfiguring.
@@ -29,8 +35,15 @@ pub const FOCUS_WAIT: Duration = Duration::from_millis(500);
 /// Frames to drop at least after the still mode starts (the sensor applies
 /// controls two frames late).
 pub const MIN_DISCARD: u32 = 2;
-/// Frames to drop at most while waiting for the exposure to settle.
+/// Frames to see before keeping one that hasn't settled (with
+/// [`SETTLE_MIN`]).
 pub const MAX_DISCARD: u32 = 10;
+/// The least time the still stream runs before a frame that hasn't
+/// settled (or, without AeState, any frame) is kept.
+pub const SETTLE_MIN: Duration = Duration::from_millis(1500);
+/// The longest wait for the exposure to settle: past it the next frame is
+/// kept whatever it says.
+pub const SETTLE_MAX: Duration = Duration::from_secs(3);
 /// On a libcamera that reports no AeState: the frames to drop before
 /// keeping one, a fixed wait for exposure and white balance to settle.
 pub const FIXED_DISCARD: u32 = 8;
@@ -77,14 +90,30 @@ enum State {
         seen: u32,
         deadline: Instant,
         last_gains: Option<[f32; 2]>,
+        /// When the still stream's first frame arrived.
+        first: Option<Instant>,
     },
     Restoring,
+}
+
+/// How a still was chosen, for the log.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StillReport {
+    /// Still frames seen, the kept one included.
+    pub frames: u32,
+    /// From the still stream's first frame to the kept one.
+    pub elapsed: Duration,
+    /// The exposure settled (Converged, or the fixed wait), rather than
+    /// the wait running out.
+    pub settled: bool,
+    pub meta: FrameMeta,
 }
 
 #[derive(Debug, Clone)]
 pub struct CaptureController {
     state: State,
     locked: Controls,
+    last_still: Option<StillReport>,
 }
 
 impl Default for CaptureController {
@@ -112,6 +141,7 @@ impl CaptureController {
         CaptureController {
             state: State::Idle,
             locked: Controls::default(),
+            last_still: None,
         }
     }
 
@@ -127,6 +157,11 @@ impl CaptureController {
 
     pub fn locked(&self) -> &Controls {
         &self.locked
+    }
+
+    /// How the last still was chosen.
+    pub fn last_still(&self) -> Option<&StillReport> {
+        self.last_still.as_ref()
     }
 
     /// The shutter was pressed.
@@ -165,6 +200,7 @@ impl CaptureController {
             seen: 0,
             deadline: now + STILL_TIMEOUT,
             last_gains: None,
+            first: None,
         };
         Step::StartStill(self.locked.clone())
     }
@@ -192,16 +228,20 @@ impl CaptureController {
         }
     }
 
-    /// A frame from the still stream.
-    pub fn on_still_frame(&mut self, meta: &FrameMeta) -> Step {
+    /// A frame from the still stream, arriving at `now`.
+    pub fn on_still_frame(&mut self, meta: &FrameMeta, now: Instant) -> Step {
         let State::Still {
-            seen, last_gains, ..
+            seen,
+            last_gains,
+            first,
+            ..
         } = &mut self.state
         else {
             return Step::Discard;
         };
         *seen += 1;
         let seen = *seen;
+        let elapsed = now.saturating_duration_since(*first.get_or_insert(now));
         let previous = std::mem::replace(last_gains, meta.color_gains);
         if seen <= MIN_DISCARD {
             return Step::Discard;
@@ -218,14 +258,21 @@ impl CaptureController {
             // The camera reports no gains: nothing to wait for.
             (None, _, _) => true,
         };
-        let ready = match meta.ae_state {
+        let settled = match meta.ae_state {
             // libcamera 4.10 says when its AE has converged (also when it
             // sits at a limit).
             Some(state) => state == AeState::Converged && color,
-            // Older: a fixed wait.
-            None => seen > FIXED_DISCARD,
+            // Older: a fixed wait, by frames and by time.
+            None => seen > FIXED_DISCARD && elapsed >= SETTLE_MIN,
         };
-        if ready || seen > MAX_DISCARD {
+        let out_of_time = (seen > MAX_DISCARD && elapsed >= SETTLE_MIN) || elapsed >= SETTLE_MAX;
+        if settled || out_of_time {
+            self.last_still = Some(StillReport {
+                frames: seen,
+                elapsed,
+                settled,
+                meta: meta.clone(),
+            });
             self.state = State::Restoring;
             Step::KeepAndRestore(self.locked.clone())
         } else {
@@ -295,19 +342,19 @@ mod tests {
         assert!(c.wants_still_stream());
         // Converged in the first two frames still waits the minimum.
         assert_eq!(
-            c.on_still_frame(&converged(9_000, None, AeState::Converged)),
+            c.on_still_frame(&converged(9_000, None, AeState::Converged), now),
             Step::Discard
         );
         assert_eq!(
-            c.on_still_frame(&converged(9_000, None, AeState::Converged)),
+            c.on_still_frame(&converged(9_000, None, AeState::Converged), now),
             Step::Discard
         );
         assert_eq!(
-            c.on_still_frame(&converged(9_000, None, AeState::Searching)),
+            c.on_still_frame(&converged(9_000, None, AeState::Searching), now),
             Step::Discard
         );
         assert_eq!(
-            c.on_still_frame(&converged(9_000, None, AeState::Converged)),
+            c.on_still_frame(&converged(9_000, None, AeState::Converged), now),
             Step::KeepAndRestore(locked)
         );
         assert!(c.is_busy(), "until the preview is back");
@@ -323,8 +370,9 @@ mod tests {
         let now = Instant::now();
         let mut c = CaptureController::new();
         c.begin(Mode::Full, false, Some(&meta(10_000, 1.0, None)), now);
+        // A full-resolution mode at 5 fps: the frames take 1.6 s.
         let steps: Vec<Step> = (0..FIXED_DISCARD + 1)
-            .map(|_| c.on_still_frame(&meta(10_000, 1.0, None)))
+            .map(|i| c.on_still_frame(&meta(10_000, 1.0, None), at(now, i, 200)))
             .collect();
         assert!(steps[..FIXED_DISCARD as usize]
             .iter()
@@ -357,27 +405,81 @@ mod tests {
         ];
         let steps: Vec<Step> = frames
             .iter()
-            .map(|g| c.on_still_frame(&converged(20_000, Some(*g), AeState::Converged)))
+            .map(|g| c.on_still_frame(&converged(20_000, Some(*g), AeState::Converged), now))
             .collect();
         assert!(steps[..4].iter().all(|s| *s == Step::Discard), "{steps:?}");
         assert!(matches!(steps[4], Step::KeepAndRestore(_)));
     }
 
+    /// The `i`th frame of a stream whose frames come every `ms`.
+    fn at(start: Instant, i: u32, ms: u64) -> Instant {
+        start + Duration::from_millis(ms * i as u64)
+    }
+
+    /// Feed still frames every `ms` until one is kept; returns its index.
+    fn kept_at(c: &mut CaptureController, now: Instant, ms: u64, m: &FrameMeta) -> u32 {
+        for i in 0..200 {
+            match c.on_still_frame(m, at(now, i, ms)) {
+                Step::Discard => {}
+                Step::KeepAndRestore(_) => return i,
+                other => panic!("{other:?}"),
+            }
+        }
+        panic!("never kept");
+    }
+
     #[test]
-    fn exposure_that_never_converges_is_kept_after_the_maximum() {
+    fn exposure_that_never_converges_is_kept_after_frames_and_time() {
+        let searching = converged(90_000, None, AeState::Searching);
+        // At 30 fps ten frames pass in a third of a second: the wait goes
+        // on to 1.5 s.
         let now = Instant::now();
         let mut c = CaptureController::new();
         c.begin(Mode::Full, false, Some(&meta(10_000, 1.0, None)), now);
-        let steps: Vec<Step> = (0..MAX_DISCARD + 1)
-            .map(|_| c.on_still_frame(&converged(90_000, None, AeState::Searching)))
-            .collect();
-        assert!(steps[..MAX_DISCARD as usize]
-            .iter()
-            .all(|s| *s == Step::Discard));
+        let i = kept_at(&mut c, now, 33, &searching);
+        assert!(at(now, i, 33) - now >= SETTLE_MIN, "frame {i}");
+        assert!(at(now, i - 1, 33) - now < SETTLE_MIN);
+        let r = c.last_still().unwrap();
+        assert!(!r.settled);
+        assert_eq!(r.frames, i + 1);
+        // At 5 fps the frames take longer: ten of them, 2 s.
+        let mut c = CaptureController::new();
+        c.begin(Mode::Full, false, None, now);
+        assert_eq!(kept_at(&mut c, now, 200, &searching), MAX_DISCARD);
+        // At 2 fps the wait stops at 3 s, before ten frames.
+        let mut c = CaptureController::new();
+        c.begin(Mode::Full, false, None, now);
+        let i = kept_at(&mut c, now, 500, &searching);
+        assert_eq!(at(now, i, 500) - now, SETTLE_MAX);
+        assert!(i < MAX_DISCARD);
+    }
+
+    #[test]
+    fn a_slow_mode_keeps_waiting_for_the_agc_past_ten_frames() {
+        // The telephoto's full mode at about 7.7 fps: the AGC converges on
+        // the 12th frame, after ten. Up to 0.3.0 the 11th, still dark, was
+        // kept.
+        let now = Instant::now();
+        let mut c = CaptureController::new();
+        c.begin(Mode::Full, false, None, now);
+        for i in 0..11 {
+            let m = converged(33_000, None, AeState::Searching);
+            assert_eq!(
+                c.on_still_frame(&m, at(now, i, 130)),
+                Step::Discard,
+                "frame {i}"
+            );
+        }
+        let done = converged(33_000, None, AeState::Converged);
         assert!(matches!(
-            steps[MAX_DISCARD as usize],
+            c.on_still_frame(&done, at(now, 11, 130)),
             Step::KeepAndRestore(_)
         ));
+        let r = c.last_still().unwrap();
+        assert!(r.settled);
+        assert_eq!(r.frames, 12);
+        assert_eq!(r.elapsed, Duration::from_millis(1430));
+        assert_eq!(r.meta.ae_state, Some(AeState::Converged));
     }
 
     #[test]
@@ -444,9 +546,18 @@ mod tests {
             Step::StartStill(Controls::default())
         );
         let none = FrameMeta::default();
-        for _ in 0..FIXED_DISCARD {
-            assert_eq!(c.on_still_frame(&none), Step::Discard);
+        // At 5 fps, the fixed wait's frames and time end together.
+        for i in 0..FIXED_DISCARD {
+            assert_eq!(c.on_still_frame(&none, at(now, i, 200)), Step::Discard);
         }
-        assert!(matches!(c.on_still_frame(&none), Step::KeepAndRestore(_)));
+        assert!(matches!(
+            c.on_still_frame(&none, at(now, FIXED_DISCARD, 200)),
+            Step::KeepAndRestore(_)
+        ));
+        // At 30 fps the time decides: 1.5 s, not 9 frames.
+        let mut c = CaptureController::new();
+        c.begin(Mode::Full, false, None, now);
+        let i = kept_at(&mut c, now, 33, &none);
+        assert!(at(now, i, 33) - now >= SETTLE_MIN && i > FIXED_DISCARD);
     }
 }

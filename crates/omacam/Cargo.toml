@@ -23,7 +23,6 @@ anyhow.workspace = true
 clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-tracing-journald.workspace = true
 async-channel.workspace = true
 turbojpeg.workspace = true
 gtk4.workspace = true
