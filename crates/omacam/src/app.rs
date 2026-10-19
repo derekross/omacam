@@ -127,6 +127,8 @@ enum Msg {
     /// The newest frame is in the frame slot.
     FrameReady,
     Saved(Result<(PathBuf, photo::Bgrx), String>),
+    /// A burst merged into one picture, ready to save.
+    Merged(Result<Box<Picture>, String>),
     /// A command on the control socket (`omacam --remote shutter`).
     Remote(String),
     VideoSaved(Result<PathBuf, String>),
@@ -192,6 +194,8 @@ struct App {
     suspended: Cell<bool>,
     last_photo: RefCell<Option<PathBuf>>,
     last_error: RefCell<Option<(String, Instant)>>,
+    /// The frames of the burst being taken (Night, HDR).
+    burst: RefCell<Vec<Picture>>,
     built_presets: RefCell<Vec<f64>>,
     pro_toggle: gtk::ToggleButton,
     pro_panel: RefCell<Option<Rc<crate::pro::ProPanel>>>,
@@ -653,6 +657,7 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
         suspended: Cell::new(false),
         last_photo: RefCell::new(None),
         last_error: RefCell::new(None),
+        burst: RefCell::new(Vec::new()),
         built_presets: RefCell::new(Vec::new()),
         pro_toggle: pro_toggle.clone(),
         pro_panel: RefCell::new(None),
@@ -1047,6 +1052,14 @@ impl App {
                     }
                     self.save(*p)
                 }
+                Output::BurstFrame(p) => {
+                    let mut burst = self.burst.borrow_mut();
+                    if burst.is_empty() && self.settings.borrow().shutter_sound {
+                        play_shutter_sound();
+                    }
+                    burst.push(*p);
+                }
+                Output::BurstDone => self.merge_burst(),
                 Output::Error(msg) => self.error(&msg),
             }
         }
@@ -1065,6 +1078,8 @@ impl App {
                     capture_mode: match self.cli.capture {
                         CaptureMode::Full => capture::Mode::Full,
                         CaptureMode::Quick => capture::Mode::Quick,
+                        CaptureMode::Night => capture::Mode::Burst(capture::BurstSpec::NIGHT),
+                        CaptureMode::Hdr => capture::Mode::Burst(capture::BurstSpec::HDR),
                     },
                     transfer_exposure: self.cli.exposure_hints,
                     tap_to_focus: self.settings.borrow().tap_to_focus,
@@ -1146,6 +1161,8 @@ impl App {
                 *self.last_photo.borrow_mut() = Some(path);
             }
             Msg::Saved(Err(e)) => self.error(&format!("Photo not saved: {e}")),
+            Msg::Merged(Ok(p)) => self.save(*p),
+            Msg::Merged(Err(e)) => self.error(&format!("Photo not saved: {e}")),
             Msg::VideoSaved(Ok(path)) => {
                 self.thumb.set_sensitive(true);
                 *self.last_photo.borrow_mut() = Some(path);
@@ -1321,6 +1338,20 @@ impl App {
         std::thread::spawn(move || {
             let result = encode_and_write(&p, &dir, &stamp, opts).map_err(|e| format!("{e:#}"));
             let _ = tx.send_blocking(Msg::Saved(result));
+        });
+    }
+
+    /// Merge the burst's frames off the UI thread; the result comes back as
+    /// [`Msg::Merged`] and is saved like any picture.
+    fn merge_burst(self: &Rc<Self>) {
+        let frames = std::mem::take(&mut *self.burst.borrow_mut());
+        let hdr = self.cli.capture == CaptureMode::Hdr;
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let result = photo::merge_burst(frames, hdr)
+                .map(Box::new)
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send_blocking(Msg::Merged(result));
         });
     }
 

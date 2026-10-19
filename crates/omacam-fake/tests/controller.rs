@@ -9,7 +9,7 @@ use omacam_core::backend::{Backend, Event};
 use omacam_core::controller::{Options, Output};
 use omacam_core::lens::{Role, TableSpec};
 use omacam_core::zoom::ZoomSource;
-use omacam_core::Controller;
+use omacam_core::{capture, Controller};
 use omacam_fake::{FakeBackend, Options as FakeOptions};
 
 struct Rig {
@@ -19,6 +19,9 @@ struct Rig {
     shown: Vec<String>,
     pictures: Vec<(String, f64, omacam_core::Size)>,
     errors: Vec<String>,
+    /// Burst frames: lens and exposure.
+    bursts: Vec<(String, Option<i32>)>,
+    bursts_done: u32,
 }
 
 impl Rig {
@@ -42,6 +45,8 @@ impl Rig {
             shown: Vec::new(),
             pictures: Vec::new(),
             errors: Vec::new(),
+            bursts: Vec::new(),
+            bursts_done: 0,
         }
     }
 
@@ -54,6 +59,10 @@ impl Rig {
                     self.pictures
                         .push((p.lens.name.clone(), p.crop, p.frame.size))
                 }
+                Output::BurstFrame(p) => self
+                    .bursts
+                    .push((p.lens.name.clone(), p.frame.meta.exposure_us)),
+                Output::BurstDone => self.bursts_done += 1,
                 Output::Error(e) => self.errors.push(e),
             }
         }
@@ -126,6 +135,40 @@ fn zoom_across_all_lenses_and_back() {
     assert!(out.is_empty());
     assert!(rig.run_until(Duration::from_secs(2), |r| r.showing(UW)));
     assert_eq!(rig.controller.view().lens_role, Some(Role::Ultrawide));
+    assert!(rig.errors.is_empty(), "{:?}", rig.errors);
+}
+
+#[test]
+fn a_night_burst_holds_one_exposure_and_the_preview_returns() {
+    let mut rig = Rig::new(fast());
+    let spec = capture::BurstSpec {
+        frames: 4,
+        under_stops: 0.0,
+        max_exposure_us: 66_000,
+    };
+    rig.controller.set_capture_mode(capture::Mode::Burst(spec));
+    let out = rig.controller.resume(Instant::now());
+    rig.apply(out);
+    assert!(rig.run_until(Duration::from_secs(2), |r| r.showing(MAIN)));
+    let out = rig.controller.shutter(Instant::now());
+    rig.apply(out);
+    assert!(rig.run_until(Duration::from_secs(5), |r| r.bursts_done == 1));
+    assert!(rig.pictures.is_empty(), "a burst gives no single picture");
+    assert_eq!(rig.bursts.len(), 4, "{:?}", rig.bursts);
+    let first = rig.bursts[0].1;
+    assert!(first.is_some());
+    assert!(
+        rig.bursts
+            .iter()
+            .all(|(lens, t)| lens == "Main" && *t == first),
+        "{:?}",
+        rig.bursts
+    );
+    rig.shown.clear();
+    assert!(
+        rig.run_until(Duration::from_secs(2), |r| !r.controller.view().capturing
+            && r.showing(MAIN))
+    );
     assert!(rig.errors.is_empty(), "{:?}", rig.errors);
 }
 

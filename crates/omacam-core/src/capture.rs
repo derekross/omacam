@@ -23,6 +23,13 @@
 //!
 //! Quick mode keeps the next preview frame instead, with no reconfiguring.
 //!
+//! Burst mode (Night and HDR, merged by omacam-merge) settles the same way,
+//! then locks one exposure for the whole burst: the settled one, the mode's
+//! stops under it, with the shutter capped for a handheld phone and the
+//! analog gain making up the rest. It drops frames until the camera reports
+//! that exposure, keeps [`BurstSpec::frames`] of them, and goes back to the
+//! preview at the settled exposure.
+//!
 //! The machine is pure: the controller feeds it frames and time, and acts
 //! on the [`Step`]s it returns.
 
@@ -54,13 +61,57 @@ pub const GAINS_WITHIN: f64 = 0.10;
 /// Without the preview's gains to compare: how little they may change
 /// from one frame to the next to count as settled.
 pub const GAINS_STEADY: f64 = 0.03;
+/// How close a burst frame's exposure time and gain must be to the burst's.
+pub const BURST_WITHIN: f64 = 0.06;
+/// Frames to wait for the camera to apply the burst's exposure.
+pub const BURST_APPLY_MAX: u32 = 8;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A burst: how many frames, how far under the settled exposure, and the
+/// longest shutter a frame may have.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BurstSpec {
+    pub frames: u32,
+    /// Stops under the settled exposure (0 keeps it).
+    pub under_stops: f32,
+    /// The longest exposure time per frame (hand shake); gain makes up the
+    /// rest.
+    pub max_exposure_us: i32,
+}
+
+impl BurstSpec {
+    /// Night: many frames at the settled brightness, each at most 1/15 s.
+    pub const NIGHT: BurstSpec = BurstSpec {
+        frames: 12,
+        under_stops: 0.0,
+        max_exposure_us: 66_000,
+    };
+    /// HDR: fewer frames, 1.5 stops under so the highlights don't clip.
+    pub const HDR: BurstSpec = BurstSpec {
+        frames: 8,
+        under_stops: 1.5,
+        max_exposure_us: 33_000,
+    };
+
+    /// The burst's exposure time and analog gain, from the settled ones.
+    pub fn exposure(&self, settled_us: i32, settled_gain: f32) -> (i32, f32) {
+        let mut t = settled_us as f64 * 2f64.powf(-self.under_stops as f64);
+        let mut g = settled_gain.max(1.0) as f64;
+        if t > self.max_exposure_us as f64 {
+            g *= t / self.max_exposure_us as f64;
+            t = self.max_exposure_us as f64;
+        }
+        (t.round().max(1.0) as i32, g as f32)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Mode {
     /// A preview frame, at preview resolution.
     Quick,
     /// A frame from the still mode, at full resolution.
     Full,
+    /// Several frames from the still mode at one locked exposure.
+    Burst(BurstSpec),
 }
 
 /// What the controller should do next.
@@ -71,6 +122,10 @@ pub enum Step {
     StartStill(Controls),
     /// Keep the frame just given as the picture.
     Keep,
+    /// Hold this exposure and color on the still stream (a burst's lock).
+    Apply(Controls),
+    /// Keep this frame as one of a burst; more follow.
+    KeepBurst,
     /// Keep this frame and go back to the preview with these hints.
     KeepAndRestore(Controls),
     /// Drop this frame.
@@ -93,6 +148,23 @@ enum State {
         /// When the still stream's first frame arrived.
         first: Option<Instant>,
     },
+    /// Waiting for the camera to apply the burst's exposure.
+    BurstApply {
+        spec: BurstSpec,
+        target: (i32, f32),
+        waited: u32,
+        deadline: Instant,
+        first: Instant,
+        seen: u32,
+    },
+    BurstKeep {
+        spec: BurstSpec,
+        target: (i32, f32),
+        kept: u32,
+        deadline: Instant,
+        first: Instant,
+        seen: u32,
+    },
     Restoring,
 }
 
@@ -114,6 +186,8 @@ pub struct CaptureController {
     state: State,
     locked: Controls,
     last_still: Option<StillReport>,
+    /// The burst this capture takes, if it is one.
+    burst: Option<BurstSpec>,
 }
 
 impl Default for CaptureController {
@@ -142,6 +216,7 @@ impl CaptureController {
             state: State::Idle,
             locked: Controls::default(),
             last_still: None,
+            burst: None,
         }
     }
 
@@ -152,7 +227,10 @@ impl CaptureController {
     /// True while frames belong to the still stream (the preview should
     /// stay frozen).
     pub fn wants_still_stream(&self) -> bool {
-        matches!(self.state, State::Still { .. })
+        matches!(
+            self.state,
+            State::Still { .. } | State::BurstApply { .. } | State::BurstKeep { .. }
+        )
     }
 
     pub fn locked(&self) -> &Controls {
@@ -162,6 +240,11 @@ impl CaptureController {
     /// How the last still was chosen.
     pub fn last_still(&self) -> Option<&StillReport> {
         self.last_still.as_ref()
+    }
+
+    /// The burst the current (or last) capture takes, if it is one.
+    pub fn burst(&self) -> Option<BurstSpec> {
+        self.burst
     }
 
     /// The shutter was pressed.
@@ -175,12 +258,16 @@ impl CaptureController {
         if self.is_busy() {
             return Step::Nothing;
         }
+        self.burst = match mode {
+            Mode::Burst(spec) => Some(spec),
+            _ => None,
+        };
         match mode {
             Mode::Quick => {
                 self.state = State::QuickWait;
                 Step::Nothing
             }
-            Mode::Full => {
+            Mode::Full | Mode::Burst(_) => {
                 let scanning = last.and_then(|m| m.af_state) == Some(AfState::Scanning);
                 if autofocus && scanning {
                     self.state = State::WaitFocus {
@@ -230,6 +317,12 @@ impl CaptureController {
 
     /// A frame from the still stream, arriving at `now`.
     pub fn on_still_frame(&mut self, meta: &FrameMeta, now: Instant) -> Step {
+        if matches!(
+            self.state,
+            State::BurstApply { .. } | State::BurstKeep { .. }
+        ) {
+            return self.on_burst_frame(meta, now);
+        }
         let State::Still {
             seen,
             last_gains,
@@ -266,18 +359,124 @@ impl CaptureController {
             None => seen > FIXED_DISCARD && elapsed >= SETTLE_MIN,
         };
         let out_of_time = (seen > MAX_DISCARD && elapsed >= SETTLE_MIN) || elapsed >= SETTLE_MAX;
-        if settled || out_of_time {
-            self.last_still = Some(StillReport {
-                frames: seen,
-                elapsed,
-                settled,
-                meta: meta.clone(),
-            });
-            self.state = State::Restoring;
-            Step::KeepAndRestore(self.locked.clone())
-        } else {
-            Step::Discard
+        if !(settled || out_of_time) {
+            return Step::Discard;
         }
+        self.last_still = Some(StillReport {
+            frames: seen,
+            elapsed,
+            settled,
+            meta: meta.clone(),
+        });
+        if let Some(spec) = self.burst {
+            // Lock the burst's exposure on the settled frame's values; the
+            // preview comes back at the settled ones (`locked`).
+            let first = now - elapsed;
+            let settled_controls = lock_from(Some(meta));
+            let (t, g) = spec.exposure(
+                meta.exposure_us
+                    .or(self.locked.exposure_us)
+                    .unwrap_or(10_000),
+                meta.analog_gain.or(self.locked.analog_gain).unwrap_or(1.0),
+            );
+            self.locked = Controls {
+                lens_position: settled_controls.lens_position.or(self.locked.lens_position),
+                ..settled_controls
+            };
+            self.state = State::BurstApply {
+                spec,
+                target: (t, g),
+                waited: 0,
+                deadline: now + STILL_TIMEOUT,
+                first,
+                seen,
+            };
+            return Step::Apply(Controls {
+                exposure_us: Some(t),
+                analog_gain: Some(g),
+                color_gains: meta.color_gains.or(self.locked.color_gains),
+                lens_position: self.locked.lens_position,
+                ..Controls::default()
+            });
+        }
+        self.state = State::Restoring;
+        Step::KeepAndRestore(self.locked.clone())
+    }
+
+    /// A still-stream frame while a burst locks or keeps its frames.
+    fn on_burst_frame(&mut self, meta: &FrameMeta, now: Instant) -> Step {
+        let near = |got: Option<f64>, want: f64| {
+            got.is_some_and(|g| want > 0.0 && ((g - want) / want).abs() <= BURST_WITHIN)
+        };
+        let applied = |target: (i32, f32)| {
+            near(meta.exposure_us.map(f64::from), target.0 as f64)
+                && near(meta.analog_gain.map(f64::from), target.1 as f64)
+        };
+        match &mut self.state {
+            State::BurstApply {
+                spec,
+                target,
+                waited,
+                deadline,
+                first,
+                seen,
+            } => {
+                *seen += 1;
+                if !applied(*target) {
+                    *waited += 1;
+                    if *waited > BURST_APPLY_MAX {
+                        self.state = State::Restoring;
+                        return Step::Fail("the camera didn't take the burst's exposure".into());
+                    }
+                    return Step::Discard;
+                }
+                let next = State::BurstKeep {
+                    spec: *spec,
+                    target: *target,
+                    kept: 0,
+                    deadline: *deadline,
+                    first: *first,
+                    seen: *seen,
+                };
+                self.state = next;
+                self.keep_burst_frame(meta, now)
+            }
+            State::BurstKeep { target, seen, .. } => {
+                *seen += 1;
+                // A frame off the burst's exposure (rare: a control
+                // re-applied late) would merge badly: leave it out.
+                if !applied(*target) {
+                    return Step::Discard;
+                }
+                self.keep_burst_frame(meta, now)
+            }
+            _ => Step::Discard,
+        }
+    }
+
+    fn keep_burst_frame(&mut self, meta: &FrameMeta, now: Instant) -> Step {
+        let State::BurstKeep {
+            spec,
+            kept,
+            first,
+            seen,
+            ..
+        } = &mut self.state
+        else {
+            return Step::Discard;
+        };
+        *kept += 1;
+        if *kept < spec.frames {
+            return Step::KeepBurst;
+        }
+        self.last_still = Some(StillReport {
+            frames: *seen,
+            elapsed: now.saturating_duration_since(*first),
+            settled: true,
+            meta: meta.clone(),
+        });
+        self.state = State::Restoring;
+        Step::KeepAndRestore(self.locked.clone())
     }
 
     /// Time passes: deadlines.
@@ -287,6 +486,12 @@ impl CaptureController {
             State::Still { deadline, .. } if now >= deadline => {
                 self.state = State::Restoring;
                 Step::Fail("the still frame didn't arrive".into())
+            }
+            State::BurstApply { deadline, .. } | State::BurstKeep { deadline, .. }
+                if now >= deadline =>
+            {
+                self.state = State::Restoring;
+                Step::Fail("the burst didn't finish".into())
             }
             _ => Step::Nothing,
         }
@@ -559,5 +764,118 @@ mod tests {
         c.begin(Mode::Full, false, None, now);
         let i = kept_at(&mut c, now, 33, &none);
         assert!(at(now, i, 33) - now >= SETTLE_MIN && i > FIXED_DISCARD);
+    }
+    fn settled(exposure: i32, gain: f32) -> FrameMeta {
+        FrameMeta {
+            exposure_us: Some(exposure),
+            analog_gain: Some(gain),
+            color_gains: Some([1.8, 1.5]),
+            ae_state: Some(AeState::Converged),
+            ..FrameMeta::default()
+        }
+    }
+
+    #[test]
+    fn a_burst_caps_the_shutter_and_makes_it_up_with_gain() {
+        // Night in a dim room: the AGC wants 1/5 s at gain 2.
+        let (t, g) = BurstSpec::NIGHT.exposure(200_000, 2.0);
+        assert_eq!(t, 66_000);
+        assert!((g - 2.0 * 200.0 / 66.0).abs() < 1e-3, "{g}");
+        // HDR outdoors: 1.5 stops under 1/50 s, gain unchanged.
+        let (t, g) = BurstSpec::HDR.exposure(20_000, 1.0);
+        assert_eq!(t, 7071);
+        assert_eq!(g, 1.0);
+    }
+
+    #[test]
+    fn a_burst_locks_its_exposure_then_keeps_its_frames() {
+        let spec = BurstSpec {
+            frames: 3,
+            under_stops: 1.0,
+            max_exposure_us: 66_000,
+        };
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        let mut c = CaptureController::new();
+        let preview = settled(20_000, 2.0);
+        assert!(matches!(
+            c.begin(Mode::Burst(spec), false, Some(&preview), t0),
+            Step::StartStill(_)
+        ));
+        // The still mode settles at 20 ms, gain 2 (after the first drops).
+        for i in 0..MIN_DISCARD as u64 {
+            assert_eq!(
+                c.on_still_frame(&settled(20_000, 2.0), ms(100 * i)),
+                Step::Discard
+            );
+        }
+        let lock = match c.on_still_frame(&settled(20_000, 2.0), ms(300)) {
+            Step::Apply(controls) => controls,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(lock.exposure_us, Some(10_000));
+        assert_eq!(lock.analog_gain, Some(2.0));
+        assert_eq!(lock.color_gains, Some([1.8, 1.5]));
+        assert!(c.wants_still_stream());
+        // A frame still at the old exposure is dropped.
+        assert_eq!(
+            c.on_still_frame(&settled(20_000, 2.0), ms(400)),
+            Step::Discard
+        );
+        // Three at the burst's exposure: two kept, the third ends the burst
+        // and the preview comes back at the settled exposure.
+        assert_eq!(
+            c.on_still_frame(&settled(10_000, 2.0), ms(500)),
+            Step::KeepBurst
+        );
+        assert_eq!(
+            c.on_still_frame(&settled(10_050, 2.0), ms(600)),
+            Step::KeepBurst
+        );
+        match c.on_still_frame(&settled(10_000, 2.0), ms(700)) {
+            Step::KeepAndRestore(restore) => {
+                assert_eq!(restore.exposure_us, Some(20_000));
+                assert_eq!(restore.analog_gain, Some(2.0));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(c.burst(), Some(spec));
+        assert!(!c.wants_still_stream());
+    }
+
+    #[test]
+    fn a_burst_gives_up_when_the_camera_ignores_its_exposure() {
+        let t0 = Instant::now();
+        let mut c = CaptureController::new();
+        let preview = settled(20_000, 2.0);
+        c.begin(Mode::Burst(BurstSpec::HDR), false, Some(&preview), t0);
+        let mut step = Step::Nothing;
+        for i in 0..(MIN_DISCARD + 1 + BURST_APPLY_MAX + 1) {
+            step = c.on_still_frame(
+                &settled(20_000, 2.0),
+                t0 + Duration::from_millis(100 * i as u64),
+            );
+            if matches!(step, Step::Fail(_)) {
+                break;
+            }
+        }
+        assert!(matches!(step, Step::Fail(_)), "{step:?}");
+    }
+
+    #[test]
+    fn full_mode_still_keeps_one_frame() {
+        let t0 = Instant::now();
+        let mut c = CaptureController::new();
+        let preview = settled(20_000, 2.0);
+        c.begin(Mode::Full, false, Some(&preview), t0);
+        let mut step = Step::Nothing;
+        for i in 0..=MIN_DISCARD {
+            step = c.on_still_frame(
+                &settled(20_000, 2.0),
+                t0 + Duration::from_millis(100 * i as u64),
+            );
+        }
+        assert!(matches!(step, Step::KeepAndRestore(_)), "{step:?}");
+        assert_eq!(c.burst(), None);
     }
 }

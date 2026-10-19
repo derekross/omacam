@@ -80,6 +80,11 @@ pub enum Output {
     /// A new frame for the viewfinder.
     Show(Frame),
     Picture(Box<Picture>),
+    /// One frame of a burst (Night, HDR) for the merge; more follow until
+    /// [`Output::BurstDone`].
+    BurstFrame(Box<Picture>),
+    /// The burst's last frame was the one before: merge them.
+    BurstDone,
     /// Something to tell the user.
     Error(String),
 }
@@ -1016,7 +1021,39 @@ impl Controller {
                 out.push(Output::Error(format!("Photo failed: {msg}")));
                 self.restore_preview(now, out);
             }
-            Step::Nothing | Step::Keep | Step::KeepAndRestore(_) | Step::Discard => {}
+            Step::Apply(controls) => {
+                // A burst's lock: hold its exposure, gain, color and focus
+                // (manual settings hold; the values in `controls` alone are
+                // only start hints the AGC would walk away from).
+                if let Some((generation, target)) = self.switch.streaming() {
+                    let caps = self.table.get(target.lens).caps.clone();
+                    let mut settings = self.exposure.effective(&caps);
+                    if let Some(t) = controls.exposure_us {
+                        settings.shutter = Setting::Manual(t);
+                    }
+                    if let Some(g) = controls.analog_gain {
+                        settings.gain = Setting::Manual(g);
+                    }
+                    if let Some(gains) = controls.color_gains {
+                        settings.white_balance = Setting::Manual(Awb::Gains(gains));
+                    }
+                    if let Some(p) = controls.lens_position {
+                        settings.lens = Setting::Manual(p);
+                    }
+                    out.push(Output::Backend(Command::SetControls {
+                        generation,
+                        controls: crate::backend::Controls {
+                            settings: Some(settings),
+                            ..controls
+                        },
+                    }));
+                }
+            }
+            Step::Nothing
+            | Step::Keep
+            | Step::KeepBurst
+            | Step::KeepAndRestore(_)
+            | Step::Discard => {}
         }
     }
 
@@ -1200,13 +1237,27 @@ impl Controller {
                             opt(m.ae_state.map(|s| format!("{s:?}"))),
                         );
                     }
-                    out.push(self.picture(frame, lens_idx, purpose));
+                    if self.capture.burst().is_some() {
+                        out.push(burst_frame(self.picture(frame, lens_idx, purpose)));
+                        out.push(Output::BurstDone);
+                    } else {
+                        out.push(self.picture(frame, lens_idx, purpose));
+                    }
                     self.restore_preview(now, out);
                 }
+                Step::KeepBurst => out.push(burst_frame(self.picture(frame, lens_idx, purpose))),
                 Step::Discard => {}
                 step => self.capture_step(step, now, out),
             },
         }
+    }
+}
+
+/// A picture output as one frame of a burst.
+fn burst_frame(o: Output) -> Output {
+    match o {
+        Output::Picture(p) => Output::BurstFrame(p),
+        other => other,
     }
 }
 

@@ -232,6 +232,68 @@ pub fn write_atomically(path: &Path, jpeg: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// A frame's pixels as omacam-merge's RGB picture.
+pub fn to_rgb(raw: &Raw<'_>) -> omacam_merge::RgbImage {
+    let mut img = omacam_merge::RgbImage::new(raw.width as usize, raw.height as usize);
+    for y in 0..raw.height {
+        for x in 0..raw.width {
+            let [b, g, r, _] = pixel(raw, x, y);
+            let i = (y as usize * raw.width as usize + x as usize) * 3;
+            img.data[i..i + 3].copy_from_slice(&[r, g, b]);
+        }
+    }
+    img
+}
+
+/// Merge a burst (Night, or HDR when `hdr`) into one picture: the
+/// reference frame's picture, its pixels replaced by the merge (XRGB8888).
+pub fn merge_burst(
+    mut frames: Vec<omacam_core::controller::Picture>,
+    hdr: bool,
+) -> Result<omacam_core::controller::Picture> {
+    let started = std::time::Instant::now();
+    let images = frames
+        .iter()
+        .map(|p| {
+            let data = p
+                .frame
+                .data
+                .bytes()
+                .context("a burst frame wasn't copied to memory")?;
+            Ok(to_rgb(&Raw {
+                data,
+                width: p.frame.size.width,
+                height: p.frame.size.height,
+                stride: p.frame.stride,
+                layout: p.frame.layout,
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let params = if hdr {
+        omacam_merge::MergeParams::hdr()
+    } else {
+        omacam_merge::MergeParams::night()
+    };
+    let out = omacam_merge::merge_burst(&images, &params)?;
+    tracing::info!(
+        "merged {} frames in {} ms, reference {}, {:?}",
+        images.len(),
+        started.elapsed().as_millis(),
+        out.reference,
+        out.stats
+    );
+    let mut picture = frames.swap_remove(out.reference);
+    // XRGB8888 in memory is B, G, R, X.
+    let mut data = Vec::with_capacity(out.image.data.len() / 3 * 4);
+    for p in out.image.data.chunks_exact(3) {
+        data.extend_from_slice(&[p[2], p[1], p[0], 255]);
+    }
+    picture.frame.stride = out.image.width as u32 * 4;
+    picture.frame.layout = PixelLayout::Xrgb8888;
+    picture.frame.data = omacam_core::backend::FrameData::Memory(data);
+    Ok(picture)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -37,6 +37,11 @@ pub enum CaptureMode {
     Full,
     /// Keep a preview frame (fast, preview resolution).
     Quick,
+    /// Night: a burst at full resolution, merged to cut the noise
+    /// (omacam-merge).
+    Night,
+    /// HDR: a burst under the settled exposure, merged and tone mapped.
+    Hdr,
 }
 
 #[derive(Debug, Clone, Parser)]
