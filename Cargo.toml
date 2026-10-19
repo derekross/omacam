@@ -4,6 +4,7 @@ members = [
     "crates/omacam-core",
     "crates/omacam-fake",
     "crates/omacam-libcamera",
+    "crates/omacam-merge",
     "crates/omacam-record",
     "crates/omacam",
 ]
@@ -13,6 +14,7 @@ members = [
 default-members = [
     "crates/omacam-core",
     "crates/omacam-fake",
+    "crates/omacam-merge",
     "crates/omacam-record",
     "crates/omacam",
 ]
@@ -34,6 +36,7 @@ undocumented_unsafe_blocks = "warn"
 omacam-core = { path = "crates/omacam-core" }
 omacam-fake = { path = "crates/omacam-fake" }
 omacam-libcamera = { path = "crates/omacam-libcamera" }
+omacam-merge = { path = "crates/omacam-merge" }
 omacam-record = { path = "crates/omacam-record" }
 
 anyhow = "1"
