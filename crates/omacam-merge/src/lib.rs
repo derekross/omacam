@@ -67,10 +67,13 @@ impl MergeParams {
         }
     }
 
-    /// HDR: a burst 1-2 stops under the AGC's exposure, fused back up.
-    pub fn hdr() -> MergeParams {
+    /// HDR: a burst `under_stops` under the AGC's exposure, fused back up:
+    /// the merge itself for the highlights, a copy brought back to the
+    /// AGC's exposure for the midtones and one a stop brighter still for
+    /// the shadows.
+    pub fn hdr(under_stops: f32) -> MergeParams {
         MergeParams {
-            fusion_evs: vec![0.0, 1.0, 2.0],
+            fusion_evs: vec![0.0, under_stops, under_stops + 1.0],
         }
     }
 }

@@ -30,7 +30,7 @@ fn main() {
             },
         ),
         ("night", MergeParams::night()),
-        ("hdr", MergeParams::hdr()),
+        ("hdr", MergeParams::hdr(1.5)),
     ] {
         let t = Instant::now();
         let out = merge_burst(&frames, &params).unwrap();

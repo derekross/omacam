@@ -56,7 +56,7 @@ fn main() {
             fusion_evs: Vec::new(),
         },
         "night" => MergeParams::night(),
-        "hdr" => MergeParams::hdr(),
+        "hdr" => MergeParams::hdr(1.5),
         m => panic!("unknown mode {m}"),
     };
     let out_dir = Path::new(&args[4]);

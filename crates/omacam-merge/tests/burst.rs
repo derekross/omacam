@@ -96,14 +96,16 @@ fn a_moving_square_leaves_no_ghost() {
 }
 
 #[test]
-fn hdr_fusion_lifts_a_dark_burst() {
+fn hdr_fusion_brings_an_under_burst_back_to_its_exposure() {
     let b = burst(6);
     let mut rng = Rng::new(3);
     // The burst two stops under: every value a quarter in linear light,
     // about 0.53 of it in display encoding.
-    let frames: Vec<RgbImage> = (0..6)
-        .map(|i| {
-            let mut f = b.noisy(i, SIGMA * 0.5, &mut rng);
+    let normal: Vec<RgbImage> = (0..6).map(|i| b.noisy(i, SIGMA * 0.5, &mut rng)).collect();
+    let frames: Vec<RgbImage> = normal
+        .iter()
+        .map(|f| {
+            let mut f = f.clone();
             for v in &mut f.data {
                 *v = (*v as f32 * 0.53).round() as u8;
             }
@@ -112,13 +114,14 @@ fn hdr_fusion_lifts_a_dark_burst() {
         .collect();
     let mean =
         |img: &RgbImage| img.data.iter().map(|&v| v as f32).sum::<f32>() / img.data.len() as f32;
-    let flat = merge_burst(&frames, &plain()).unwrap();
-    let hdr = merge_burst(&frames, &MergeParams::hdr()).unwrap();
+    let exposed = merge_burst(&normal, &plain()).unwrap();
+    let hdr = merge_burst(&frames, &MergeParams::hdr(2.0)).unwrap();
+    // Back to about the exposure the AGC chose, not merely brighter than
+    // the burst (the phone's first HDR came out darker than a plain shot).
+    let (m_hdr, m_exp) = (mean(&hdr.image), mean(&exposed.image));
     assert!(
-        mean(&hdr.image) > 1.2 * mean(&flat.image),
-        "{} vs {}",
-        mean(&hdr.image),
-        mean(&flat.image)
+        (0.85..=1.2).contains(&(m_hdr / m_exp)),
+        "{m_hdr} vs {m_exp}"
     );
     let clipped = hdr.image.data.iter().filter(|&&v| v == 255).count();
     assert!(

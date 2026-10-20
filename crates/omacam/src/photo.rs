@@ -295,7 +295,7 @@ fn merge_burst_in_pool(
         })
         .collect::<Result<Vec<_>>>()?;
     let params = if hdr {
-        omacam_merge::MergeParams::hdr()
+        omacam_merge::MergeParams::hdr(omacam_core::capture::BurstSpec::HDR.under_stops)
     } else {
         omacam_merge::MergeParams::night()
     };
