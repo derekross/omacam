@@ -234,19 +234,20 @@ pub fn write_atomically(path: &Path, jpeg: &[u8]) -> Result<()> {
 
 /// A frame's pixels as omacam-merge's RGB picture.
 pub fn to_rgb(raw: &Raw<'_>) -> omacam_merge::RgbImage {
+    use rayon::prelude::*;
     let mut img = omacam_merge::RgbImage::new(raw.width as usize, raw.height as usize);
-    for y in 0..raw.height {
-        for x in 0..raw.width {
-            let [b, g, r, _] = pixel(raw, x, y);
-            let i = (y as usize * raw.width as usize + x as usize) * 3;
-            img.data[i..i + 3].copy_from_slice(&[r, g, b]);
-        }
-    }
+    img.data
+        .par_chunks_mut(raw.width as usize * 3)
+        .enumerate()
+        .for_each(|(y, row)| {
+            for (x, o) in row.chunks_exact_mut(3).enumerate() {
+                let [b, g, r, _] = pixel(raw, x as u32, y as u32);
+                o.copy_from_slice(&[r, g, b]);
+            }
+        });
     img
 }
 
-/// Merge a burst (Night, or HDR when `hdr`) into one picture: the
-/// reference frame's picture, its pixels replaced by the merge (XRGB8888).
 /// The merge's threads: one core left free and a lower priority, so the
 /// viewfinder keeps moving while a burst merges.
 fn merge_pool() -> Result<rayon::ThreadPool> {
@@ -265,6 +266,8 @@ fn merge_pool() -> Result<rayon::ThreadPool> {
         .context("the merge's threads didn't start")
 }
 
+/// Merge a burst (Night, or HDR when `hdr`) into one picture: the
+/// reference frame's picture, its pixels replaced by the merge (XRGB8888).
 pub fn merge_burst(
     frames: Vec<omacam_core::controller::Picture>,
     hdr: bool,
@@ -276,7 +279,10 @@ fn merge_burst_in_pool(
     mut frames: Vec<omacam_core::controller::Picture>,
     hdr: bool,
 ) -> Result<omacam_core::controller::Picture> {
+    use rayon::prelude::*;
     let started = std::time::Instant::now();
+    // One frame at a time (a Picture isn't Sync); to_rgb runs its rows
+    // in parallel.
     let images = frames
         .iter()
         .map(|p| {
@@ -294,6 +300,7 @@ fn merge_burst_in_pool(
             }))
         })
         .collect::<Result<Vec<_>>>()?;
+    let converted = started.elapsed();
     let params = if hdr {
         omacam_merge::MergeParams::hdr(omacam_core::capture::BurstSpec::HDR.under_stops)
     } else {
@@ -301,18 +308,23 @@ fn merge_burst_in_pool(
     };
     let out = omacam_merge::merge_burst(&images, &params)?;
     tracing::info!(
-        "merged {} frames in {} ms, reference {}, {:?}",
+        "merged {} frames in {} ms ({} ms to RGB), reference {}, {:?}",
         images.len(),
         started.elapsed().as_millis(),
+        converted.as_millis(),
         out.reference,
         out.stats
     );
     let mut picture = frames.swap_remove(out.reference);
     // XRGB8888 in memory is B, G, R, X.
-    let mut data = Vec::with_capacity(out.image.data.len() / 3 * 4);
-    for p in out.image.data.chunks_exact(3) {
-        data.extend_from_slice(&[p[2], p[1], p[0], 255]);
-    }
+    let mut data = vec![0u8; out.image.data.len() / 3 * 4];
+    data.par_chunks_mut(4 * 4096)
+        .zip(out.image.data.par_chunks(3 * 4096))
+        .for_each(|(o, p)| {
+            for (o, p) in o.chunks_exact_mut(4).zip(p.chunks_exact(3)) {
+                o.copy_from_slice(&[p[2], p[1], p[0], 255]);
+            }
+        });
     picture.frame.stride = out.image.width as u32 * 4;
     picture.frame.layout = PixelLayout::Xrgb8888;
     picture.frame.data = omacam_core::backend::FrameData::Memory(data);

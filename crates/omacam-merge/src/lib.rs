@@ -117,15 +117,22 @@ pub fn merge_burst(frames: &[RgbImage], params: &MergeParams) -> Result<MergeOut
         return Err(MergeError::TooSmall(w, h));
     }
 
+    let mut timings = Vec::new();
+    let mut t = std::time::Instant::now();
+    let mut lap = |name: &'static str| {
+        timings.push((name, t.elapsed()));
+        t = std::time::Instant::now();
+    };
     let lumas: Vec<Plane> = frames.par_iter().map(luma).collect();
     let reference = (0..frames.len().min(REFERENCE_CANDIDATES))
         .max_by(|&a, &b| sharpness(&lumas[a]).total_cmp(&sharpness(&lumas[b])))
         .unwrap();
+    lap("luma");
 
     let grid = TileGrid::new(w, h);
     let ref_pyramid = Pyramid::new(lumas[reference].clone());
     let offsets: Vec<Vec<(i32, i32)>> = lumas
-        .iter()
+        .par_iter()
         .enumerate()
         .map(|(i, l)| {
             if i == reference {
@@ -135,8 +142,10 @@ pub fn merge_burst(frames: &[RgbImage], params: &MergeParams) -> Result<MergeOut
             }
         })
         .collect();
+    lap("align");
 
-    let (merged, stats) = merge::merge(frames, &lumas, reference, &grid, &offsets);
+    let (merged, mut stats) = merge::merge(frames, &lumas, reference, &grid, &offsets);
+    lap("merge");
 
     let gain = if params.fusion_evs.len() > 1 {
         let mut ml = Plane::new(w, h);
@@ -147,19 +156,22 @@ pub fn merge_burst(frames: &[RgbImage], params: &MergeParams) -> Result<MergeOut
     } else {
         None
     };
+    lap("fusion");
 
     let mut image = RgbImage::new(w, h);
-    for (i, (o, p)) in image
+    image
         .data
-        .chunks_exact_mut(3)
-        .zip(merged.chunks_exact(3))
+        .par_chunks_exact_mut(3)
+        .zip(merged.par_chunks_exact(3))
         .enumerate()
-    {
-        let g = gain.as_ref().map_or(1.0, |g| g.data[i]);
-        for c in 0..3 {
-            o[c] = (p[c] * g).round().clamp(0.0, 255.0) as u8;
-        }
-    }
+        .for_each(|(i, (o, p))| {
+            let g = gain.as_ref().map_or(1.0, |g| g.data[i]);
+            for c in 0..3 {
+                o[c] = (p[c] * g).round().clamp(0.0, 255.0) as u8;
+            }
+        });
+    lap("output");
+    stats.timings = timings;
     Ok(MergeOutput {
         image,
         reference,

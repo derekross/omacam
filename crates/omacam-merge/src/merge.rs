@@ -110,6 +110,8 @@ pub struct MergeStats {
     /// Noise standard deviation (8-bit, per color) of the middle brightness
     /// bin.
     pub noise_sigma: f32,
+    /// How long each stage took, in order (filled in by `merge_burst`).
+    pub timings: Vec<(&'static str, std::time::Duration)>,
 }
 
 /// Merge `frames` onto `frames[reference]`, each moved per tile by its

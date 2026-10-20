@@ -40,5 +40,8 @@ fn main() {
             rayon::current_num_threads(),
             out.reference
         );
+        for (stage, d) in &out.stats.timings {
+            println!("  {stage}: {:.0} ms", d.as_secs_f64() * 1000.0);
+        }
     }
 }

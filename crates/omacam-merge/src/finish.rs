@@ -9,6 +9,7 @@
 //! its new luma over its old, which keeps the color.
 
 use crate::image::Plane;
+use rayon::prelude::*;
 
 /// The display encoding the software ISP writes is close to a 2.2 gamma.
 const GAMMA: f32 = 2.2;
@@ -99,9 +100,10 @@ fn laplacian_pyramid(p: Plane, levels: usize) -> Vec<Plane> {
     for l in 0..levels - 1 {
         let up = expand(&g[l + 1], g[l].width, g[l].height);
         let mut d = g[l].clone();
-        for (a, b) in d.data.iter_mut().zip(&up.data) {
-            *a -= b;
-        }
+        d.data
+            .par_iter_mut()
+            .zip(&up.data)
+            .for_each(|(a, b)| *a -= b);
         out.push(d);
     }
     out.push(g[levels - 1].clone());
@@ -112,9 +114,11 @@ fn collapse(mut pyr: Vec<Plane>) -> Plane {
     let mut cur = pyr.pop().unwrap();
     while let Some(mut finer) = pyr.pop() {
         let up = expand(&cur, finer.width, finer.height);
-        for (a, b) in finer.data.iter_mut().zip(&up.data) {
-            *a += b;
-        }
+        finer
+            .data
+            .par_iter_mut()
+            .zip(&up.data)
+            .for_each(|(a, b)| *a += b);
         cur = finer;
     }
     cur
@@ -138,9 +142,9 @@ pub fn fusion_gain(luma: &Plane, evs: &[f32]) -> Plane {
         .map(|ev| {
             let k = 2f32.powf(*ev);
             let mut p = luma.clone();
-            for v in &mut p.data {
-                *v = from_linear(to_linear(*v) * k);
-            }
+            p.data
+                .par_iter_mut()
+                .for_each(|v| *v = from_linear(to_linear(*v) * k));
             p
         })
         .collect();
@@ -148,24 +152,28 @@ pub fn fusion_gain(luma: &Plane, evs: &[f32]) -> Plane {
     // Normalize the weights across exposures, per pixel.
     let mut total = Plane::new(luma.width, luma.height);
     for w in &ws {
-        for (t, v) in total.data.iter_mut().zip(&w.data) {
-            *t += v;
-        }
+        total
+            .data
+            .par_iter_mut()
+            .zip(&w.data)
+            .for_each(|(t, v)| *t += v);
     }
     let mut fused: Option<Vec<Plane>> = None;
     for (img, mut w) in exposures.into_iter().zip(ws) {
-        for (v, t) in w.data.iter_mut().zip(&total.data) {
-            *v /= t;
-        }
+        w.data
+            .par_iter_mut()
+            .zip(&total.data)
+            .for_each(|(v, t)| *v /= t);
         let gw = gaussian_pyramid(w, levels);
         let li = laplacian_pyramid(img, levels);
         let contrib: Vec<Plane> = li
             .into_iter()
             .zip(&gw)
             .map(|(mut l, g)| {
-                for (a, b) in l.data.iter_mut().zip(&g.data) {
-                    *a *= b;
-                }
+                l.data
+                    .par_iter_mut()
+                    .zip(&g.data)
+                    .for_each(|(a, b)| *a *= b);
                 l
             })
             .collect();
@@ -173,9 +181,10 @@ pub fn fusion_gain(luma: &Plane, evs: &[f32]) -> Plane {
             None => contrib,
             Some(mut acc) => {
                 for (a, c) in acc.iter_mut().zip(&contrib) {
-                    for (x, y) in a.data.iter_mut().zip(&c.data) {
-                        *x += y;
-                    }
+                    a.data
+                        .par_iter_mut()
+                        .zip(&c.data)
+                        .for_each(|(x, y)| *x += y);
                 }
                 acc
             }
@@ -183,10 +192,14 @@ pub fn fusion_gain(luma: &Plane, evs: &[f32]) -> Plane {
     }
     let out = collapse(fused.unwrap());
     let mut gain = Plane::new(luma.width, luma.height);
-    for ((g, o), l) in gain.data.iter_mut().zip(&out.data).zip(&luma.data) {
-        let before = (l / 255.0).max(1.0 / 255.0);
-        *g = (o.clamp(0.0, 1.0) / before).clamp(0.5, MAX_GAIN);
-    }
+    gain.data
+        .par_iter_mut()
+        .zip(&out.data)
+        .zip(&luma.data)
+        .for_each(|((g, o), l)| {
+            let before = (l / 255.0).max(1.0 / 255.0);
+            *g = (o.clamp(0.0, 1.0) / before).clamp(0.5, MAX_GAIN);
+        });
     gain
 }
 
