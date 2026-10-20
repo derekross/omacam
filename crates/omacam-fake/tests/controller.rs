@@ -146,6 +146,9 @@ fn a_night_burst_holds_one_exposure_and_the_preview_returns() {
         under_stops: 0.0,
         max_exposure_us: 66_000,
     };
+    // The phone's exposure loop ignores a stream's start controls: the
+    // preview must get its automatic exposure back by request.
+    rig.backend.faults.lock().unwrap().sticky_settings = true;
     rig.controller.set_capture_mode(capture::Mode::Burst(spec));
     let out = rig.controller.resume(Instant::now());
     rig.apply(out);
@@ -170,6 +173,11 @@ fn a_night_burst_holds_one_exposure_and_the_preview_returns() {
             && r.showing(MAIN))
     );
     assert!(rig.errors.is_empty(), "{:?}", rig.errors);
+    // The burst's manual exposure doesn't stay on the preview.
+    assert!(rig.run_until(Duration::from_secs(1), |r| {
+        let kept = r.backend.faults.lock().unwrap().last_settings;
+        kept.is_some_and(|s| s.shutter.is_auto() && s.gain.is_auto())
+    }));
 }
 
 #[test]

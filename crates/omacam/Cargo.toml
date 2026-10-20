@@ -30,6 +30,8 @@ gtk4.workspace = true
 libadwaita.workspace = true
 serde.workspace = true
 toml.workspace = true
+rayon = "1"
+libc = "0.2"
 
 [dev-dependencies]
 kamadak-exif = "0.6"

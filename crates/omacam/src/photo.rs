@@ -247,7 +247,32 @@ pub fn to_rgb(raw: &Raw<'_>) -> omacam_merge::RgbImage {
 
 /// Merge a burst (Night, or HDR when `hdr`) into one picture: the
 /// reference frame's picture, its pixels replaced by the merge (XRGB8888).
+/// The merge's threads: one core left free and a lower priority, so the
+/// viewfinder keeps moving while a burst merges.
+fn merge_pool() -> Result<rayon::ThreadPool> {
+    let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(cores.saturating_sub(1).max(1))
+        .thread_name(|i| format!("omacam-merge-{i}"))
+        .start_handler(|_| {
+            // SAFETY: setpriority takes no pointers; on Linux, who = 0
+            // with PRIO_PROCESS is the calling thread.
+            unsafe {
+                libc::setpriority(libc::PRIO_PROCESS, 0, 10);
+            }
+        })
+        .build()
+        .context("the merge's threads didn't start")
+}
+
 pub fn merge_burst(
+    frames: Vec<omacam_core::controller::Picture>,
+    hdr: bool,
+) -> Result<omacam_core::controller::Picture> {
+    merge_pool()?.install(|| merge_burst_in_pool(frames, hdr))
+}
+
+fn merge_burst_in_pool(
     mut frames: Vec<omacam_core::controller::Picture>,
     hdr: bool,
 ) -> Result<omacam_core::controller::Picture> {

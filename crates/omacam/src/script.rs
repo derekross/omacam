@@ -24,8 +24,10 @@ pub enum Step {
     CloseSettings,
     /// A tap on the picture at (u, v), 0..1.
     Tap(f64, f64),
-    /// Switch to photo or video (`shutter` then records and stops).
+    /// Switch to night, photo or video (`shutter` then records and stops).
     Mode(String),
+    /// The HDR chip.
+    Hdr(bool),
     /// Show or hide the Pro panel.
     Pro(bool),
     /// Open a Pro editor: shutter, iso, wb or focus.
@@ -72,7 +74,8 @@ pub fn parse(text: &str) -> Result<Vec<Step>, String> {
                 arg.into()
             }),
             "close-settings" => Step::CloseSettings,
-            "mode" if arg == "photo" || arg == "video" => Step::Mode(arg.into()),
+            "mode" if matches!(arg, "night" | "photo" | "video") => Step::Mode(arg.into()),
+            "hdr" if arg == "on" || arg == "off" => Step::Hdr(arg == "on"),
             "pro" if arg == "on" || arg == "off" => Step::Pro(arg == "on"),
             "pro-edit" if ["shutter", "iso", "wb", "focus"].contains(&arg) => {
                 Step::ProEdit(arg.into())
@@ -83,7 +86,7 @@ pub fn parse(text: &str) -> Result<Vec<Step>, String> {
                 arg.parse::<f64>()
                     .map_err(|_| format!("ev: a number, got {arg:?}"))?,
             ),
-            "mode" => return Err(format!("mode: photo or video, got {arg:?}")),
+            "mode" => return Err(format!("mode: night, photo or video, got {arg:?}")),
             "tap" => {
                 let mut it = arg.split_whitespace().map(|v| v.parse::<f64>());
                 match (it.next(), it.next()) {

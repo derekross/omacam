@@ -125,6 +125,11 @@ pub struct Faults {
     /// Streams bigger than this many pixels fail for lack of memory, as
     /// the CMA pool does on the phone; the request's fallbacks are tried.
     pub memory_limit_pixels: Option<u64>,
+    /// A restarted stream keeps the exposure settings the last one had and
+    /// ignores the ones it starts with, as the phone's exposure loop does.
+    pub sticky_settings: bool,
+    /// The settings the last stream had (for `sticky_settings`).
+    pub last_settings: Option<omacam_core::backend::ExposureSettings>,
 }
 
 enum Msg {
@@ -373,7 +378,15 @@ fn handle(
                 notice,
                 sequence: 0,
                 next_frame: now,
-                settings: controls.settings.unwrap_or_default(),
+                settings: {
+                    let mut f = faults.lock().unwrap();
+                    let settings = match f.last_settings {
+                        Some(kept) if f.sticky_settings => kept,
+                        _ => controls.settings.unwrap_or_default(),
+                    };
+                    f.last_settings = Some(settings);
+                    settings
+                },
                 controls,
             });
         }
@@ -392,6 +405,7 @@ fn handle(
             if let Some(s) = stream.as_mut().filter(|s| s.generation == generation) {
                 if let Some(settings) = controls.settings {
                     s.settings = settings;
+                    faults.lock().unwrap().last_settings = Some(settings);
                 }
                 s.controls = controls;
             }

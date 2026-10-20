@@ -1049,6 +1049,18 @@ impl Controller {
                     }));
                 }
             }
+            Step::Unlock => {
+                if let Some((generation, target)) = self.switch.streaming() {
+                    let caps = self.table.get(target.lens).caps.clone();
+                    out.push(Output::Backend(Command::SetControls {
+                        generation,
+                        controls: crate::backend::Controls {
+                            settings: Some(self.exposure.effective(&caps)),
+                            ..Default::default()
+                        },
+                    }));
+                }
+            }
             Step::Nothing
             | Step::Keep
             | Step::KeepBurst

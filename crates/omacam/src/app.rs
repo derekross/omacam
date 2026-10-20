@@ -204,6 +204,14 @@ struct App {
     low_light_chip: gtk::Box,
     fps_toggle: gtk::ToggleButton,
     setting_fps: Cell<bool>,
+    /// Photo: HDR bursts on or off.
+    hdr_toggle: gtk::ToggleButton,
+    setting_hdr: Cell<bool>,
+    /// "Hold still" while a burst is taken, then "Merging" until it's saved.
+    burst_chip: gtk::Box,
+    burst_label: gtk::Label,
+    /// The frames of the burst being merged (the shutter waits for it).
+    merging: Cell<Option<usize>>,
     ev_slider: gtk::Scale,
     setting_ev: Cell<bool>,
     /// The EV slider shows until then (after a tap or a drag).
@@ -219,6 +227,7 @@ struct App {
     settings_dialog: RefCell<Option<adw::PreferencesDialog>>,
     /// The size, stride and layout of the frames on screen.
     shown_format: Cell<Option<(u32, u32, u32, PixelLayout)>>,
+    mode_night: gtk::ToggleButton,
     mode_photo: gtk::ToggleButton,
     mode_video: gtk::ToggleButton,
     mode_box: gtk::Box,
@@ -567,6 +576,29 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
     fps_toggle.set_margin_end(64);
     fps_toggle.set_visible(false);
     overlay.add_overlay(&fps_toggle);
+    // Photo: HDR, in the same place (the two never show together).
+    let hdr_toggle = gtk::ToggleButton::with_label("HDR");
+    hdr_toggle.add_css_class("fps-toggle");
+    hdr_toggle.set_tooltip_text(Some("Merge a burst to keep highlights and shadows"));
+    hdr_toggle.set_halign(gtk::Align::End);
+    hdr_toggle.set_valign(gtk::Align::Start);
+    hdr_toggle.set_margin_top(16);
+    hdr_toggle.set_margin_end(64);
+    hdr_toggle.set_visible(false);
+    overlay.add_overlay(&hdr_toggle);
+    let burst_label = gtk::Label::new(None);
+    let burst_spinner = gtk::Spinner::new();
+    burst_spinner.set_spinning(true);
+    let burst_chip = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    burst_chip.add_css_class("note-chip");
+    burst_chip.append(&burst_spinner);
+    burst_chip.append(&burst_label);
+    burst_chip.set_halign(gtk::Align::Center);
+    burst_chip.set_valign(gtk::Align::Start);
+    burst_chip.set_margin_top(14);
+    burst_chip.set_visible(false);
+    burst_chip.set_can_target(false);
+    overlay.add_overlay(&burst_chip);
     let ev_slider = gtk::Scale::with_range(gtk::Orientation::Vertical, -2.0, 2.0, 0.1);
     ev_slider.set_inverted(true);
     ev_slider.set_draw_value(false);
@@ -583,14 +615,18 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
     let controls = gtk::Box::new(gtk::Orientation::Vertical, 12);
     controls.add_css_class("omacam-controls");
     controls.set_vexpand(false);
-    // Photo / Video.
+    // Night / Photo / Video.
+    let mode_night = gtk::ToggleButton::with_label("Night");
+    mode_night.set_tooltip_text(Some("A burst merged into one clean photo: hold still"));
     let mode_photo = gtk::ToggleButton::with_label("Photo");
     let mode_video = gtk::ToggleButton::with_label("Video");
+    mode_night.set_group(Some(&mode_photo));
     mode_video.set_group(Some(&mode_photo));
     mode_photo.set_active(true);
     let mode_box = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     mode_box.add_css_class("mode-switch");
     mode_box.set_halign(gtk::Align::Center);
+    mode_box.append(&mode_night);
     mode_box.append(&mode_photo);
     mode_box.append(&mode_video);
     let pro_toggle = gtk::ToggleButton::with_label("Pro");
@@ -666,6 +702,11 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
         low_light_chip,
         fps_toggle: fps_toggle.clone(),
         setting_fps: Cell::new(false),
+        hdr_toggle: hdr_toggle.clone(),
+        setting_hdr: Cell::new(false),
+        burst_chip,
+        burst_label,
+        merging: Cell::new(None),
         ev_slider,
         setting_ev: Cell::new(false),
         ev_shown_until: Cell::new(None),
@@ -677,6 +718,7 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
         countdown_left: Cell::new(0),
         settings_dialog: RefCell::new(None),
         shown_format: Cell::new(None),
+        mode_night,
         mode_photo,
         mode_video,
         mode_box,
@@ -718,6 +760,28 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
             }
         });
     }
+    {
+        let a = Rc::downgrade(&app);
+        hdr_toggle.connect_toggled(move |b| {
+            let Some(a) = a.upgrade() else { return };
+            if a.setting_hdr.get() {
+                return;
+            }
+            let mut s = a.settings.borrow().clone();
+            s.hdr = b.is_active();
+            if let Err(e) = s.save(&a.settings_path) {
+                a.error(&format!("Settings not saved: {e}"));
+            }
+            *a.settings.borrow_mut() = s;
+            a.push_capture_mode();
+        });
+    }
+    // Night or HDR from the command line: for this run only.
+    match app.cli.capture {
+        CaptureMode::Night => app.mode_night.set_active(true),
+        CaptureMode::Hdr => app.settings.borrow_mut().hdr = true,
+        CaptureMode::Full | CaptureMode::Quick => {}
+    }
     // The controls that turn with the phone.
     for w in [
         app.thumb.upcast_ref::<gtk::Widget>(),
@@ -726,6 +790,8 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
         app.lock_chip.upcast_ref(),
         app.low_light_chip.upcast_ref(),
         app.fps_toggle.upcast_ref(),
+        app.hdr_toggle.upcast_ref(),
+        app.burst_chip.upcast_ref(),
         app.zoom_indicator.upcast_ref(),
         app.status_box.upcast_ref(),
         app.rec_label.upcast_ref(),
@@ -805,13 +871,12 @@ async fn run_script(app: Rc<App>, steps: Vec<crate::script::Step>) {
                     d.close();
                 }
             }
-            Step::Mode(m) => {
-                if m == "video" {
-                    app.mode_video.set_active(true);
-                } else {
-                    app.mode_photo.set_active(true);
-                }
-            }
+            Step::Mode(m) => match m.as_str() {
+                "video" => app.mode_video.set_active(true),
+                "night" => app.mode_night.set_active(true),
+                _ => app.mode_photo.set_active(true),
+            },
+            Step::Hdr(on) => app.hdr_toggle.set_active(on),
             Step::Tap(u, v) => app.tap_at(u, v),
             Step::Pro(on) => app.pro_toggle.set_active(on),
             Step::ProEdit(which) => {
@@ -1075,12 +1140,7 @@ impl App {
         match msg {
             Msg::Event(Event::Cameras(cameras)) => {
                 let opts = Options {
-                    capture_mode: match self.cli.capture {
-                        CaptureMode::Full => capture::Mode::Full,
-                        CaptureMode::Quick => capture::Mode::Quick,
-                        CaptureMode::Night => capture::Mode::Burst(capture::BurstSpec::NIGHT),
-                        CaptureMode::Hdr => capture::Mode::Burst(capture::BurstSpec::HDR),
-                    },
+                    capture_mode: self.capture_mode(),
                     transfer_exposure: self.cli.exposure_hints,
                     tap_to_focus: self.settings.borrow().tap_to_focus,
                     low_light: self.settings.borrow().low_light,
@@ -1161,8 +1221,14 @@ impl App {
                 *self.last_photo.borrow_mut() = Some(path);
             }
             Msg::Saved(Err(e)) => self.error(&format!("Photo not saved: {e}")),
-            Msg::Merged(Ok(p)) => self.save(*p),
-            Msg::Merged(Err(e)) => self.error(&format!("Photo not saved: {e}")),
+            Msg::Merged(result) => {
+                self.merging.set(None);
+                match result {
+                    Ok(p) => self.save(*p),
+                    Err(e) => self.error(&format!("Photo not saved: {e}")),
+                }
+                self.refresh();
+            }
             Msg::VideoSaved(Ok(path)) => {
                 self.thumb.set_sensitive(true);
                 *self.last_photo.borrow_mut() = Some(path);
@@ -1345,7 +1411,10 @@ impl App {
     /// [`Msg::Merged`] and is saved like any picture.
     fn merge_burst(self: &Rc<Self>) {
         let frames = std::mem::take(&mut *self.burst.borrow_mut());
-        let hdr = self.cli.capture == CaptureMode::Hdr;
+        // The burst was taken in the mode still selected: the mode switch
+        // is off while the camera takes it.
+        let hdr = !self.mode_night.is_active();
+        self.merging.set(Some(frames.len()));
         let tx = self.tx.clone();
         std::thread::spawn(move || {
             let result = photo::merge_burst(frames, hdr)
@@ -1353,6 +1422,26 @@ impl App {
                 .map_err(|e| format!("{e:#}"));
             let _ = tx.send_blocking(Msg::Merged(result));
         });
+    }
+
+    /// The photo capture the controls ask for: a Night or HDR burst, or the
+    /// command line's single frame.
+    fn capture_mode(&self) -> capture::Mode {
+        if self.mode_night.is_active() {
+            capture::Mode::Burst(capture::BurstSpec::NIGHT)
+        } else if self.settings.borrow().hdr {
+            capture::Mode::Burst(capture::BurstSpec::HDR)
+        } else if self.cli.capture == CaptureMode::Quick {
+            capture::Mode::Quick
+        } else {
+            capture::Mode::Full
+        }
+    }
+
+    fn push_capture_mode(self: &Rc<Self>) {
+        let mode = self.capture_mode();
+        self.with_controller(|c| c.set_capture_mode(mode));
+        self.refresh();
     }
 
     fn error(&self, msg: &str) {
@@ -1404,8 +1493,9 @@ impl App {
         } else {
             self.shutter.remove_css_class("busy");
         }
-        self.shutter
-            .set_sensitive(!view.capturing && (!view.switching || view.recording));
+        self.shutter.set_sensitive(
+            !view.capturing && self.merging.get().is_none() && (!view.switching || view.recording),
+        );
         let video = view.mode == omacam_core::controller::Mode::Video;
         if video {
             self.shutter.add_css_class("record");
@@ -1416,7 +1506,12 @@ impl App {
             }));
         } else {
             self.shutter.remove_css_class("record");
-            self.shutter.set_tooltip_text(Some("Take a photo"));
+            self.shutter
+                .set_tooltip_text(Some(if self.mode_night.is_active() {
+                    "Take a Night photo"
+                } else {
+                    "Take a photo"
+                }));
         }
         if view.recording {
             self.shutter.add_css_class("recording");
@@ -1540,6 +1635,26 @@ impl App {
             self.fps_toggle.set_active(view.video_fps >= 60);
             self.setting_fps.set(false);
         }
+        self.hdr_toggle.set_visible(
+            !video_mode && !self.mode_night.is_active() && !self.pro_toggle.is_active(),
+        );
+        let hdr = self.settings.borrow().hdr;
+        if self.hdr_toggle.is_active() != hdr {
+            self.setting_hdr.set(true);
+            self.hdr_toggle.set_active(hdr);
+            self.setting_hdr.set(false);
+        }
+        // A burst: hold still while it's taken, then the merge. The merge
+        // starts while the preview is still coming back, which counts as
+        // capturing, so it wins.
+        let bursting = view.capturing && matches!(self.capture_mode(), capture::Mode::Burst(_));
+        if let Some(n) = self.merging.get() {
+            self.burst_label.set_label(&format!("Merging {n} frames…"));
+        } else if bursting {
+            self.burst_label.set_label("Hold still…");
+        }
+        self.burst_chip
+            .set_visible(bursting || self.merging.get().is_some());
         let ev_on = ex.caps.ev.is_some()
             && self
                 .ev_shown_until
@@ -1756,8 +1871,22 @@ impl App {
         let a = Rc::downgrade(self);
         self.pro_toggle.connect_toggled(move |b| {
             if let Some(a) = a.upgrade() {
+                // Pro's manual values and a Night burst's own exposure
+                // don't mix: Pro takes single photos.
+                if b.is_active() && a.mode_night.is_active() {
+                    a.mode_photo.set_active(true);
+                }
                 a.set_pro(b.is_active());
+                a.push_capture_mode();
             }
+        });
+        let a = Rc::downgrade(self);
+        self.mode_night.connect_toggled(move |b| {
+            let Some(a) = a.upgrade() else { return };
+            if b.is_active() && a.pro_toggle.is_active() {
+                a.pro_toggle.set_active(false);
+            }
+            a.push_capture_mode();
         });
         let a = Rc::downgrade(self);
         self.mode_video.connect_toggled(move |b| {

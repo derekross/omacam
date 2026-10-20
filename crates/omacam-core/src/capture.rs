@@ -132,6 +132,11 @@ pub enum Step {
     Discard,
     /// Give up and go back to the preview.
     Fail(String),
+    /// The preview is back after a burst: put the exposure settings back.
+    /// The burst's lock made them manual, and the controls a stream starts
+    /// with don't reach the camera's exposure loop, so the preview would
+    /// keep the burst's exposure.
+    Unlock,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -309,7 +314,11 @@ impl CaptureController {
             }
             State::Restoring => {
                 self.state = State::Idle;
-                Step::Nothing
+                if self.burst.is_some() {
+                    Step::Unlock
+                } else {
+                    Step::Nothing
+                }
             }
             _ => Step::Nothing,
         }
@@ -841,6 +850,12 @@ mod tests {
         }
         assert_eq!(c.burst(), Some(spec));
         assert!(!c.wants_still_stream());
+        // The preview's first frame puts the exposure settings back.
+        assert_eq!(
+            c.on_preview_frame(&settled(20_000, 2.0), ms(800)),
+            Step::Unlock
+        );
+        assert!(!c.is_busy());
     }
 
     #[test]

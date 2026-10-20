@@ -217,6 +217,8 @@ pub struct Settings {
     pub video_fps: u32,
     /// Steady videos with the gyroscope, where the phone has one.
     pub stabilization: bool,
+    /// Photos are HDR bursts, merged and tone mapped (the HDR chip).
+    pub hdr: bool,
 }
 
 impl Default for Settings {
@@ -240,6 +242,7 @@ impl Default for Settings {
             low_light: true,
             video_fps: 30,
             stabilization: true,
+            hdr: false,
         }
     }
 }
@@ -377,6 +380,7 @@ mod tests {
             low_light: false,
             video_fps: 60,
             stabilization: false,
+            hdr: true,
         };
         s.save(&p).unwrap();
         let text = std::fs::read_to_string(&p).unwrap();
