@@ -45,17 +45,22 @@ impl Pyramid {
     }
 }
 
-/// A 3x3 box blur, edges clamped.
+/// A 3x3 box blur, edges clamped: three rows summed, then three columns.
 fn blur3(p: &Plane) -> Plane {
-    Plane::from_rows(p.width, p.height, |y, row| {
-        for (x, o) in row.iter_mut().enumerate() {
-            let mut s = 0.0;
-            for j in -1..=1 {
-                for i in -1..=1 {
-                    s += p.at_clamped(x as isize + i, y as isize + j);
-                }
-            }
-            *o = s / 9.0;
+    let w = p.width;
+    Plane::from_rows(w, p.height, |y, row| {
+        let line = |j: isize| {
+            let yy = (y as isize + j).clamp(0, p.height as isize - 1) as usize;
+            &p.data[yy * w..][..w]
+        };
+        let (a, b, c) = (line(-1), line(0), line(1));
+        let mut col: Vec<f32> = (0..w).map(|x| a[x] + b[x] + c[x]).collect();
+        col.push(col[w - 1]);
+        let mut prev = col[0];
+        for x in 0..w {
+            let s = prev + col[x] + col[x + 1];
+            prev = col[x];
+            row[x] = s / 9.0;
         }
     })
 }
@@ -75,6 +80,24 @@ fn tile_cost(
     let mut cost = 0.0;
     let x_end = (x0 + size).min(reference.width);
     let y_end = (y0 + size).min(reference.height);
+    let (fx0, fy0) = (x0 as isize + dx as isize, y0 as isize + dy as isize);
+    let inside = fx0 >= 0
+        && fy0 >= 0
+        && x_end as isize + dx as isize <= frame.width as isize
+        && y_end as isize + dy as isize <= frame.height as isize;
+    if inside && step == 1 {
+        // The usual case: the moved tile lies inside the frame, so whole
+        // rows compare as slices (no clamping, and the compiler
+        // vectorizes it).
+        let (fx0, fy0) = (fx0 as usize, fy0 as usize);
+        let n = x_end - x0;
+        for (j, y) in (y0..y_end).enumerate() {
+            let r = &reference.data[y * reference.width + x0..][..n];
+            let f = &frame.data[(fy0 + j) * frame.width + fx0..][..n];
+            cost += r.iter().zip(f).map(|(a, b)| (a - b) * (a - b)).sum::<f32>();
+        }
+        return cost;
+    }
     for y in (y0..y_end).step_by(step) {
         let row = y * reference.width;
         let fy = y as isize + dy as isize;

@@ -143,6 +143,9 @@ struct Active {
     /// Copy frames out (memory display, and always for stills, which the
     /// encoder reads on the CPU).
     copy: bool,
+    /// The camera takes AwbMode (the simple pipeline doesn't, and logs an
+    /// error for each request that sets it).
+    awb_modes: bool,
     /// Completed requests lent to the UI (dmabuf mode), by cookie.
     lent: HashMap<u64, Request>,
     /// Requests that couldn't be queued.
@@ -571,8 +574,17 @@ impl Worker {
             let _ = me.send(Msg::Completed(req));
         });
 
+        let awb_modes = cam
+            .controls()
+            .find(<controls::AwbMode as ControlEntry>::ID)
+            .is_ok();
         let mut start_controls = ControlList::from_info_map(cam.controls()).unwrap_or_default();
-        set_controls(&mut start_controls, controls, self.opts.exposure_hints);
+        set_controls(
+            &mut start_controls,
+            controls,
+            self.opts.exposure_hints,
+            awb_modes,
+        );
         cam.start(Some(&start_controls)).map_err(at("start"))?;
 
         let mut active = Active {
@@ -584,6 +596,7 @@ impl Worker {
             stride,
             layout,
             copy: self.opts.display == DisplayMode::Memory || req.purpose == Purpose::Still,
+            awb_modes,
             lent: HashMap::new(),
             idle: Vec::new(),
             pending_controls: None,
@@ -612,7 +625,7 @@ impl Worker {
         };
         req.reuse(ReuseFlag::REUSE_BUFFERS);
         if let Some(c) = a.pending_controls.take() {
-            set_controls(req.controls_mut(), &c, hints);
+            set_controls(req.controls_mut(), &c, hints, a.awb_modes);
         }
         if let Err((req, e)) = a.cam.queue_request(req) {
             tracing::warn!(error = %e, "requeue failed");
@@ -800,7 +813,7 @@ fn caps(map: &ControlInfoMap) -> Caps {
 /// with values: a manual exposure time is ExposureTimeMode Manual plus
 /// ExposureTime (or AeEnable off on a libcamera without the modes), and
 /// Auto puts the mode back.
-fn set_settings(list: &mut ControlList, s: &ExposureSettings) {
+fn set_settings(list: &mut ControlList, s: &ExposureSettings, awb_modes: bool) {
     let _ = list.set(controls::ExposureValue(s.ev));
     if s.ae_hold {
         // AE lock: the camera holds what it has. Mode controls in the same
@@ -836,7 +849,9 @@ fn set_settings(list: &mut ControlList, s: &ExposureSettings) {
     match s.white_balance {
         Setting::Auto => {
             let _ = list.set(controls::AwbEnable(true));
-            let _ = list.set(controls::AwbMode::AwbAuto);
+            if awb_modes {
+                let _ = list.set(controls::AwbMode::AwbAuto);
+            }
         }
         Setting::Manual(Awb::Preset(p)) => {
             let _ = list.set(controls::AwbEnable(true));
@@ -883,12 +898,12 @@ fn set_window(list: &mut ControlList, w: &Rect) {
 
 /// Put `c` on a control list. A control the camera doesn't have fails to
 /// set; that's fine.
-fn set_controls(list: &mut ControlList, c: &Controls, exposure_hints: bool) {
+fn set_controls(list: &mut ControlList, c: &Controls, exposure_hints: bool, awb_modes: bool) {
     if c.af_continuous {
         let _ = list.set(controls::AfMode::Continuous);
     }
     if let Some(s) = &c.settings {
-        set_settings(list, s);
+        set_settings(list, s, awb_modes);
     }
     if let Some(w) = &c.metering_window {
         set_window(list, w);

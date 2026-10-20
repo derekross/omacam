@@ -190,15 +190,39 @@ pub fn merge(
                         if wt < 1e-3 {
                             continue;
                         }
+                        let sx0 = x0 as isize + dx as isize;
+                        let inside = sx0 >= 0 && sx0 + grid.size as isize <= w as isize;
                         for j in 0..grid.size {
                             let sy = (y0 + j) as isize + dy as isize;
                             let sy = sy.clamp(0, h as isize - 1) as usize;
-                            for k in 0..grid.size {
-                                let ww = wt * win[j] * win[k];
-                                let sx = ((x0 + k) as isize + dx as isize).clamp(0, w as isize - 1)
-                                    as usize;
+                            let wj = wt * win[j];
+                            let dst_row = j * w + x0;
+                            if inside {
+                                // The usual case: the moved row lies inside
+                                // the frame, so no clamping per pixel.
+                                let src =
+                                    &frame.data[(sy * w + sx0 as usize) * 3..][..grid.size * 3];
+                                let dst = &mut a[dst_row * 3..][..grid.size * 3];
+                                let nd = &mut n[dst_row..][..grid.size];
+                                for (k, ((d, s), nn)) in dst
+                                    .chunks_exact_mut(3)
+                                    .zip(src.chunks_exact(3))
+                                    .zip(nd)
+                                    .enumerate()
+                                {
+                                    let ww = wj * win[k];
+                                    d[0] += ww * s[0] as f32;
+                                    d[1] += ww * s[1] as f32;
+                                    d[2] += ww * s[2] as f32;
+                                    *nn += ww;
+                                }
+                                continue;
+                            }
+                            for (k, &wk) in win.iter().enumerate() {
+                                let ww = wj * wk;
+                                let sx = (sx0 + k as isize).clamp(0, w as isize - 1) as usize;
                                 let src = (sy * w + sx) * 3;
-                                let dst = j * w + x0 + k;
+                                let dst = dst_row + k;
                                 a[dst * 3] += ww * frame.data[src] as f32;
                                 a[dst * 3 + 1] += ww * frame.data[src + 1] as f32;
                                 a[dst * 3 + 2] += ww * frame.data[src + 2] as f32;
@@ -210,25 +234,31 @@ pub fn merge(
                 (y0, a, n)
             })
             .collect();
-        for (y0, a, n) in bands {
+        // Bands of one parity cover different rows: add them in parallel,
+        // a row each.
+        let mut rows_of: Vec<Option<(&[f32], &[f32])>> = vec![None; h];
+        for (y0, a, n) in &bands {
             for j in 0..grid.size {
-                let row = (y0 + j) * w;
-                for x in 0..w {
-                    norm[row + x] += n[j * w + x];
-                    for c in 0..3 {
-                        acc[(row + x) * 3 + c] += a[(j * w + x) * 3 + c];
-                    }
-                }
+                rows_of[y0 + j] = Some((&a[j * w * 3..][..w * 3], &n[j * w..][..w]));
             }
         }
+        acc.par_chunks_mut(w * 3)
+            .zip(norm.par_chunks_mut(w))
+            .zip(rows_of.par_iter())
+            .for_each(|((acc_row, norm_row), band)| {
+                if let Some((a, n)) = band {
+                    acc_row.iter_mut().zip(*a).for_each(|(x, y)| *x += y);
+                    norm_row.iter_mut().zip(*n).for_each(|(x, y)| *x += y);
+                }
+            });
     }
 
-    for (p, &n) in acc.chunks_exact_mut(3).zip(&norm) {
+    acc.par_chunks_exact_mut(3).zip(&norm).for_each(|(p, &n)| {
         let inv = if n > 0.0 { 1.0 / n } else { 0.0 };
         for c in p {
             *c *= inv;
         }
-    }
+    });
     (acc, stats)
 }
 
