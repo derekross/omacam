@@ -275,6 +275,10 @@ pub struct StreamRequest {
     /// a still, usually lack of camera memory). The backend says so with an
     /// [`Event::Notice`].
     pub fallbacks: Vec<Size>,
+    /// Capture each frame's raw Bayer picture too, where the camera gives
+    /// it at the processed frame's size ([`Frame::raw`]): a Night or HDR
+    /// burst merges the raw frames.
+    pub raw: bool,
 }
 
 /// Autofocus states, as libcamera reports them.
@@ -449,6 +453,38 @@ pub struct Frame {
     pub layout: PixelLayout,
     pub data: FrameData,
     pub meta: FrameMeta,
+    /// The raw picture the frame was processed from, when the stream asked
+    /// for it ([`StreamRequest::raw`]).
+    pub raw: Option<Box<RawFrame>>,
+}
+
+/// A raw Bayer frame: MIPI CSI-2 packed 10-bit samples, at the processed
+/// frame's size.
+#[derive(Debug, Clone)]
+pub struct RawFrame {
+    pub size: Size,
+    /// Bytes per row.
+    pub stride: u32,
+    /// Where the red sample of the 2x2 pattern sits: (column, row).
+    pub first_red: (u8, u8),
+    pub data: Vec<u8>,
+    pub isp: IspMeta,
+}
+
+/// What the software ISP used for a frame, as far as the metadata says:
+/// the raw merge finishes with the same (the camera's tuning file has the
+/// rest).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct IspMeta {
+    /// The sensor's model (`s5kgn1`): it names the tuning file.
+    pub sensor_model: Option<String>,
+    /// Black level on a 16-bit scale (libcamera's SensorBlackLevels).
+    pub black_level: Option<f32>,
+    pub color_matrix: Option<[[f32; 3]; 3]>,
+    pub saturation: Option<f32>,
+    pub contrast: Option<f32>,
+    pub sharpness: Option<f32>,
+    pub gamma: Option<f32>,
 }
 
 /// Commands from the app to a backend.

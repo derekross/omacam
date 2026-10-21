@@ -35,8 +35,8 @@ use libcamera::{controls, properties};
 
 use omacam_core::backend::{
     AeState, AfState, Awb, AwbPreset, Backend, CameraInfo, Caps, Command, Controls, Event,
-    EventSink, ExposureSettings, Frame, FrameData, FrameMeta, Location, PixelLayout, Purpose, Rect,
-    ReleaseToken, Setting, Size, StreamRequest,
+    EventSink, ExposureSettings, Frame, FrameData, FrameMeta, IspMeta, Location, PixelLayout,
+    Purpose, RawFrame, Rect, ReleaseToken, Setting, Size, StreamRequest,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -59,6 +59,14 @@ pub struct Options {
 /// XRGB8888, the format asked of the software ISP: 32-bit linear, the
 /// safe EGL import target on panfrost.
 const XRGB8888: PixelFormat = PixelFormat::new(u32::from_le_bytes(*b"XR24"), 0);
+/// The raw formats the raw merge reads (MIPI CSI-2 packed 10-bit), with
+/// where each puts its red sample: (column, row).
+const RAW_FORMATS: [(PixelFormat, (u8, u8)); 4] = [
+    (libcamera::formats::SRGGB10_CSI2P, (0, 0)),
+    (libcamera::formats::SGRBG10_CSI2P, (1, 0)),
+    (libcamera::formats::SGBRG10_CSI2P, (0, 1)),
+    (libcamera::formats::SBGGR10_CSI2P, (1, 1)),
+];
 const EINVAL: i32 = 22;
 const ENOMEM: i32 = 12;
 
@@ -154,7 +162,19 @@ struct Active {
     pending_controls: Option<Controls>,
     /// The configured mode's highest frame rate (FrameDurationLimits).
     max_fps: Option<f64>,
+    /// The raw stream beside the processed one, when the start asked for it
+    /// and the camera gives it at the same size.
+    raw: Option<RawStream>,
+    /// The sensor's model, for the raw frames' tuning file.
+    sensor_model: Option<String>,
     _alloc: FrameBufferAllocator,
+}
+
+struct RawStream {
+    stream: Stream,
+    size: Size,
+    stride: u32,
+    first_red: (u8, u8),
 }
 
 struct Worker {
@@ -483,28 +503,67 @@ impl Worker {
         })?;
         let mut cam: ActiveCamera<'static> = cam.acquire().map_err(at("acquire"))?;
 
-        let mut cfgs = cam
-            .generate_configuration(&[StreamRole::ViewFinder])
-            .ok_or_else(|| at("generate configuration")(io::Error::other("no configuration")))?;
-        {
-            let mut sc = cfgs.get_mut(0).expect("one stream");
-            sc.set_pixel_format(XRGB8888);
-            if let Some(s) = size_wanted {
-                sc.set_size(LcSize::new(s.width, s.height));
+        // A raw stream beside the processed one, where the camera gives one
+        // at the processed frame's size in a format the raw merge reads;
+        // otherwise the processed stream alone.
+        let mut want_raw = req.raw;
+        let (mut cfgs, status, raw_layout) = loop {
+            let roles: &[StreamRole] = if want_raw {
+                &[StreamRole::ViewFinder, StreamRole::Raw]
+            } else {
+                &[StreamRole::ViewFinder]
+            };
+            let Some(mut cfgs) = cam.generate_configuration(roles) else {
+                if want_raw {
+                    want_raw = false;
+                    continue;
+                }
+                return Err(at("generate configuration")(io::Error::other(
+                    "no configuration",
+                )));
+            };
+            {
+                let mut sc = cfgs.get_mut(0).expect("one stream");
+                sc.set_pixel_format(XRGB8888);
+                if let Some(s) = size_wanted {
+                    sc.set_size(LcSize::new(s.width, s.height));
+                }
+                sc.set_buffer_count(buffers.max(1));
             }
-            sc.set_buffer_count(buffers.max(1));
-        }
-        let status = cfgs.validate();
-        tracing::info!(
-            generation,
-            camera,
-            purpose = ?req.purpose,
-            asked = %size_wanted.map(|s| s.to_string()).unwrap_or_else(|| "default".into()),
-            buffers,
-            status = ?status,
-            config = %cfgs.to_string_repr(),
-            "configuration validated"
-        );
+            if want_raw {
+                let mut rc = cfgs.get_mut(1).expect("a raw stream");
+                if let Some(s) = size_wanted {
+                    rc.set_size(LcSize::new(s.width, s.height));
+                }
+                rc.set_buffer_count(buffers.max(1));
+            }
+            let status = cfgs.validate();
+            tracing::info!(
+                generation,
+                camera,
+                purpose = ?req.purpose,
+                asked = %size_wanted.map(|s| s.to_string()).unwrap_or_else(|| "default".into()),
+                buffers,
+                raw = want_raw,
+                status = ?status,
+                config = %cfgs.to_string_repr(),
+                "configuration validated"
+            );
+            if !want_raw {
+                break (cfgs, status, None);
+            }
+            let layout = (!status.is_invalid()).then(|| raw_layout(&cfgs)).flatten();
+            if layout.is_none() {
+                tracing::warn!(
+                    generation,
+                    camera,
+                    "no raw stream at the processed size: bursts merge the processed frames"
+                );
+                want_raw = false;
+                continue;
+            }
+            break (cfgs, status, layout);
+        };
         if status.is_invalid() {
             return Err(at("validate")(io::Error::from_raw_os_error(EINVAL)));
         }
@@ -543,9 +602,29 @@ impl Worker {
             .get(0)
             .and_then(|sc| sc.stream())
             .ok_or_else(|| at("stream")(io::Error::other("no stream after configure")))?;
+        let raw = match raw_layout {
+            Some((size, stride, first_red)) => Some(RawStream {
+                stream: cfgs.get(1).and_then(|sc| sc.stream()).ok_or_else(|| {
+                    at("raw stream")(io::Error::other("no raw stream after configure"))
+                })?,
+                size,
+                stride,
+                first_red,
+            }),
+            None => None,
+        };
 
         let mut alloc = FrameBufferAllocator::new(&cam);
         let fbs = alloc.alloc(&stream).map_err(at("allocate buffers"))?;
+        let mut raw_fbs = match &raw {
+            Some(r) => alloc
+                .alloc(&r.stream)
+                .map_err(at("allocate raw buffers"))?
+                .into_iter()
+                .map(Some)
+                .collect(),
+            None => Vec::new(),
+        };
         tracing::info!(
             generation,
             count = fbs.len(),
@@ -557,15 +636,26 @@ impl Worker {
             ),
             "buffers allocated"
         );
-        let mut requests = Vec::with_capacity(fbs.len());
-        for (i, fb) in fbs.into_iter().enumerate() {
-            let mapped = MappedBuffer::new(fb).map_err(|e| {
-                at("map buffer")(io::Error::other(format!("mapping a buffer: {e:?}")))
-            })?;
+        // With a raw stream, each request carries one buffer of each.
+        let n = match &raw {
+            Some(_) => fbs.len().min(raw_fbs.len()),
+            None => fbs.len(),
+        };
+        let mut requests = Vec::with_capacity(n);
+        for (i, fb) in fbs.into_iter().take(n).enumerate() {
+            let map = |fb| {
+                MappedBuffer::new(fb).map_err(|e| {
+                    at("map buffer")(io::Error::other(format!("mapping a buffer: {e:?}")))
+                })
+            };
             let mut r = cam
                 .create_request(Some(i as u64))
                 .ok_or_else(|| at("create request")(io::Error::other("create_request failed")))?;
-            r.add_buffer(&stream, mapped).map_err(at("add buffer"))?;
+            r.add_buffer(&stream, map(fb)?).map_err(at("add buffer"))?;
+            if let (Some(rs), Some(rfb)) = (&raw, raw_fbs.get_mut(i).and_then(Option::take)) {
+                r.add_buffer(&rs.stream, map(rfb)?)
+                    .map_err(at("add raw buffer"))?;
+            }
             requests.push(r);
         }
 
@@ -587,6 +677,11 @@ impl Worker {
         );
         cam.start(Some(&start_controls)).map_err(at("start"))?;
 
+        let sensor_model = cam
+            .properties()
+            .get::<properties::Model>()
+            .ok()
+            .map(|m| m.0);
         let mut active = Active {
             cam,
             generation,
@@ -601,6 +696,8 @@ impl Worker {
             idle: Vec::new(),
             pending_controls: None,
             max_fps,
+            raw,
+            sensor_model,
             _alloc: alloc,
         };
         for r in requests {
@@ -651,6 +748,25 @@ impl Worker {
             return;
         }
         let meta = frame_meta(&req);
+        let raw = a.raw.as_ref().and_then(|r| {
+            let fb = req.buffer::<MappedBuffer>(&r.stream)?;
+            let ok = fb
+                .metadata()
+                .is_some_and(|m| m.status() == FrameMetadataStatus::Success);
+            if !ok {
+                return None;
+            }
+            let planes = fb.data();
+            let plane = planes.first()?;
+            let len = (r.stride as usize * r.size.height as usize).min(plane.len());
+            Some(Box::new(RawFrame {
+                size: r.size,
+                stride: r.stride,
+                first_red: r.first_red,
+                data: plane[..len].to_vec(),
+                isp: isp_meta(&req, a.sensor_model.clone()),
+            }))
+        });
         let (generation, size, stride, layout) = (a.generation, a.size, a.stride, a.layout);
         let camera = a.camera_id.clone();
         let data = match a.copy {
@@ -700,6 +816,7 @@ impl Worker {
             layout,
             data,
             meta,
+            raw,
         }));
     }
 
@@ -932,6 +1049,41 @@ fn set_controls(list: &mut ControlList, c: &Controls, exposure_hints: bool, awb_
         if let Some(g) = c.analog_gain {
             let _ = list.set(controls::AnalogueGain(g));
         }
+    }
+}
+
+/// The raw stream's size, stride and Bayer phase, if the validated
+/// configuration has one at the processed stream's size in a format the
+/// raw merge reads.
+fn raw_layout(cfgs: &libcamera::camera::CameraConfiguration) -> Option<(Size, u32, (u8, u8))> {
+    let (processed, raw) = (cfgs.get(0)?, cfgs.get(1)?);
+    let fmt = raw.get_pixel_format();
+    let first_red = RAW_FORMATS
+        .iter()
+        .find(|(f, _)| *f == fmt)
+        .map(|(_, r)| *r)?;
+    let (ps, rs) = (processed.get_size(), raw.get_size());
+    ((ps.width, ps.height) == (rs.width, rs.height))
+        .then(|| (Size::new(rs.width, rs.height), raw.get_stride(), first_red))
+}
+
+/// What the ISP used for this frame, from its metadata.
+fn isp_meta(req: &Request, sensor_model: Option<String>) -> IspMeta {
+    let md = req.metadata();
+    IspMeta {
+        sensor_model,
+        black_level: md
+            .get::<controls::SensorBlackLevels>()
+            .ok()
+            .map(|b| b.0.iter().map(|&v| v as f32).sum::<f32>() / 4.0),
+        color_matrix: md
+            .get::<controls::ColourCorrectionMatrix>()
+            .ok()
+            .map(|m| m.0),
+        saturation: md.get::<controls::Saturation>().ok().map(|v| v.0),
+        contrast: md.get::<controls::Contrast>().ok().map(|v| v.0),
+        sharpness: md.get::<controls::Sharpness>().ok().map(|v| v.0),
+        gamma: md.get::<controls::Gamma>().ok().map(|v| v.0),
     }
 }
 

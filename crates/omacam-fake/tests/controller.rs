@@ -19,8 +19,8 @@ struct Rig {
     shown: Vec<String>,
     pictures: Vec<(String, f64, omacam_core::Size)>,
     errors: Vec<String>,
-    /// Burst frames: lens and exposure.
-    bursts: Vec<(String, Option<i32>)>,
+    /// Burst frames: lens, exposure and whether a raw picture came along.
+    bursts: Vec<(String, Option<i32>, bool)>,
     bursts_done: u32,
 }
 
@@ -56,12 +56,15 @@ impl Rig {
                 Output::Backend(c) => self.backend.send(c),
                 Output::Show(f) => self.shown.push(f.camera),
                 Output::Picture(p) => {
+                    assert!(p.frame.raw.is_none(), "a single still takes no raw picture");
                     self.pictures
                         .push((p.lens.name.clone(), p.crop, p.frame.size))
                 }
-                Output::BurstFrame(p) => self
-                    .bursts
-                    .push((p.lens.name.clone(), p.frame.meta.exposure_us)),
+                Output::BurstFrame(p) => self.bursts.push((
+                    p.lens.name.clone(),
+                    p.frame.meta.exposure_us,
+                    p.frame.raw.is_some(),
+                )),
                 Output::BurstDone => self.bursts_done += 1,
                 Output::Error(e) => self.errors.push(e),
             }
@@ -163,7 +166,7 @@ fn a_night_burst_holds_one_exposure_and_the_preview_returns() {
     assert!(
         rig.bursts
             .iter()
-            .all(|(lens, t)| lens == "Main" && *t == first),
+            .all(|(lens, t, raw)| lens == "Main" && *t == first && *raw),
         "{:?}",
         rig.bursts
     );

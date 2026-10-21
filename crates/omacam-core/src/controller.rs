@@ -40,6 +40,9 @@ pub struct Options {
     /// Frames per second asked of a camera in video mode, where its mode
     /// allows it (30 or 60).
     pub video_fps: u32,
+    /// Merge Night and HDR bursts from the raw frames, where the camera
+    /// gives them; otherwise from the processed ones.
+    pub raw_merge: bool,
 }
 
 impl Default for Options {
@@ -52,6 +55,7 @@ impl Default for Options {
             tap_to_focus: true,
             low_light: true,
             video_fps: 30,
+            raw_merge: true,
         }
     }
 }
@@ -515,6 +519,7 @@ impl Controller {
                         size: lens.preview,
                         buffers: self.opts.preview_buffers,
                         fallbacks: Vec::new(),
+                        raw: false,
                     },
                     Purpose::Still => {
                         let size = lens.still.or(lens.preview);
@@ -528,6 +533,8 @@ impl Controller {
                                 .filter(|p| Some(*p) != size)
                                 .into_iter()
                                 .collect(),
+                            // A burst merges the raw frames.
+                            raw: self.opts.raw_merge && self.capture.burst().is_some(),
                         }
                     }
                 };
@@ -1369,6 +1376,7 @@ mirror = true
                 analog_gain: Some(1.0),
                 ..FrameMeta::default()
             },
+            raw: None,
         })
     }
 

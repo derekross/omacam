@@ -275,12 +275,113 @@ pub fn merge_burst(
     merge_pool()?.install(|| merge_burst_in_pool(frames, hdr))
 }
 
+/// Where libcamera's simple pipeline looks for a sensor's tuning file, in
+/// order.
+const TUNING_DIRS: [&str; 2] = [
+    "/etc/libcamera/ipa/simple",
+    "/usr/share/libcamera/ipa/simple",
+];
+
+/// The ISP's finish for a raw burst, from a frame's metadata and the
+/// sensor's tuning file (the look and the detail base values).
+fn raw_finish(
+    p: &omacam_core::controller::Picture,
+    raw: &omacam_core::backend::RawFrame,
+) -> omacam_merge::IspParams {
+    use omacam_merge::isp::{contrast_exp, with_saturation, Detail, IspParams, Tuning};
+    let isp = &raw.isp;
+    let tuning = isp
+        .sensor_model
+        .as_deref()
+        .and_then(|m| {
+            TUNING_DIRS
+                .iter()
+                .find_map(|d| std::fs::read_to_string(format!("{d}/{m}.yaml")).ok())
+        })
+        .map(|t| Tuning::parse(&t))
+        .unwrap_or_else(|| {
+            tracing::warn!(model = ?isp.sensor_model, "no tuning file: the raw merge has no look");
+            Tuning::default()
+        });
+    let identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    let meta = &p.frame.meta;
+    let gains = meta.color_gains.unwrap_or([1.0, 1.0]);
+    let gain = meta.analog_gain.unwrap_or(1.0) * meta.digital_gain.unwrap_or(1.0).max(1.0);
+    IspParams {
+        // SensorBlackLevels count on a 16-bit scale; the ISP takes the
+        // 8 high bits.
+        black: isp.black_level.unwrap_or(0.0) / 256.0 / 255.0,
+        awb: [gains[0], 1.0, gains[1]],
+        // Without a matrix the ISP applies no saturation either.
+        ccm: isp
+            .color_matrix
+            .map(|m| with_saturation(m, isp.saturation.unwrap_or(1.0)))
+            .unwrap_or(identity),
+        gamma: 1.0 / isp.gamma.unwrap_or(2.2),
+        contrast_exp: contrast_exp(isp.contrast.unwrap_or(1.0)),
+        look: tuning.look,
+        detail: Detail::for_gain(tuning.detail, isp.sharpness.unwrap_or(1.0), gain),
+    }
+}
+
+/// The burst's raw frames as quads, if every frame has one and they match.
+fn raw_quads(
+    frames: &[omacam_core::controller::Picture],
+) -> Option<(Vec<omacam_merge::RawQuads>, (usize, usize))> {
+    let first = frames.first()?.frame.raw.as_ref()?;
+    let quads = frames
+        .iter()
+        .map(|p| {
+            let r = p.frame.raw.as_ref()?;
+            if r.size != first.size || r.first_red != first.first_red {
+                return None;
+            }
+            omacam_merge::RawQuads::from_csi2p10(
+                &r.data,
+                r.size.width as usize,
+                r.size.height as usize,
+                r.stride as usize,
+            )
+            .map_err(|e| tracing::warn!("a raw burst frame: {e}"))
+            .ok()
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let fr = (first.first_red.0 as usize, first.first_red.1 as usize);
+    Some((quads, fr))
+}
+
 fn merge_burst_in_pool(
     mut frames: Vec<omacam_core::controller::Picture>,
     hdr: bool,
 ) -> Result<omacam_core::controller::Picture> {
-    use rayon::prelude::*;
     let started = std::time::Instant::now();
+    if let Some((quads, first_red)) = raw_quads(&frames) {
+        let raw = frames[0].frame.raw.as_ref().expect("checked");
+        let finish = omacam_merge::RawFinish {
+            isp: raw_finish(&frames[0], raw),
+            first_red,
+            // HDR's burst is under the AGC's exposure: brighten it back in
+            // the raw, highlights rolled off, then lift the shadows as Night
+            // does.
+            gain: if hdr {
+                2f32.powf(omacam_core::capture::BurstSpec::HDR.under_stops)
+            } else {
+                1.0
+            },
+        };
+        let unpacked = started.elapsed();
+        let out =
+            omacam_merge::merge_raw_burst(&quads, &finish, &omacam_merge::MergeParams::night())?;
+        tracing::info!(
+            "merged {} raw frames in {} ms ({} ms to unpack), reference {}, {:?}",
+            quads.len(),
+            started.elapsed().as_millis(),
+            unpacked.as_millis(),
+            out.reference,
+            out.stats
+        );
+        return Ok(picture_from(frames.swap_remove(out.reference), &out.image));
+    }
     // One frame at a time (a Picture isn't Sync); to_rgb runs its rows
     // in parallel.
     let images = frames
@@ -315,20 +416,30 @@ fn merge_burst_in_pool(
         out.reference,
         out.stats
     );
-    let mut picture = frames.swap_remove(out.reference);
+    Ok(picture_from(frames.swap_remove(out.reference), &out.image))
+}
+
+/// The reference frame's picture, its pixels replaced by the merge
+/// (XRGB8888) and its raw picture dropped.
+fn picture_from(
+    mut picture: omacam_core::controller::Picture,
+    image: &omacam_merge::RgbImage,
+) -> omacam_core::controller::Picture {
+    use rayon::prelude::*;
     // XRGB8888 in memory is B, G, R, X.
-    let mut data = vec![0u8; out.image.data.len() / 3 * 4];
+    let mut data = vec![0u8; image.data.len() / 3 * 4];
     data.par_chunks_mut(4 * 4096)
-        .zip(out.image.data.par_chunks(3 * 4096))
+        .zip(image.data.par_chunks(3 * 4096))
         .for_each(|(o, p)| {
             for (o, p) in o.chunks_exact_mut(4).zip(p.chunks_exact(3)) {
                 o.copy_from_slice(&[p[2], p[1], p[0], 255]);
             }
         });
-    picture.frame.stride = out.image.width as u32 * 4;
+    picture.frame.stride = image.width as u32 * 4;
     picture.frame.layout = PixelLayout::Xrgb8888;
     picture.frame.data = omacam_core::backend::FrameData::Memory(data);
-    Ok(picture)
+    picture.frame.raw = None;
+    picture
 }
 
 #[cfg(test)]

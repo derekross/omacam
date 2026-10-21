@@ -68,6 +68,10 @@ pub struct Cli {
     /// Show frame rate, lens and switch time over the viewfinder.
     #[arg(long, env = "OMACAM_DEBUG")]
     debug: bool,
+    /// Merge Night and HDR bursts from the processed frames, as before the
+    /// raw merge (for comparing the two).
+    #[arg(long, env = "OMACAM_NO_RAW_MERGE")]
+    no_raw_merge: bool,
     /// Run a test script (see `script.rs`), e.g.
     /// "wait 3; zoom 5; wait 2; shot /tmp/tele.png; quit".
     #[arg(long)]

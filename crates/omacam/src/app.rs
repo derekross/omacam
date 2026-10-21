@@ -1145,6 +1145,7 @@ impl App {
                     tap_to_focus: self.settings.borrow().tap_to_focus,
                     low_light: self.settings.borrow().low_light,
                     video_fps: self.settings.borrow().video_fps,
+                    raw_merge: !self.cli.no_raw_merge,
                     ..Options::default()
                 };
                 // The list comes at startup and again whenever cameras come

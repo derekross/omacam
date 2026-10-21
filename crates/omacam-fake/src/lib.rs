@@ -10,8 +10,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use omacam_core::backend::{
-    Backend, CameraInfo, Command, Controls, Event, EventSink, Frame, FrameData, FrameMeta,
-    Location, PixelLayout, Size,
+    Backend, CameraInfo, Command, Controls, Event, EventSink, Frame, FrameData, FrameMeta, IspMeta,
+    Location, PixelLayout, RawFrame, Size,
 };
 
 /// The manual controls a camera might offer: all of them.
@@ -201,6 +201,8 @@ struct Stream {
     /// Light lost to the lens's aperture against the main camera's:
     /// (f / 1.85)².
     aperture: f64,
+    /// Give each frame a raw picture too.
+    raw: bool,
 }
 
 /// The aperture of the Pixel 7 Pro's cameras by sensor model, against the
@@ -373,6 +375,7 @@ fn handle(
                     .unwrap_or(1.0),
                 camera,
                 size: fit(size.expect("checked"), opts.max_size),
+                raw: req.raw,
                 started_at: now + opts.start_delay,
                 started: false,
                 notice,
@@ -460,6 +463,20 @@ fn step(s: &mut Stream, sink: &EventSink, opts: &Options, epoch: Instant) {
             lens_position: Some(s.settings.lens.manual().unwrap_or(0.5)),
             ..FrameMeta::default()
         },
+        // A flat mid-gray raw picture, 10-bit packed.
+        raw: s.raw.then(|| {
+            let stride = s.size.width / 4 * 5;
+            Box::new(RawFrame {
+                size: s.size,
+                stride,
+                first_red: (1, 0),
+                data: vec![128; (stride * s.size.height) as usize],
+                isp: IspMeta {
+                    sensor_model: Some("fake".into()),
+                    ..IspMeta::default()
+                },
+            })
+        }),
     }));
     s.sequence += 1;
     s.next_frame += opts.frame_interval;
@@ -527,6 +544,7 @@ mod tests {
             settings: Default::default(),
             tint: [100, 100, 100],
             aperture: 1.0,
+            raw: false,
         };
         let px = render(&s);
         let at = |x: usize, y: usize| px[(y * 64 + x) * 4..(y * 64 + x) * 4 + 3].to_vec();
