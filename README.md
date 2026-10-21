@@ -56,10 +56,13 @@ finds.
   frame rate and stabilization, volume keys as the shutter, tap to focus,
   the low-light lens, and the debug overlay. They are kept in
   `~/.config/omacam/settings.toml`.
+- Night mode and an HDR chip (Photo mode): a burst at one locked exposure
+  (Night 12 frames, HDR 8), aligned and merged on the phone into one photo.
+  Hold still while it's taken; the merge takes a few seconds.
 - The cameras are let go while the window is hidden, so other apps (a
   browser, a video call) can use them.
 
-Not yet: RAW, a level, HDR and night modes, and a stabilized preview
+Not yet: RAW, a level, and a stabilized preview
 (the file is stabilized; the viewfinder shows its framing). See
 [docs/architecture.md](docs/architecture.md) for the plan.
 
