@@ -557,7 +557,7 @@ impl Worker {
                 tracing::warn!(
                     generation,
                     camera,
-                    "no raw stream at the processed size: bursts merge the processed frames"
+                    "no raw stream to match the processed one: bursts merge the processed frames"
                 );
                 want_raw = false;
                 continue;
@@ -1055,6 +1055,9 @@ fn set_controls(list: &mut ControlList, c: &Controls, exposure_hints: bool, awb_
 /// The raw stream's size, stride and Bayer phase, if the validated
 /// configuration has one at the processed stream's size in a format the
 /// raw merge reads.
+/// How much wider than the processed frame a raw frame may be.
+const RAW_EXTRA_COLUMNS: u32 = 16;
+
 fn raw_layout(cfgs: &libcamera::camera::CameraConfiguration) -> Option<(Size, u32, (u8, u8))> {
     let (processed, raw) = (cfgs.get(0)?, cfgs.get(1)?);
     let fmt = raw.get_pixel_format();
@@ -1063,7 +1066,9 @@ fn raw_layout(cfgs: &libcamera::camera::CameraConfiguration) -> Option<(Size, u3
         .find(|(f, _)| *f == fmt)
         .map(|(_, r)| *r)?;
     let (ps, rs) = (processed.get_size(), raw.get_size());
-    ((ps.width, ps.height) == (rs.width, rs.height))
+    // The software ISP's output can be a few columns narrower than the
+    // sensor's (4072 of 4080 on the S5KGN1): the raw frame's left part.
+    (ps.height == rs.height && (ps.width..=ps.width + RAW_EXTRA_COLUMNS).contains(&rs.width))
         .then(|| (Size::new(rs.width, rs.height), raw.get_stride(), first_red))
 }
 

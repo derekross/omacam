@@ -6,7 +6,7 @@
 //!   compares it with the ISP's own XRGB8888 frame (AWB_R and AWB_B are the
 //!   gains the ISP applied: the previous frame's ColourGains).
 //!
-//! `raw_files merge plain|night|hdr TUNING AWB_R AWB_B GAIN RAW_GAIN OUT RAW...`
+//! `raw_files merge plain|night|hdr|hdr15 TUNING AWB_R AWB_B GAIN RAW_GAIN OUT RAW...`
 //!   merges the raw frames, finishes them and writes OUT as a PPM picture.
 //!
 //! The color matrix, saturation and contrast are the camera's metadata for
@@ -119,6 +119,7 @@ fn main() {
                     fusion_evs: Vec::new(),
                 },
                 "night" => MergeParams::night(),
+                "hdr15" => MergeParams::hdr(1.5),
                 _ => MergeParams {
                     fusion_evs: vec![0.0, 1.0],
                 },

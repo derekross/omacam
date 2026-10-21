@@ -350,6 +350,14 @@ fn raw_quads(
     Some((quads, fr))
 }
 
+fn merge_params(hdr: bool) -> omacam_merge::MergeParams {
+    if hdr {
+        omacam_merge::MergeParams::hdr(omacam_core::capture::BurstSpec::HDR.under_stops)
+    } else {
+        omacam_merge::MergeParams::night()
+    }
+}
+
 fn merge_burst_in_pool(
     mut frames: Vec<omacam_core::controller::Picture>,
     hdr: bool,
@@ -360,18 +368,13 @@ fn merge_burst_in_pool(
         let finish = omacam_merge::RawFinish {
             isp: raw_finish(&frames[0], raw),
             first_red,
-            // HDR's burst is under the AGC's exposure: brighten it back in
-            // the raw, highlights rolled off, then lift the shadows as Night
-            // does.
-            gain: if hdr {
-                2f32.powf(omacam_core::capture::BurstSpec::HDR.under_stops)
-            } else {
-                1.0
-            },
+            // HDR's burst stays at its own exposure through the finish, so
+            // the look doesn't wash out bright colors, and the fusion brings
+            // it back up as on the processed path.
+            gain: 1.0,
         };
         let unpacked = started.elapsed();
-        let out =
-            omacam_merge::merge_raw_burst(&quads, &finish, &omacam_merge::MergeParams::night())?;
+        let out = omacam_merge::merge_raw_burst(&quads, &finish, &merge_params(hdr))?;
         tracing::info!(
             "merged {} raw frames in {} ms ({} ms to unpack), reference {}, {:?}",
             quads.len(),
@@ -380,7 +383,10 @@ fn merge_burst_in_pool(
             out.reference,
             out.stats
         );
-        return Ok(picture_from(frames.swap_remove(out.reference), &out.image));
+        // The processed frame is the raw frame's left part.
+        let picture = frames.swap_remove(out.reference);
+        let image = crop_width(out.image, picture.frame.size.width as usize);
+        return Ok(picture_from(picture, &image));
     }
     // One frame at a time (a Picture isn't Sync); to_rgb runs its rows
     // in parallel.
@@ -402,12 +408,7 @@ fn merge_burst_in_pool(
         })
         .collect::<Result<Vec<_>>>()?;
     let converted = started.elapsed();
-    let params = if hdr {
-        omacam_merge::MergeParams::hdr(omacam_core::capture::BurstSpec::HDR.under_stops)
-    } else {
-        omacam_merge::MergeParams::night()
-    };
-    let out = omacam_merge::merge_burst(&images, &params)?;
+    let out = omacam_merge::merge_burst(&images, &merge_params(hdr))?;
     tracing::info!(
         "merged {} frames in {} ms ({} ms to RGB), reference {}, {:?}",
         images.len(),
@@ -417,6 +418,24 @@ fn merge_burst_in_pool(
         out.stats
     );
     Ok(picture_from(frames.swap_remove(out.reference), &out.image))
+}
+
+/// The left `width` columns of an image.
+fn crop_width(image: omacam_merge::RgbImage, width: usize) -> omacam_merge::RgbImage {
+    if width >= image.width {
+        return image;
+    }
+    let data = image
+        .data
+        .chunks_exact(image.width * 3)
+        .flat_map(|row| &row[..width * 3])
+        .copied()
+        .collect();
+    omacam_merge::RgbImage {
+        width,
+        data,
+        ..image
+    }
 }
 
 /// The reference frame's picture, its pixels replaced by the merge
@@ -445,6 +464,18 @@ fn picture_from(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crop_width_keeps_the_left_columns() {
+        let image = omacam_merge::RgbImage {
+            width: 3,
+            height: 2,
+            data: (0..18).collect(),
+        };
+        let c = crop_width(image, 2);
+        assert_eq!((c.width, c.height), (2, 2));
+        assert_eq!(c.data, [0, 1, 2, 3, 4, 5, 9, 10, 11, 12, 13, 14]);
+    }
 
     /// A 4x2 XRGB frame whose pixel (x, y) has blue = 10x + y.
     fn frame() -> Vec<u8> {

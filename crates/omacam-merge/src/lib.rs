@@ -64,7 +64,7 @@ pub struct RawFinish {
     /// Where the red sample of the 2x2 pattern sits (column, row).
     pub first_red: (usize, usize),
     /// Brighten the merge by this much in the raw, highlights rolled off
-    /// (HDR: back to the AGC's exposure); 1 for none.
+    /// (a burst under the exposure wanted); 1 for none.
     pub gain: f32,
 }
 
