@@ -6,7 +6,7 @@
 
 use rayon::prelude::*;
 
-use crate::image::{Plane, RgbImage};
+use crate::image::Plane;
 use crate::tiles::{window, TileGrid};
 
 /// A tile weighs fully while its mean squared difference from the reference
@@ -16,48 +16,56 @@ const ROBUST_FREE: f32 = 1.5;
 const ROBUST_SLOPE: f32 = 1.0;
 /// Brightness bins for the noise estimate (noise depends on brightness).
 const NOISE_BINS: usize = 8;
-/// The least noise variance assumed (8-bit units squared), so that a
-/// very clean burst still tolerates quantization and resampling error.
-const MIN_NOISE_VAR: f32 = 1.0;
+/// The least noise variance assumed for 8-bit samples (units squared), so
+/// that a very clean burst still tolerates quantization and resampling
+/// error.
+pub const MIN_NOISE_VAR_8BIT: f32 = 1.0;
+
+/// The pictures the merge takes: `C` samples a pixel, rows packed with no
+/// padding. 8-bit RGB (C = 3) and raw Bayer quads (C = 4, 10-bit) both
+/// fit.
+#[derive(Clone, Copy)]
+pub struct Frames<'a, T, const C: usize> {
+    pub width: usize,
+    pub height: usize,
+    pub data: &'a [&'a [T]],
+}
 
 /// Mean squared difference of a tile between the reference and an aligned
-/// frame, over the three colors (luma alone misses a colored object on a
+/// frame, over every channel (luma alone misses a colored object on a
 /// background of the same brightness), and the reference tile's mean luma.
 #[allow(clippy::too_many_arguments)]
-fn tile_stats(
-    reference: &RgbImage,
+fn tile_stats<T: Copy + Into<f32>, const C: usize>(
+    reference: &[T],
     ref_luma: &Plane,
-    frame: &RgbImage,
+    frame: &[T],
+    (w, h): (usize, usize),
     x0: usize,
     y0: usize,
     size: usize,
     (dx, dy): (i32, i32),
 ) -> (f32, f32) {
-    let (w, h) = (reference.width as isize, reference.height as isize);
     let (mut sq, mut mean, mut n) = (0.0, 0.0, 0.0);
     for y in (y0..y0 + size).step_by(2) {
-        let fy = (y as isize + dy as isize).clamp(0, h - 1) as usize;
+        let fy = (y as isize + dy as isize).clamp(0, h as isize - 1) as usize;
         for x in (x0..x0 + size).step_by(2) {
-            let fx = (x as isize + dx as isize).clamp(0, w - 1) as usize;
-            let (ri, fi) = (
-                (y * reference.width + x) * 3,
-                (fy * reference.width + fx) * 3,
-            );
-            for c in 0..3 {
-                let d = reference.data[ri + c] as f32 - frame.data[fi + c] as f32;
+            let fx = (x as isize + dx as isize).clamp(0, w as isize - 1) as usize;
+            let (ri, fi) = ((y * w + x) * C, (fy * w + fx) * C);
+            for c in 0..C {
+                let d = reference[ri + c].into() - frame[fi + c].into();
                 sq += d * d;
             }
             mean += ref_luma.at(x, y);
             n += 1.0;
         }
     }
-    (sq / (3.0 * n), mean / n)
+    (sq / (C as f32 * n), mean / n)
 }
 
 /// The noise variance of one frame, per brightness bin, from the burst
 /// itself: half the median squared difference between two aligned frames
 /// over the tiles of that brightness (the median ignores tiles that moved).
-pub fn noise_profile(diffs: &[(f32, f32)]) -> [f32; NOISE_BINS] {
+pub fn noise_profile(diffs: &[(f32, f32)], min_var: f32) -> [f32; NOISE_BINS] {
     let median = |mut v: Vec<f32>| -> Option<f32> {
         if v.is_empty() {
             return None;
@@ -81,7 +89,7 @@ pub fn noise_profile(diffs: &[(f32, f32)]) -> [f32; NOISE_BINS] {
         } else {
             all
         };
-        *slot = (0.5 * m).max(MIN_NOISE_VAR);
+        *slot = (0.5 * m).max(min_var);
     }
     out
 }
@@ -107,24 +115,29 @@ pub fn robust_weight(msd: f32, noise_var: f32) -> f32 {
 pub struct MergeStats {
     /// The mean tile weight of each non-reference frame.
     pub frame_weights: Vec<f32>,
-    /// Noise standard deviation (8-bit, per color) of the middle brightness
-    /// bin.
+    /// Noise standard deviation (in the samples' units, per channel) of the
+    /// middle brightness bin.
     pub noise_sigma: f32,
     /// How long each stage took, in order (filled in by `merge_burst`).
     pub timings: Vec<(&'static str, std::time::Duration)>,
 }
 
 /// Merge `frames` onto `frames[reference]`, each moved per tile by its
-/// `offsets` (one list per frame, empty for the reference).
-pub fn merge(
-    frames: &[RgbImage],
+/// `offsets` (one list per frame, empty for the reference). `lumas` are
+/// the frames' brightness on a 0..255 scale (for the noise bins);
+/// `min_noise_var` is the least noise variance assumed, in the samples'
+/// units squared. The result has `C` floats a pixel.
+pub fn merge<T: Copy + Into<f32> + Sync, const C: usize>(
+    frames: Frames<'_, T, C>,
     lumas: &[Plane],
     reference: usize,
     grid: &TileGrid,
     offsets: &[Vec<(i32, i32)>],
+    min_noise_var: f32,
 ) -> (Vec<f32>, MergeStats) {
-    let (w, h) = (frames[0].width, frames[0].height);
+    let (w, h) = (frames.width, frames.height);
     let ref_luma = &lumas[reference];
+    let frames = frames.data;
 
     // Per frame: each tile's difference from the reference and brightness,
     // then the frame's noise profile and the tile weights.
@@ -138,10 +151,11 @@ pub fn merge(
             .into_par_iter()
             .map(|i| {
                 let (x0, y0) = grid.origin(i);
-                tile_stats(
-                    &frames[reference],
+                tile_stats::<T, C>(
+                    frames[reference],
                     ref_luma,
-                    &frames[f],
+                    frames[f],
+                    (w, h),
                     x0,
                     y0,
                     grid.size,
@@ -149,7 +163,7 @@ pub fn merge(
                 )
             })
             .collect();
-        let noise = noise_profile(&diffs);
+        let noise = noise_profile(&diffs, min_noise_var);
         if stats.noise_sigma == 0.0 {
             stats.noise_sigma = noise[NOISE_BINS / 2].sqrt();
         }
@@ -166,7 +180,7 @@ pub fn merge(
     // that threads never write the same pixels: tile rows overlap by half,
     // so even tile rows first, then odd ones.
     let win = window(grid.size);
-    let mut acc = vec![0.0f32; w * h * 3];
+    let mut acc = vec![0.0f32; w * h * C];
     let mut norm = vec![0.0f32; w * h];
     for parity in 0..2 {
         // Each band of a tile row covers pixel rows [y0, y0 + size); rows of
@@ -176,7 +190,7 @@ pub fn merge(
             .par_iter()
             .map(|&ty| {
                 let (_, y0) = grid.origin(ty * grid.nx);
-                let mut a = vec![0.0f32; w * grid.size * 3];
+                let mut a = vec![0.0f32; w * grid.size * C];
                 let mut n = vec![0.0f32; w * grid.size];
                 for tx in 0..grid.nx {
                     let i = ty * grid.nx + tx;
@@ -200,20 +214,19 @@ pub fn merge(
                             if inside {
                                 // The usual case: the moved row lies inside
                                 // the frame, so no clamping per pixel.
-                                let src =
-                                    &frame.data[(sy * w + sx0 as usize) * 3..][..grid.size * 3];
-                                let dst = &mut a[dst_row * 3..][..grid.size * 3];
+                                let src = &frame[(sy * w + sx0 as usize) * C..][..grid.size * C];
+                                let dst = &mut a[dst_row * C..][..grid.size * C];
                                 let nd = &mut n[dst_row..][..grid.size];
                                 for (k, ((d, s), nn)) in dst
-                                    .chunks_exact_mut(3)
-                                    .zip(src.chunks_exact(3))
+                                    .chunks_exact_mut(C)
+                                    .zip(src.chunks_exact(C))
                                     .zip(nd)
                                     .enumerate()
                                 {
                                     let ww = wj * win[k];
-                                    d[0] += ww * s[0] as f32;
-                                    d[1] += ww * s[1] as f32;
-                                    d[2] += ww * s[2] as f32;
+                                    for c in 0..C {
+                                        d[c] += ww * s[c].into();
+                                    }
                                     *nn += ww;
                                 }
                                 continue;
@@ -221,11 +234,11 @@ pub fn merge(
                             for (k, &wk) in win.iter().enumerate() {
                                 let ww = wj * wk;
                                 let sx = (sx0 + k as isize).clamp(0, w as isize - 1) as usize;
-                                let src = (sy * w + sx) * 3;
+                                let src = (sy * w + sx) * C;
                                 let dst = dst_row + k;
-                                a[dst * 3] += ww * frame.data[src] as f32;
-                                a[dst * 3 + 1] += ww * frame.data[src + 1] as f32;
-                                a[dst * 3 + 2] += ww * frame.data[src + 2] as f32;
+                                for c in 0..C {
+                                    a[dst * C + c] += ww * frame[src + c].into();
+                                }
                                 n[dst] += ww;
                             }
                         }
@@ -239,10 +252,10 @@ pub fn merge(
         let mut rows_of: Vec<Option<(&[f32], &[f32])>> = vec![None; h];
         for (y0, a, n) in &bands {
             for j in 0..grid.size {
-                rows_of[y0 + j] = Some((&a[j * w * 3..][..w * 3], &n[j * w..][..w]));
+                rows_of[y0 + j] = Some((&a[j * w * C..][..w * C], &n[j * w..][..w]));
             }
         }
-        acc.par_chunks_mut(w * 3)
+        acc.par_chunks_mut(w * C)
             .zip(norm.par_chunks_mut(w))
             .zip(rows_of.par_iter())
             .for_each(|((acc_row, norm_row), band)| {
@@ -253,7 +266,7 @@ pub fn merge(
             });
     }
 
-    acc.par_chunks_exact_mut(3).zip(&norm).for_each(|(p, &n)| {
+    acc.par_chunks_exact_mut(C).zip(&norm).for_each(|(p, &n)| {
         let inv = if n > 0.0 { 1.0 / n } else { 0.0 };
         for c in p {
             *c *= inv;
@@ -280,7 +293,7 @@ mod tests {
         // moved ones far off, all mid-gray.
         let mut d = vec![(50.0, 128.0); 80];
         d.extend(vec![(5000.0, 128.0); 20]);
-        let p = noise_profile(&d);
+        let p = noise_profile(&d, MIN_NOISE_VAR_8BIT);
         assert_eq!(p[bin_of(128.0)], 25.0);
     }
 }

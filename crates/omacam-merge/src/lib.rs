@@ -12,14 +12,18 @@
 //! This is the CPU reference: plain Rust, parallel with rayon, tested on
 //! synthetic bursts with known motion. A GPU version must match it.
 //!
-//! Stage 1 merges the software ISP's processed 8-bit frames, which keeps
-//! libcamera's whole look; the noise in N frames dithers away the 8-bit
-//! steps.
+//! [`merge_burst`] merges the software ISP's processed 8-bit frames, which
+//! keeps libcamera's whole look; the noise in N frames dithers away the
+//! 8-bit steps. [`merge_raw_burst`] merges the raw frames instead and
+//! finishes the merge with a CPU port of the ISP ([`isp`]): the same look,
+//! with the shadows the 8-bit frames lose (Q5).
 
 mod align;
 mod finish;
 pub mod image;
+pub mod isp;
 mod merge;
+pub mod raw;
 #[doc(hidden)]
 pub mod synth;
 mod tiles;
@@ -27,7 +31,9 @@ mod tiles;
 use rayon::prelude::*;
 
 pub use image::RgbImage;
+pub use isp::IspParams;
 pub use merge::MergeStats;
+pub use raw::RawQuads;
 
 use align::Pyramid;
 use image::{luma, Plane};
@@ -47,6 +53,19 @@ pub enum MergeError {
     SizeMismatch(usize, usize, usize, usize, usize),
     #[error("frames of {0}x{1} are too small to merge")]
     TooSmall(usize, usize),
+}
+
+/// What the raw path needs besides the frames.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RawFinish {
+    /// The ISP's parameters for the burst (its white balance, matrix, look
+    /// and the detail for its gain).
+    pub isp: IspParams,
+    /// Where the red sample of the 2x2 pattern sits (column, row).
+    pub first_red: (usize, usize),
+    /// Brighten the merge by this much in the raw, highlights rolled off
+    /// (HDR: back to the AGC's exposure); 1 for none.
+    pub gain: f32,
 }
 
 /// How to merge and finish.
@@ -124,14 +143,105 @@ pub fn merge_burst(frames: &[RgbImage], params: &MergeParams) -> Result<MergeOut
         t = std::time::Instant::now();
     };
     let lumas: Vec<Plane> = frames.par_iter().map(luma).collect();
-    let reference = (0..frames.len().min(REFERENCE_CANDIDATES))
+    lap("luma");
+    let (reference, offsets) = align_all(&lumas, w, h);
+    let grid = TileGrid::new(w, h);
+    lap("align");
+
+    let data: Vec<&[u8]> = frames.iter().map(|f| f.data.as_slice()).collect();
+    let (merged, mut stats) = merge::merge(
+        merge::Frames::<u8, 3> {
+            width: w,
+            height: h,
+            data: &data,
+        },
+        &lumas,
+        reference,
+        &grid,
+        &offsets,
+        merge::MIN_NOISE_VAR_8BIT,
+    );
+    lap("merge");
+    let image = output(merged, w, h, params, &mut lap);
+    stats.timings = timings;
+    Ok(MergeOutput {
+        image,
+        reference,
+        stats,
+    })
+}
+
+/// Merge a raw burst and finish it as the ISP would.
+pub fn merge_raw_burst(
+    frames: &[RawQuads],
+    finish: &RawFinish,
+    params: &MergeParams,
+) -> Result<MergeOutput, MergeError> {
+    if frames.len() < MIN_FRAMES {
+        return Err(MergeError::TooFewFrames(frames.len()));
+    }
+    let (w, h) = (frames[0].width, frames[0].height);
+    for (i, f) in frames.iter().enumerate() {
+        if (f.width, f.height) != (w, h) {
+            return Err(MergeError::SizeMismatch(
+                i,
+                2 * f.width,
+                2 * f.height,
+                2 * w,
+                2 * h,
+            ));
+        }
+    }
+    if w < tiles::TILE || h < tiles::TILE {
+        return Err(MergeError::TooSmall(2 * w, 2 * h));
+    }
+
+    let mut timings = Vec::new();
+    let mut t = std::time::Instant::now();
+    let mut lap = |name: &'static str| {
+        timings.push((name, t.elapsed()));
+        t = std::time::Instant::now();
+    };
+    let lumas: Vec<Plane> = frames.par_iter().map(RawQuads::luma).collect();
+    let (reference, offsets) = align_all(&lumas, w, h);
+    lap("align");
+
+    let data: Vec<&[u16]> = frames.iter().map(|f| f.data.as_slice()).collect();
+    let grid = TileGrid::new(w, h);
+    let (merged, mut stats) = merge::merge(
+        merge::Frames::<u16, 4> {
+            width: w,
+            height: h,
+            data: &data,
+        },
+        &lumas,
+        reference,
+        &grid,
+        &offsets,
+        raw::MIN_NOISE_VAR,
+    );
+    lap("merge");
+    let rgb = raw::finish(&merged, w, h, &finish.isp, finish.first_red, finish.gain);
+    drop(merged);
+    lap("finish");
+    let image = output(rgb, 2 * w, 2 * h, params, &mut lap);
+    stats.timings = timings;
+    Ok(MergeOutput {
+        image,
+        reference,
+        stats,
+    })
+}
+
+/// The reference (the sharpest of the first few frames) and every other
+/// frame's tile offsets onto it.
+fn align_all(lumas: &[Plane], w: usize, h: usize) -> (usize, Vec<Vec<(i32, i32)>>) {
+    let reference = (0..lumas.len().min(REFERENCE_CANDIDATES))
         .max_by(|&a, &b| sharpness(&lumas[a]).total_cmp(&sharpness(&lumas[b])))
         .unwrap();
-    lap("luma");
-
     let grid = TileGrid::new(w, h);
     let ref_pyramid = Pyramid::new(lumas[reference].clone());
-    let offsets: Vec<Vec<(i32, i32)>> = lumas
+    let offsets = lumas
         .par_iter()
         .enumerate()
         .map(|(i, l)| {
@@ -142,11 +252,18 @@ pub fn merge_burst(frames: &[RgbImage], params: &MergeParams) -> Result<MergeOut
             }
         })
         .collect();
-    lap("align");
+    (reference, offsets)
+}
 
-    let (merged, mut stats) = merge::merge(frames, &lumas, reference, &grid, &offsets);
-    lap("merge");
-
+/// Fusion (when asked for) and the 8-bit picture, from RGB floats on a
+/// 0..255 scale.
+fn output(
+    merged: Vec<f32>,
+    w: usize,
+    h: usize,
+    params: &MergeParams,
+    lap: &mut impl FnMut(&'static str),
+) -> RgbImage {
     let gain = if params.fusion_evs.len() > 1 {
         let mut ml = Plane::new(w, h);
         for (o, p) in ml.data.iter_mut().zip(merged.chunks_exact(3)) {
@@ -171,10 +288,5 @@ pub fn merge_burst(frames: &[RgbImage], params: &MergeParams) -> Result<MergeOut
             }
         });
     lap("output");
-    stats.timings = timings;
-    Ok(MergeOutput {
-        image,
-        reference,
-        stats,
-    })
+    image
 }

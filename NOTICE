@@ -27,6 +27,39 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
+omacam-merge's ISP port, crates/omacam-merge/src/isp.rs, follows
+libcamera's software ISP shaders. Its demosaic comes from
+bayer_1x_packed.frag, which carries this license:
+
+Copyright (c) 2008, Morgan McGuire. All rights reserved.
+Modified by Linaro Ltd for 10/12-bit packed vs 8-bit raw Bayer format, and
+for simpler demosaic algorithm. Copyright (C) 2020, Linaro
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice,
+   this list of conditions and the following disclaimer.
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
+
+Its other steps (defective pixel correction, color and tone, the
+post-filter) port Omarchy Mobile's own libcamera changes, released under the
+LGPL-2.1-or-later, which allows their use under the GPL.
+
 The omacam binary links these Rust crates statically, each under its own
 license: libcamera and libcamera-sys (MIT OR Apache-2.0), gtk4, gdk4, gsk4,
 glib, gio, libadwaita and the other gtk-rs crates (MIT), turbojpeg
