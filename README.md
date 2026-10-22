@@ -58,7 +58,10 @@ finds.
   `~/.config/omacam/settings.toml`.
 - Night mode and an HDR chip (Photo mode): a burst at one locked exposure
   (Night 12 frames, HDR 8), aligned and merged on the phone into one photo.
-  Hold still while it's taken; the merge takes a few seconds.
+  The burst's raw sensor frames are merged before the color processing,
+  which keeps the shadows and cuts the noise further (`--no-raw-merge`
+  merges the processed frames instead). Hold still while it's taken; the
+  merge takes a few seconds.
 - The cameras are let go while the window is hidden, so other apps (a
   browser, a video call) can use them.
 
