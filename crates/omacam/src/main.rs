@@ -98,6 +98,17 @@ pub struct Cli {
     fake_fps: Option<f64>,
 }
 
+/// The built-in lens table for this device, by its device-tree compatible.
+fn builtin_table() -> TableSpec {
+    let compatible = std::fs::read("/proc/device-tree/compatible").unwrap_or_default();
+    let compatible: Vec<&str> = compatible
+        .split(|&b| b == 0)
+        .filter_map(|s| std::str::from_utf8(s).ok())
+        .filter(|s| !s.is_empty())
+        .collect();
+    TableSpec::builtin(&compatible)
+}
+
 impl Cli {
     pub fn lens_table(&self) -> TableSpec {
         let user = gtk::glib::user_config_dir().join("omacam/lenses.toml");
@@ -113,10 +124,10 @@ impl Cli {
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "using the built-in lens table");
-                    TableSpec::cheetah()
+                    builtin_table()
                 }
             },
-            None => TableSpec::cheetah(),
+            None => builtin_table(),
         }
     }
 
