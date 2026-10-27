@@ -183,6 +183,8 @@ pub struct TableSpec {
 
 /// The built-in table for the Pixel 7 Pro.
 pub const CHEETAH: &str = include_str!("../../../data/cheetah.toml");
+/// The built-in table for the Pixel 9a.
+pub const TEGU: &str = include_str!("../../../data/tegu.toml");
 
 /// Highest zoom when the table doesn't say.
 pub const DEFAULT_MAX_ZOOM: f64 = 8.0;
@@ -245,6 +247,20 @@ impl TableSpec {
 
     pub fn cheetah() -> TableSpec {
         TableSpec::parse(CHEETAH).expect("built-in lens table parses")
+    }
+
+    pub fn tegu() -> TableSpec {
+        TableSpec::parse(TEGU).expect("built-in lens table parses")
+    }
+
+    /// The built-in table for the device whose device-tree `compatible`
+    /// strings are given (the Pixel 7 Pro's when none matches).
+    pub fn builtin(compatible: &[&str]) -> TableSpec {
+        if compatible.contains(&"google,zumapro-tegu") {
+            TableSpec::tegu()
+        } else {
+            TableSpec::cheetah()
+        }
     }
 
     /// An empty table: every camera gets a generic entry.
@@ -417,6 +433,43 @@ mod tests {
                 270,
             ),
         ]
+    }
+
+    #[test]
+    fn tegu_table_matches_its_three_cameras() {
+        let cam = |id: &str, location| CameraInfo {
+            id: id.into(),
+            location,
+            rotation: 0,
+            model: "sensor".into(),
+            ..CameraInfo::default()
+        };
+        let cams = vec![
+            cam(
+                "/base/soc/usi@108c00c0/i2c@108c0000/camera@56",
+                Location::Back,
+            ),
+            cam(
+                "/base/soc/usi@108900c0/i2c@10890000/camera@1a",
+                Location::Back,
+            ),
+            cam(
+                "/base/soc/usi@108a00c0/i2c@108a0000/camera@1a",
+                Location::Front,
+            ),
+        ];
+        let t = TableSpec::builtin(&["google,zumapro-tegu", "google,zumapro"]).resolve(&cams);
+        assert_eq!(t.lenses().len(), 3);
+        for role in [Role::Main, Role::Ultrawide, Role::Front] {
+            assert!(t.by_role(role).is_some(), "{role:?}");
+        }
+    }
+
+    #[test]
+    fn builtin_picks_cheetah_elsewhere() {
+        let t = TableSpec::builtin(&["google,gs201-cheetah", "google,gs201"])
+            .resolve(&cheetah_cameras());
+        assert_eq!(t.lenses().len(), 4);
     }
 
     #[test]
