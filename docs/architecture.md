@@ -212,10 +212,13 @@ Two paths, `--display`:
 
 ### What the hardware and the system offer (2026-10-14)
 
-- **No hardware encoder.** The gs201's video codec block (MFC) has no
-  mainline driver in our kernel: no `/dev/video*` encoder node (the four
-  video nodes are the CSIS capture DMAs), no `v4l2h264enc`. Encoding is on
-  the CPU: two Cortex-X1, two A78 and four A55 cores.
+- **Hardware encoder where the kernel has one.** On 2026-10-14 the gs201's
+  video codec block (MFC) had no driver in our kernel, so encoding was on
+  the CPU: two Cortex-X1, two A78 and four A55 cores. The Pixel 7's MFC now
+  has one (linux-omarchy-mobile #250 and #256): `v4l2h264enc` exists there,
+  and omacam prefers it (`Codec::V4l2H264`), with x264 as the fallback if it
+  fails to start. GStreamer registers `v4l2h264enc` only when an encoder
+  node exists, so phones without one keep x264.
 - **Encoders on the phone:** the x264, OpenH264 and libvpx libraries are
   installed; GStreamer has `vp8enc`/`vp9enc` (gst-plugins-good) but not
   `x264enc` (gst-plugins-ugly) or `openh264enc` (gst-plugins-bad). The
