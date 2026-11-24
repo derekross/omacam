@@ -1,4 +1,4 @@
-//! omacam: a phone camera for Omarchy Mobile, shown as "Camera".
+//! omacam: a phone camera for Omamobile, shown as "Camera".
 
 mod app;
 mod exif;
@@ -45,7 +45,7 @@ pub enum CaptureMode {
 }
 
 #[derive(Debug, Clone, Parser)]
-#[command(name = "omacam", version, about = "Camera for Omarchy Mobile")]
+#[command(name = "omacam", version, about = "Camera for Omamobile")]
 pub struct Cli {
     /// List the cameras and their roles, then exit (opens no stream).
     #[arg(long)]

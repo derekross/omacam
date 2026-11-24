@@ -1,4 +1,4 @@
-//! omacam's burst merge: the Night and HDR modes (Omarchy Mobile's
+//! omacam's burst merge: the Night and HDR modes (Omamobile's
 //! docs/CAMERA-QUALITY-PLAN.md, Q2).
 //!
 //! The approach is HDR+'s (Hasinoff et al., "Burst photography for high

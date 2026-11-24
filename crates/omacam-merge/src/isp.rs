@@ -1,6 +1,6 @@
 //! The software ISP's finish on the CPU: libcamera's GPU debayer
 //! (`dpc_packed.frag`, `bayer_1x_packed.frag`, `postfilter.frag` in
-//! libcamera 0.7.2 with Omarchy Mobile's patches 0029-0055) over a raw
+//! libcamera 0.7.2 with Omamobile's patches 0029-0055) over a raw
 //! Bayer picture, so a merged raw burst comes out with the look of the
 //! camera's own frames.
 //!
@@ -8,13 +8,13 @@
 //! picture between its passes. Here the samples stay floats throughout,
 //! which is what a merge of many frames needs: its precision is finer than
 //! one frame's. Fed one frame's 8 high bits, the result matches the
-//! camera's own output to 0.05 levels (Omarchy Mobile's
+//! camera's own output to 0.05 levels (Omamobile's
 //! docs/CAMERA-QUALITY-PLAN.md, Q5.1).
 //!
 //! The demosaic is McGuire's ("Efficient, High-Quality Bayer Demosaic
 //! Filtering on GPUs", 2008) as simplified by Linaro for libcamera
 //! (BSD-2-Clause, see NOTICE). The defective pixel correction, the color
-//! and tone steps and the post-filter port Omarchy Mobile's own
+//! and tone steps and the post-filter port Omamobile's own
 //! libcamera patches (LGPL-2.1-or-later, taken here under the GPL).
 
 use rayon::prelude::*;

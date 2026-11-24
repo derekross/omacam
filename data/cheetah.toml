@@ -1,5 +1,5 @@
-# Lens table for the Google Pixel 7 Pro (cheetah, gs201) running Omarchy
-# Mobile. Cameras are matched by their libcamera id, the sensor's device
+# Lens table for the Google Pixel 7 Pro (cheetah, gs201) running
+# Omamobile. Cameras are matched by their libcamera id, the sensor's device
 # tree path that `cam -l` prints.
 #
 # zoom: field of view relative to the main camera, z = tan(FOV_main/2) /

@@ -1,6 +1,6 @@
 [package]
 name = "omacam"
-description = "Camera: a phone camera app for Omarchy Mobile"
+description = "Camera: a phone camera app for Omamobile"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

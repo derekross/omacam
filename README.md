@@ -1,6 +1,6 @@
 # omacam
 
-omacam is the camera app of Omarchy Mobile, shown as **Camera**. It is made
+omacam is the camera app of Omamobile, shown as **Camera**. It is made
 for phones: one zoom control runs from the ultrawide through the main camera
 to the telephoto and picks the lens for you, as the stock Android camera
 does, and photos come from the camera's full-resolution mode instead of the
@@ -12,7 +12,7 @@ camera of the phone, its modes and its controls. The window follows your
 Omarchy theme.
 
 The reference phone is the Google Pixel 7 Pro running
-[Omarchy Mobile](https://github.com/derekross/omarchy-mobile). On other
+[Omamobile](https://github.com/derekross/omamobile). On other
 machines omacam uses the first back camera and the first front camera it
 finds.
 
@@ -71,7 +71,7 @@ Not yet: RAW, a level, and a stabilized preview
 
 ## Install
 
-Once omacam is in Omarchy Mobile's package repository, install the
+Once omacam is in Omamobile's package repository, install the
 `omacam` package. To build and install the package from a checkout on the
 phone itself:
 
@@ -94,7 +94,7 @@ omacam --capture quick   # photos from the preview, without the mode switch
 omacam --remote shutter  # take a photo with the running omacam
 ```
 
-Volume keys take photos when they reach the window. On Omarchy Mobile the
+Volume keys take photos when they reach the window. On Omamobile the
 shell binds them for the system volume, so it has to hand them over with
 `omacam --remote shutter` while the camera is in front.
 

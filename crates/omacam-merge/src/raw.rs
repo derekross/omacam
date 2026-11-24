@@ -1,4 +1,4 @@
-//! The raw path (Omarchy Mobile's docs/CAMERA-QUALITY-PLAN.md, Q5): merge
+//! The raw path (Omamobile's docs/CAMERA-QUALITY-PLAN.md, Q5): merge
 //! the burst's raw Bayer frames, then finish the merge as the software ISP
 //! would ([`crate::isp`]).
 //!
