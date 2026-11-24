@@ -2,8 +2,8 @@
 
 omacam is a phone camera on libcamera, GTK 4 and libadwaita. This document
 covers what is built, the design choices behind it, and what is pending.
-The design follows Omarchy Mobile's camera app plan
-(`docs/CAMERA-APP-PLAN.md` in omarchy-mobile); section numbers below refer
+The design follows Omamobile's camera app plan
+(`docs/CAMERA-APP-PLAN.md` in omamobile); section numbers below refer
 to it. Building and testing are in `docs/development.md`.
 
 ## Crates
@@ -354,7 +354,7 @@ Automatic by default, with manual control where the camera allows it:
   (118 of 255) through `ExposureValue`, at most ±2 EV.
 - **Autofocus is continuous** by default, in photos and video (AfMode
   Continuous where the camera has autofocus and focus is on auto). The
-  software ISP's contrast autofocus (Omarchy Mobile's libcamera patches
+  software ISP's contrast autofocus (Omamobile's libcamera patches
   0005-0007) supports it and smooths its sharpness over about eight
   frames, so it holds steady rather than hunting. In photos a tap runs one
   scan on the tapped window (AfMode Auto, AfTrigger Start), holds it for 5

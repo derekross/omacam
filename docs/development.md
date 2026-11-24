@@ -38,7 +38,7 @@ bin/cross check       # clippy for the libcamera backend
 The first build takes about three minutes, later ones seconds.
 
 The sysroot takes libcamera from Arch Linux ARM. To match a phone that runs
-Omarchy Mobile's patched libcamera, put those packages in a directory and
+Omamobile's patched libcamera, put those packages in a directory and
 pass it: `OMACAM_EXTRA_PKGS=~/omarchy-mobile/out/repo/aarch64 bin/cross
 sysroot` installs every package in it, so use a directory with only the
 `libcamera` and `libcamera-ipa` packages. The headers and the soname are the same,

@@ -57,7 +57,7 @@ ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 POSSIBILITY OF SUCH DAMAGE.
 
 Its other steps (defective pixel correction, color and tone, the
-post-filter) port Omarchy Mobile's own libcamera changes, released under the
+post-filter) port Omamobile's own libcamera changes, released under the
 LGPL-2.1-or-later, which allows their use under the GPL.
 
 The omacam binary links these Rust crates statically, each under its own
