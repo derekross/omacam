@@ -11,9 +11,10 @@
 //!   -> opusenc -> muxer
 //! ```
 //!
-//! The gs201's hardware codec (MFC) has no mainline driver, so encoding is
-//! on the CPU: H.264 by x264 (gst-plugins-ugly) or OpenH264 (-bad) in MP4,
-//! else VP8 (libvpx, -good) in WebM. Audio is Opus (CAMERA-APP-PLAN Q11),
+//! H.264 goes to the hardware encoder when the kernel has one (GStreamer's
+//! `v4l2h264enc`, which exists only then: the Pixel 7's MFC), else to the
+//! CPU: x264 (gst-plugins-ugly) or OpenH264 (-bad) in MP4, else VP8 (libvpx,
+//! -good) in WebM. Audio is Opus (CAMERA-APP-PLAN Q11),
 //! which MP4 carries too. Frames and audio are timestamped on the
 //! pipeline's clock as they arrive, which keeps them in sync to within a
 //! frame.
@@ -68,6 +69,8 @@ impl InputFormat {
 /// The encoder and container, in order of preference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Codec {
+    /// v4l2h264enc, the kernel's hardware H.264 encoder, in MP4.
+    V4l2H264,
     /// x264enc, H.264 in MP4.
     X264,
     /// openh264enc, H.264 in MP4.
@@ -77,11 +80,11 @@ pub enum Codec {
 }
 
 impl Codec {
-    pub const PREFERENCE: [Codec; 3] = [Codec::X264, Codec::OpenH264, Codec::Vp8];
+    pub const PREFERENCE: [Codec; 4] = [Codec::V4l2H264, Codec::X264, Codec::OpenH264, Codec::Vp8];
 
     pub fn extension(self) -> &'static str {
         match self {
-            Codec::X264 | Codec::OpenH264 => "mp4",
+            Codec::V4l2H264 | Codec::X264 | Codec::OpenH264 => "mp4",
             Codec::Vp8 => "webm",
         }
     }
@@ -90,6 +93,15 @@ impl Codec {
         match self {
             // x264enc gives mp4mux the avc stream format itself: no parser,
             // so no gst-plugins-bad.
+            Codec::V4l2H264 => &[
+                "capssetter",
+                "v4l2h264enc",
+                "h264parse",
+                "mp4mux",
+                "videocrop",
+                "videoflip",
+                "taginject",
+            ],
             Codec::X264 => &["x264enc", "mp4mux", "videocrop", "videoflip", "taginject"],
             Codec::OpenH264 => &[
                 "openh264enc",
@@ -107,6 +119,18 @@ impl Codec {
     fn chain(self, bitrate_kbps: u32, fps: u32) -> String {
         let keyint = fps * 2;
         match self {
+            // The bitrate needs frame-level rate control on; without it the
+            // encoder codes every frame at a fixed QP. The frames carry no
+            // frame rate (they're stamped as they come), so the encoder is
+            // told the chosen one: its rate control spreads the bitrate over
+            // that many frames a second.
+            Codec::V4l2H264 => format!(
+                "capssetter caps=\"video/x-raw,framerate={fps}/1\" \
+                 ! v4l2h264enc extra-controls=\"controls,video_bitrate={},\
+                 frame_level_rate_control_enable=1,video_gop_size={keyint}\" \
+                 ! h264parse ! video/x-h264,stream-format=avc,alignment=au",
+                bitrate_kbps * 1000
+            ),
             Codec::X264 => format!(
                 "x264enc speed-preset=ultrafast tune=zerolatency bitrate={bitrate_kbps} \
                  key-int-max={keyint} threads=0 \
@@ -123,9 +147,18 @@ impl Codec {
         }
     }
 
+    /// The raw format the encoder takes: the hardware encoder reads NV12,
+    /// the software ones I420.
+    fn raw_format(self) -> &'static str {
+        match self {
+            Codec::V4l2H264 => "NV12",
+            Codec::X264 | Codec::OpenH264 | Codec::Vp8 => "I420",
+        }
+    }
+
     fn muxer(self) -> &'static str {
         match self {
-            Codec::X264 | Codec::OpenH264 => "mp4mux",
+            Codec::V4l2H264 | Codec::X264 | Codec::OpenH264 => "mp4mux",
             Codec::Vp8 => "webmmux",
         }
     }
@@ -405,6 +438,24 @@ impl Recorder {
     /// Build and start the pipeline. With PipeWire audio, falls back to a
     /// silent recording when the microphone can't be opened.
     pub fn start(config: Config) -> Result<Recorder> {
+        match Recorder::start_with_audio(config.clone()) {
+            Ok(r) => Ok(r),
+            // The hardware encoder can be busy or out of memory: then the
+            // best software encoder that writes the same container.
+            Err(e) if config.codec == Codec::V4l2H264 => {
+                let Some(codec) = Codec::PREFERENCE.into_iter().skip(1).find(|c| {
+                    c.extension() == config.codec.extension() && c.needed().iter().all(|e| have(e))
+                }) else {
+                    return Err(e);
+                };
+                tracing::warn!(error = %e, ?codec, "hardware encoder failed");
+                Recorder::start_with_audio(Config { codec, ..config })
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn start_with_audio(config: Config) -> Result<Recorder> {
         match Recorder::start_with(config.clone()) {
             Ok(r) => Ok(r),
             Err(e) if config.audio == Audio::PipeWire => {
@@ -459,12 +510,13 @@ impl Recorder {
              ! queue max-size-buffers=3 max-size-bytes=0 max-size-time=0 leaky=downstream \
              ! videocrop name=crop \
              ! videoconvertscale add-borders=false n-threads=4 \
-             ! video/x-raw,format=I420,width={ow},height={oh},pixel-aspect-ratio=1/1 \
+             ! video/x-raw,format={raw},width={ow},height={oh},pixel-aspect-ratio=1/1 \
              ! videoflip name=flip video-direction=identity \
              ! queue max-size-buffers=3 max-size-bytes=0 max-size-time=0 leaky=downstream \
              ! {chain} ! taginject tags=\"{tags}\" \
              ! queue name=vq {big} ! {muxer} name=mux ! filesink async=false location=\"{location}\" \
              {audio}",
+            raw = c.codec.raw_format(),
             ow = c.out_width,
             oh = c.out_height,
             chain = c.codec.chain(c.bitrate_kbps(), c.fps),
